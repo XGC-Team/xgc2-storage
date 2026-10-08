@@ -380,56 +380,79 @@ and rejects a new group at exact fresh point versions because of that stop.
 These are real SQLite/engine data tests; Core's exact runtime action plans and
 notification wiring remain its consumer owner's work.
 
-## Session workflow log snapshot consumer contract (pending registration)
+## Session workflow log snapshot
 
-The exact consumer port is `SessionWorkflowLogSnapshot(ctx, targetID, sessionID)`.
-Its candidate named operation is `session.workflow_logs.snapshot`, a read-only
-operation using the same scope/database/schema/module envelope. Request data is
-`model.SessionWorkflowLogRead{TargetID, SessionID}`. The DTO exists in the pure
-model package, but the storage operation is **not yet registered or executed**.
-Core's new single-Named consumer port is therefore an integration dependency,
-not evidence that the service read has been implemented.
+`session.workflow_logs.snapshot` is registered `ReadOnly=true`. Its request is
+`model.SessionWorkflowLogRead{TargetID, SessionID}` in the owner's exact
+scope/database/schema/module envelope; it returns no write receipt. The binding
+is deployment supplied. `model.SessionGraphCollections()` is the sole new-data
+class/index catalog shared by deployment and execution writers:
 
-The agreed response shape is `model.SessionWorkflowLogSnapshot`: the Session
-View as `session`, unique Run aggregates as `runs` (Run, Invocations, Attempts,
-ExecutionRelations) and exact-origin Job projections as `jobs`. These fields
-contain product metadata JSON objects; the storage package does not import Core
-internal/domain packages. Raw objects preserve product integer values without a
-float64 intermediate. Every Job has an explicit `{origin, job}` envelope because
-the product's Job projection intentionally excludes Origin from its JSON. Job
-parameters, handler checkpoints, private worker ownership and lease credentials
-are outside the public Job/relation projection. Public target, Run ownership,
-binding and origin coordinates needed by the tree projector must be preserved.
+| Class | Record key | Declared dependency index |
+| --- | --- | --- |
+| sessions | Session ID | exact point, verify target |
+| session_members | member ID | by_session(targetId, sessionId) |
+| runs | Run ID | exact point, verify target/root/ownership |
+| invocations | invocation ID | by_run(runId) |
+| attempts | attempt ID | by_run(runId) |
+| run_relations | model.RelationRecordKey(kind, ID) | by_run(runId) |
+| workflow_jobs | Job ID | unique by_origin(runTargetId, runId, invocationId), by_run(runTargetId, runId) |
+| definitions | immutable pin ID | existing exact point |
 
-The service must seed the traversal only from the exact target/Session identity
-and that Session's `workflow_run`/`workflow_command` member owner IDs. It follows
-declared child ownership edges, then reads only those Runs' dependent invocation,
-attempt and relation facts, then those invocations' trusted workflow-origin Job
-projections. It must not infer lineage from authored output, handler checkpoints,
-public Job IDs, or a global inventory. The exact target/Run/invocation and complete
-origin coordinates must agree; an ordinary Job occupying a workflow origin or
-an ambiguous origin is corruption, not an absent Job. New data stores the trusted
-origin explicitly; no retired DedupeKey envelope decoder/import/fallback belongs
-in this model.
+Session, member, Run, invocation and attempt records are the writer's actual
+metadata objects, not cached snapshots. `model.RunRelationRecord` is one
+canonical relation fact `{id,runId,kind,fact}`; kind names one of the eight
+ExecutionRelations slices. Private fields may be present in the durable fact;
+the reader forwards only explicitly allowlisted public scalar fields. A sealed
+`group.prepare` group, its member and its child link are read directly through
+`core_groups_parent` from the module's existing authority, including membership
+digest validation. Copying those facts into run_relations is rejected as a
+duplicate authority. Lifecycle mutations of sealed group facts require an
+explicit future operation against that authority; the reader never creates or
+repairs rows.
 
-The entire selection and materialization use one reader transaction released
-before returning, with at most 4096 Runs, 16384 log sources, 1024 Session members,
-and the complete 16 MiB response envelope. Limits apply while materializing the
-dependent facts, including attempt history and relation metadata; the service
-must stop before allocating an unbounded aggregate. An oversized or incomplete
-graph fails the complete read instead of returning a silently truncated tree.
-It uses indexed dependent sets inside the owner, not per-Run network requests,
-all-scope scans, cross-request reader handles or changing-revision page restarts.
-Shared Runs entered by multiple Session members are materialized once; Core's
-pure tree projector preserves each member's separate lineage and checks cycles
-within each entry. Run lifecycle and child relation visibility fences remain
-authoritative; prepared and remote child facts must not fabricate local Run truth.
+`model.WorkflowJobRecord` is an authoritative Job metadata fact written only by
+the trusted workflow Job admission path, atomically with its execution action.
+It has flat scalar index coordinates plus explicit `origin` and `job` objects.
+Ordinary Job admission supplies no origin. The reader checks the flat coordinates,
+selected Run/invocation, complete immutable origin pins and bounded attempt lineage.
+No retired private DedupeKey decoding, public-id inference, alias or fallback is
+used. An indexed ordinary, mismatched or ambiguous origin is `data_loss`.
 
-The remaining service prerequisites are the explicit authoritative Session
-data-class/index catalog from the execution writer and the bounded safe field
-projection. The owner now supplies `engine.ReadRecords` for exact keys or declared
-equality indexes inside this same read transaction, with cumulative finite row
-and byte budgets; no inventory scan or additional RPC is needed. Acceptance requires
-mixed-revision concurrency, unrelated Session exclusion, malformed/ambiguous
-trusted-origin rejection, corrupt/missing ownership edges, exact limit/overflow
-cases and no private-field leakage on a real storage read transaction.
+The response is `model.SessionWorkflowLogSnapshot`: the Session View as
+`session`, unique Run aggregates as `runs` (Run, Invocations, Attempts,
+ExecutionRelations) and exact-origin Job projections as `jobs`. Every Job carries
+explicit `{origin,job}` because Core's Job projection has `Origin json:"-"`.
+Numbers retain their original JSON bytes, including integers above 2^53.
+Parameters, results, checkpoints, private worker ownership, lease tokens and
+private deduplication/admission credentials are excluded. Public target, owner,
+binding and origin coordinates needed by the tree projection remain available.
+
+One storage-owned read transaction selects the exact target/Session, seeds only
+its workflow_run/workflow_command member owner IDs, follows bound local child
+ownership edges and reads only selected Runs' exact indexed dependency sets.
+Shared Runs are materialized once. Prepared links and remote TargetRoot links
+remain relation facts; they never manufacture local Run metadata or lifecycle.
+Bound local children must agree with the link's parent/root/target and immutable
+pins. Cycles, missing dependencies, duplicate ownership, orphan attempts/groups,
+wrong target, wrong producer and incompatible origins fail the complete read.
+No per-Run RPC, global inventory, authored-output lineage, transaction handle or
+changing-revision page restart exists. `engine.ReadRecords` drains all index pages
+inside this same transaction using the owner's shared index codec and budgets.
+
+Limits are 4096 unique Runs, 1024 Session members and 16384 materialized dependency
+facts (including members, Runs, occurrences, attempt history, relations, Jobs and
+Job attempts). This also bounds log sources; limits fail instead of truncating.
+The owner additionally bounds all generic materialized rows/bytes; private sealed
+group materialization has its own 16 MiB cumulative cap. The complete Named
+response envelope is at most 16 MiB. The finite generic dependent-query budget
+must cover the legal 4096-Run graph: one cached Run point and four indexed sets
+per Run plus Session/member reads and internal index pages.
+
+The real engine tests exercise shared Run materialization, unrelated Session
+exclusion, explicit Origin, exact numeric bytes, private-field filtering, prepared
+and remote child visibility, missing/corrupt/cyclic ownership, exact member/Run/
+dependency limits and overflow, reading group.prepare's sealed authority, and
+an atomic writer commit while a reader retains the preceding snapshot. Core's
+pure projector and production writers consume this catalog separately; these
+storage tests do not claim full product migration or runtime closure.

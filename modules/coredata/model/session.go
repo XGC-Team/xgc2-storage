@@ -17,7 +17,6 @@ type SessionWorkflowLogRead struct {
 // without importing Core's internal packages or decoding numbers through any.
 // The storage implementation must select the safe projection fields from its
 // authoritative data; a consumer cannot submit a prebuilt snapshot as truth.
-// This operation is under development and is not yet in the module Spec.
 type SessionWorkflowLogSnapshot struct {
 	Session json.RawMessage         `json:"session"`
 	Runs    []SessionWorkflowLogRun `json:"runs"`

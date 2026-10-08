@@ -39,12 +39,12 @@ var SchemaSQL string
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed module.go group.go group_conditions.go namespace.go execution.go execution_commit.go schema.sql model/*.go
+//go:embed module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/*.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
 	h := sha256.New()
-	for _, path := range []string{"module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/contract.go", "model/group_conditions.go"} {
+	for _, path := range []string{"module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go"} {
 		b, _ := moduleSource.ReadFile(path)
 		h.Write([]byte(path + "\x00"))
 		h.Write(b)
@@ -60,6 +60,7 @@ func Spec() api.Module {
 		{ID: model.ExecutionCommandGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionEventCursorOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionEventReadOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.SessionWorkflowLogSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 	}}
 }
 
@@ -191,6 +192,11 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			var r model.EventRead
 			if err = decode(raw, &r); err == nil {
 				result, err = readExecutionEvents(ctx, tx, scope, r)
+			}
+		case model.SessionWorkflowLogSnapshotOperation:
+			var r model.SessionWorkflowLogRead
+			if err = decode(raw, &r); err == nil {
+				result, err = sessionWorkflowLogSnapshot(ctx, tx, scope, r)
 			}
 		default:
 			err = failure("invalid_argument", "unregistered core data operation")

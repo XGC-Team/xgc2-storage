@@ -10,6 +10,31 @@
       "receipt_ttl_seconds": 604800,
       "collections": [
         {
+          "id": "sessions",
+          "max_record_bytes": 3145728,
+          "max_records": 100000,
+          "max_bytes": 268435456,
+          "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
+          "recovery": "storage-owned consistent new-data backup/restore"
+        },
+        {
+          "id": "session_members",
+          "max_record_bytes": 3145728,
+          "max_records": 100000,
+          "max_bytes": 268435456,
+          "indexes": [
+            {
+              "id": "by_session",
+              "fields": [
+                "targetId",
+                "sessionId"
+              ]
+            }
+          ],
+          "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
+          "recovery": "storage-owned consistent new-data backup/restore"
+        },
+        {
           "id": "runs",
           "max_record_bytes": 3145728,
           "max_records": 100000,
@@ -22,6 +47,72 @@
           "max_record_bytes": 3145728,
           "max_records": 100000,
           "max_bytes": 268435456,
+          "indexes": [
+            {
+              "id": "by_run",
+              "fields": [
+                "runId"
+              ]
+            }
+          ],
+          "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
+          "recovery": "storage-owned consistent new-data backup/restore"
+        },
+        {
+          "id": "attempts",
+          "max_record_bytes": 3145728,
+          "max_records": 100000,
+          "max_bytes": 268435456,
+          "indexes": [
+            {
+              "id": "by_run",
+              "fields": [
+                "runId"
+              ]
+            }
+          ],
+          "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
+          "recovery": "storage-owned consistent new-data backup/restore"
+        },
+        {
+          "id": "run_relations",
+          "max_record_bytes": 3145728,
+          "max_records": 100000,
+          "max_bytes": 268435456,
+          "indexes": [
+            {
+              "id": "by_run",
+              "fields": [
+                "runId"
+              ]
+            }
+          ],
+          "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
+          "recovery": "storage-owned consistent new-data backup/restore"
+        },
+        {
+          "id": "workflow_jobs",
+          "max_record_bytes": 3145728,
+          "max_records": 100000,
+          "max_bytes": 268435456,
+          "indexes": [
+            {
+              "id": "by_origin",
+              "fields": [
+                "runTargetId",
+                "runId",
+                "invocationId"
+              ],
+              "unique": true
+            },
+            {
+              "id": "by_run",
+              "fields": [
+                "runTargetId",
+                "runId"
+              ]
+            }
+          ],
           "retention": "Core owns current/recovery facts; reviewed explicit retention cleanup only",
           "recovery": "storage-owned consistent new-data backup/restore"
         },
@@ -38,7 +129,7 @@
         {
           "id": "coredata",
           "schema": "core-relational-v1",
-          "digest": "c8a95850ad6a119e7462a0d8371def34a47eb869c34e52b816b1681b8fe0f676",
+          "digest": "38e9d8925923bb8be6e622b083c3a4c53037ea6072889d3981e383bdfd5f0c11",
           "operations": [
             {
               "id": "group.prepare",
@@ -96,6 +187,12 @@
             },
             {
               "id": "execution.events.read",
+              "read_only": true,
+              "max_request_bytes": 16777216,
+              "max_response_bytes": 16777216
+            },
+            {
+              "id": "session.workflow_logs.snapshot",
               "read_only": true,
               "max_request_bytes": 16777216,
               "max_response_bytes": 16777216
