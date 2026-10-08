@@ -1,0 +1,16 @@
+{
+ "format":"storage-v1",
+ "namespaces":[{
+  "id":"lichtblick","owner":"lichtblick","schema":"lichtblick.v1",
+  "max_scopes":256,"max_receipts":50000,"receipt_ttl_seconds":604800,
+  "collections":[
+   {"id":"documents","max_record_bytes":2097152,"max_records":10000,"max_bytes":268435456,
+    "retention":"Lichtblick product deletes reviewed user documents; no automatic deletion",
+    "recovery":"consistent storage backup plus product browser export import",
+    "indexes":[{"id":"family","fields":["family"]}]},
+   {"id":"extensions","max_record_bytes":65536,"max_records":4096,"max_bytes":16777216,
+    "retention":"Lichtblick extension uninstall removes metadata with version CAS",
+    "recovery":"metadata backup and asset sha256 from existing Extensions filesystem owner"}
+  ]
+ }]
+}

@@ -1,0 +1,28 @@
+syntax = "proto3";
+package xgc2.storage.v1;
+option go_package = "github.com/XGC-Team/xgc2-storage/protocol;protocol";
+
+message Scope { string namespace=1; string user=2; string workspace=3; }
+message Token { string database_id=1; string schema=2; string revision=3; }
+message Query {
+ string collection=1; repeated string keys=2; string index=3;
+ repeated bytes equal_json=4; string after=5; int32 limit=6;
+ bool include_deleted=7;
+}
+message SnapshotRequest { Scope scope=1; repeated Query queries=2; Token at=3; }
+message Record { string key=1; string version=2; bool deleted=3; bool missing=4; bytes data_json=5; string collection=6; }
+message QueryResult { string collection=1; repeated Record records=2; string next_after=3; }
+message SnapshotResponse { Scope scope=1; Token token=2; repeated QueryResult results=3; }
+message Mutation { string collection=1; string key=2; string expected_version=3; bool delete=4; bytes data_json=5; }
+message BatchRequest { Scope scope=1; Token expected=2; string request_id=3; repeated Mutation mutations=4; }
+message ReceiptRequest { Scope scope=1; string request_id=2; }
+message ReceiptResponse { string request_id=1; string digest=2; Token token=3; string committed_at=4; string expires_at=5; string durability=6; repeated Record versions=7; }
+message NamedRequest { Scope scope=1; string database_id=2; string schema=3; string module=4; string operation=5; string request_id=6; bytes payload_json=7; }
+message NamedResponse { ReceiptResponse receipt=1; bytes result_json=2; }
+service Storage {
+ rpc Snapshot(SnapshotRequest) returns(SnapshotResponse);
+ rpc Batch(BatchRequest) returns(ReceiptResponse);
+ rpc Receipt(ReceiptRequest) returns(ReceiptResponse);
+ rpc Named(NamedRequest) returns(NamedResponse);
+ rpc NamedResult(ReceiptRequest) returns(NamedResponse);
+}
