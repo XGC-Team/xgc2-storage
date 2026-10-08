@@ -1,5 +1,7 @@
 github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261008183413-35c23b558399 h1:zww4QE18mlJIhNKVn3CWJyqwGBAa9o5CLA1F0LTT7vw=
 github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261008183413-35c23b558399/go.mod h1:SbR8WMLhRLqW77NAaSD1tKKpPxT1SQavGU2ciCTF74A=
+github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261008201732-a26df3039fa7 h1:+cHg495A1QnpOodsCmdwx0PKpMnUUmIfKflbpvUzOP4=
+github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261008201732-a26df3039fa7/go.mod h1:GvSetpAh9ef+bjbYoo9avS25fMASCJ76eK3RrrAuXbM=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
 github.com/go-logr/logr v1.4.3 h1:CjnDlHq8ikf6E492q6eKboGOC0T8CDaOvkHCIg8idEI=
