@@ -304,6 +304,48 @@ func TestNamespaceCloneRecursiveCurrentMainOriginAndReferences(t *testing.T) {
 	}
 }
 
+func TestNamespaceCloneUsesMultibyteNameBoundsAndSeparateIDs(t *testing.T) {
+	for _, kind := range []string{"valid-name", "name-overflow", "id-overflow", "embedded-newline"} {
+		t.Run(kind, func(t *testing.T) {
+			db, ctx := fixture(t)
+			r := seedTree(t, db, ctx)
+			r.Name = strings.Repeat("😀", 128)
+			r.NameKey = r.Name
+			if kind == "name-overflow" {
+				r.Name += "a"
+				r.NameKey = r.Name
+			}
+			if kind == "id-overflow" {
+				r.TargetID = strings.Repeat("😀", 64)
+			}
+			if kind == "embedded-newline" {
+				r.Name, r.NameKey = "copy\nname", "copy\nname"
+			}
+			_, err := run(t, db, ctx, model.NamespaceCloneOperation, r)
+			if kind != "valid-name" {
+				if errorCode(err) != "invalid_argument" {
+					t.Fatalf("overflow=%v", err)
+				}
+				if count(t, db, ctx, "core_changes") != 0 || count(t, db, ctx, "core_namespaces") != 3 {
+					t.Fatal("invalid name/ID mutated clone")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := run(t, db, ctx, model.NamespaceGetOperation, model.NamespaceRead{Domain: "robot", ID: "copy"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var row model.NamespaceRow
+			if json.Unmarshal(raw, &row) != nil || row.Name != r.Name || row.NameKey != r.NameKey {
+				t.Fatal("multibyte name bytes changed")
+			}
+		})
+	}
+}
+
 func TestNamespaceLateReferenceFailureRollsBackAllRelations(t *testing.T) {
 	db, ctx := fixture(t)
 	r := seedTree(t, db, ctx)

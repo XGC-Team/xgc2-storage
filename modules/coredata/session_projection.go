@@ -73,7 +73,10 @@ func canonicalSessionPin(value string) bool {
 const sessionPublicFields = "id targetId experimentResourceId experimentCommitId experimentDigest robotSelectionDigest state mode runMode revision error createdAt updatedAt activatedAt stoppingAt completedAt"
 const memberPublicFields = "id targetId sessionId bindingId kind ownerId status revision error createdAt updatedAt completedAt artifactPath artifactStartedAt artifactEndedAt"
 const runPublicFields = "id targetId automationResourceId definitionId definitionVersion configDigest executionPlanDigest registryDigest definitionDigest actionId actionVersion executionModel throughNodeId parentRunId rootRunId callNodeId depth correlationId status admissionMode admissionScope admissionLimit admissionOnConflict replacesRunId terminationKind reason acceptedAt createdAt startedAt updatedAt finishedAt revision"
-const invocationPublicFields = "id runId nodeId kind status currentWaitId waitGeneration nextAttemptAt startedAt finishedAt createdAt updatedAt revision"
+
+// activeAttemptId is a minimal authenticated snapshot ownership pointer, not a
+// public Core NodeInvocation field. occurrences validates it before returning.
+const invocationPublicFields = "id runId nodeId kind status activeAttemptId currentWaitId waitGeneration nextAttemptAt startedAt finishedAt createdAt updatedAt revision"
 const attemptPublicFields = "id runId invocationId phase number status adoptionCount createdAt startedAt finishedAt updatedAt revision"
 const originPublicFields = "RunTargetID RunID RootRunID DefinitionID ConfigDigest ExecutionPlanDigest RegistryDigest DefinitionDigest NodeID NodeKind NodeTypeVersion InvocationID"
 const jobPublicFields = "ID TargetID Kind Status Revision AttemptCount UpdatedAt"

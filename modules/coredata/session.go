@@ -300,13 +300,13 @@ func (s *sessionGraphReader) occurrences(runID string) ([]json.RawMessage, []jso
 		}
 		nodes[f.text("nodeId")] = true
 		byID[f.text("id")] = f
-		invocations = append(invocations, f.raw())
 	}
 	records, err = s.read(model.AttemptsCollection, model.RunFactsIndex, runID)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	seen := map[string]bool{}
+	attemptsByID := map[string]sessionFact{}
 	for _, record := range records {
 		f, e := publicSessionFact(record.Data, attemptPublicFields)
 		if e != nil {
@@ -317,8 +317,27 @@ func (s *sessionGraphReader) occurrences(runID string) ([]json.RawMessage, []jso
 			return nil, nil, nil, failure("data_loss", "invalid or duplicate attempt ownership")
 		}
 		seen[key] = true
+		attemptsByID[f.text("id")] = f
 		s.attemptFacts[f.text("id")] = f
 		attempts = append(attempts, f.raw())
+	}
+	for id, f := range byID {
+		// Never infer an active attempt from status/number/order. An explicit
+		// persistent pointer must resolve in this transaction's run-local index
+		// and belong to this exact invocation. Missing/empty means no pointer.
+		if f.present("activeAttemptId") {
+			var active string
+			if json.Unmarshal(f["activeAttemptId"], &active) != nil {
+				return nil, nil, nil, failure("data_loss", "invalid active-attempt pointer type")
+			}
+			if active != "" {
+				attempt := attemptsByID[active]
+				if !textKey(active) || attempt == nil || attempt.text("runId") != runID || attempt.text("invocationId") != id {
+					return nil, nil, nil, failure("data_loss", "active-attempt pointer ownership disagrees")
+				}
+			}
+		}
+		invocations = append(invocations, f.raw())
 	}
 	sortSessionFacts(invocations)
 	sortSessionFacts(attempts)

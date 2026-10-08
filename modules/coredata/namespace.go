@@ -7,6 +7,7 @@ import (
 	"errors"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"strconv"
+	"strings"
 )
 
 // The recursive limit stops expansion as well as bounding the output. UNION
@@ -184,7 +185,7 @@ func cloneNamespace(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 	if err = checkSize(r); err != nil {
 		return out, err
 	}
-	if !textKey(r.Domain) || !textKey(r.SourceID) || !textKey(r.TargetID) || !textKey(r.Name) || !textKey(r.NameKey) || !positiveRevision(r.ExpectedRevision) || !textKey(r.ChangeID) || !object(r.Change) || len(r.Namespaces) > MaxCloneNamespaces || len(r.Resources) > MaxCloneResources {
+	if !textKey(r.Domain) || !textKey(r.SourceID) || !textKey(r.TargetID) || model.ValidateConfigurationName(model.ConfigurationNamespaceName, r.Name) != nil || model.ValidateConfigurationName(model.ConfigurationNamespaceName, r.NameKey) != nil || strings.TrimSpace(r.Name) != r.Name || strings.TrimSpace(r.NameKey) != r.NameKey || strings.ContainsAny(r.Name+r.NameKey, "\r\n") || !positiveRevision(r.ExpectedRevision) || !textKey(r.ChangeID) || !object(r.Change) || len(r.Namespaces) > MaxCloneNamespaces || len(r.Resources) > MaxCloneResources {
 		return out, failure("invalid_argument", "invalid namespace clone identity or bounds")
 	}
 	if r.TargetParentID == "" {

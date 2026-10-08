@@ -47,6 +47,7 @@ progress, or impose a whole-scope CAS on a later named write.
 | `execution.command.get` | read | exact command ID or idempotency-key receipt |
 | `execution.events.cursor` | read | persistent stream identity and durable latest offset |
 | `execution.events.read` | read | bounded indexed event page through one fixed high-watermark |
+| `session.workflow_logs.snapshot` | read | bounded exact Session ownership graph in one snapshot |
 
 Request and response limits are 16 MiB each, including the engine envelope.
 The module also checks its payload/result limit. HTTP and gRPC hosts/clients must
@@ -54,8 +55,10 @@ consume the registered bounds, rather than the ordinary 4 MiB document profile.
 Numbers used as revisions are canonical positive decimal **strings**, preserving
 values above 2^53. Namespace root parent revision is explicit `"0"`; a Run root
 has an empty parent ID and its own explicit root ID. Counts/ordinals are small
-bounded JSON numbers. IDs/names are UTF-8, 1..255 bytes, without surrounding
-whitespace, NUL, CR or LF. Core supplies the canonical name key.
+bounded JSON numbers. IDs are UTF-8, 1..255 bytes, without surrounding
+whitespace, NUL, CR or LF. Names use their distinct rune and UTF-8 byte bounds
+below; namespace.clone accepts up to 128 runes/512 bytes for its root name/key.
+Core supplies normalization, domain syntax and the canonical name key.
 
 Parameter and typed payload/manifest fields are byte arrays in the Go API and
 base64 strings in JSON. Their contents remain JSON objects, validated after
@@ -428,6 +431,16 @@ Parameters, results, checkpoints, private worker ownership, lease tokens and
 private deduplication/admission credentials are excluded. Public target, owner,
 binding and origin coordinates needed by the tree projection remain available.
 
+The authenticated Invocation snapshot additionally carries only an explicitly
+persisted `activeAttemptId` ownership pointer. For a nonempty pointer, the reader
+checks the same transaction's already indexed attempt set: exact attempt ID,
+same runId and same invocationId. A dangling, cross-invocation, cross-run or
+non-string pointer fails the complete snapshot with data_loss and no partial
+result/receipt. Missing/empty means no pointer; the reader never infers it from
+status, attempt number or ordering. This adds no query or second authority.
+Core's public NodeInvocation/Response JSON remains unchanged; lease ownership,
+checkpoint and parameter bytes are still excluded from the authenticated wire.
+
 One storage-owned read transaction selects the exact target/Session, seeds only
 its workflow_run/workflow_command member owner IDs, follows bound local child
 ownership edges and reads only selected Runs' exact indexed dependency sets.
@@ -456,3 +469,264 @@ dependency limits and overflow, reading group.prepare's sealed authority, and
 an atomic writer commit while a reader retains the preceding snapshot. Core's
 pure projector and production writers consume this catalog separately; these
 storage tests do not claim full product migration or runtime closure.
+The focused active-pointer tests persist the field through execution.commit and
+read the actual engine.Named provider, including an atomic pointer/attempt switch
+while a read transaction retains the preceding state. They establish this data
+seam, not production writer activation or native transport/product closure.
+
+## Configuration first atomic group: shared contract v5
+
+The exact DTO definitions are now authoritative in
+`modules/coredata/model/configuration.go`, copied from the frozen consumer v5
+Go declarations (source SHA-256
+`ddcc13a174aadb9bfbbe3a5e488fd72c716f27be37fca4064d93ccf3e5a89d57`).
+The agreed semantics/budgets source SHA-256 is
+`8974fa79b37b283031c7cac83c6cbd8808c1cd69b3bb52a0f7bef00bf84e8d2a`.
+This v5 supersedes the shared v4 contract and incorporates C1/C2 and the
+receipt/transport/resource claim boundaries. Its four operation constants and
+twenty DTO field/type/JSON-tag definitions remain identical to v4. Frozen v3/v4
+sources and handoff evidence remain unchanged, with no retrospective v5 claim.
+The pure `ConfigurationFirstGroupOperations()` declaration defines:
+
+| Operation | Kind | Request | Response |
+| --- | --- | --- | --- |
+| resource.create | write | ConfigurationResourceCreate | ConfigurationMutationResult |
+| resource.commit | write | ConfigurationResourceCommit | ConfigurationMutationResult |
+| resource.snapshot | read-only | ConfigurationResourceRead | ConfigurationResourceSnapshot |
+| configuration.receipt | read-only | ConfigurationReceipt | ConfigurationMutationResult |
+
+These four operations are now implemented by Execute and registered in
+coredata.Spec and schemas/core-relational-v1.json, making fifteen executable
+operations. The implementation uses the existing core_resources/branches/
+snapshots/references/changes authority, plus a bounded explicit deployment domain
+registry and durable product receipt table. Production Core Named wiring and
+deployment declaration synchronization remain separate owner work. No retired
+schema import, alias, fallback or request-time adoption exists.
+
+ConfigurationDomainGuard declares key/schema identity/version/registry digest
+against an explicit deployment registry. SchemaIdentity and RegistryDigest
+include the active compiled panel/codec catalog; a catalog change is not an old
+business-data schema and must not hide all stored current-schema Experiments.
+An authorized explicit startup/deployment declaration synchronization may update
+the accepted active catalog identity while the fixed domain schema version and
+capabilities remain valid. Request guards fence that accepted active catalog.
+Immutable snapshot eligibility uses its own schema version and domain codec;
+the accepted catalog is not substituted for an immutable snapshot's version.
+No request-time adoption, import, alias, payload rewrite or fallback is allowed.
+The structural root is SQL NULL and
+`ConfigurationNamespaceGuard{ID:"",ExpectedRevision:"0"}`; every real namespace
+has a positive exact revision. Resource/branch/commit guards remain local points,
+head and content digests. Revisions, versions and next_version are canonical
+signed-64-bit decimal strings, including values above 2^53. There is no whole-scope
+CAS. ConfigurationResourceRead selects exactly resource+explicit branch,
+resource+commit, or namespace+name key; Core explicitly chooses main when intended.
+
+Every resource.snapshot returns the selected complete immutable facts plus
+CurrentMain{Branch,SchemaVersion,Identity}, from the same read transaction.
+History and named-branch selection cannot bypass current-main visibility. The
+authoritative Payload is one generic envelope `{"identity":{...},"body":{...}}`.
+Storage only projects the generic identity member, at most 16 KiB, without a
+domain interpreter or Core callback; no separately authored/stored identity row
+is introduced. When selected==current main, both outputs derive from the one
+selected immutable blob and that blob is fetched only once. Core consumes the
+selected identity and current-main projection before decoding opaque body bytes;
+inactive identity rejects first, and DecodeStored checks active envelope/body
+consistency using that snapshot's codec/version. No separate visibility query or
+second immutable decode is permitted by this contract.
+
+Durable product mutation identity is separate from the expiring engine transport
+receipt. Core freezes IntentDigest before provider lookup, mutable pin resolution
+or random allocation IDs, and reads configuration.receipt first. Equal
+key/domain/allowed operation/intent returns the original compact result without
+source guards, provider reads or replacing the original plan. New unused
+allocation IDs on a later same-intent submission cannot create a second resource
+or commit. Changed intent conflicts. Same transport RequestID still has the
+engine's exact content-digest fence. Product receipts survive engine receipt TTL;
+quota exhaustion rejects the complete write rather than evicting them.
+
+Every admitted writer invocation rechecks the durable product receipt inside the
+owner transaction before source/Main guards, allocation-ID reservations or version
+allocation. A public preflight miss cannot skip this check. A matching receipt
+returns the original accepted plan/head without consuming the loser's IDs or
+publishing its freshly prepared bytes. Core may return its local prepared typed
+value only for a non-replayed first created/committed result, after matching the
+returned accepted CommitID and full PlanDigest; a stored created/committed
+disposition on replay never permits returning loser preparation. A
+different winner requires the original immutable commit once, under the same
+current typed-visibility policy. Metadata replay reports a historical persisted
+result, not current typed availability or permission for a new notification.
+
+Each newly prepared complete plan uses a distinct transport RequestID, independent
+of the stable product mutation Key/Intent. Concurrent preflight misses with equal
+product intent and different allocation IDs must reach the product receipt check
+using separate transport identities. Reusing a transport identity is valid only
+for identical frozen wire intent; deriving it solely from the product key cannot
+satisfy this contract because the engine rightly rejects changed full-plan digests
+before Execute. The exact engine transport identity/content fence remains intact.
+
+configuration.receipt is registered ReadOnly in the executable catalog. Receipt-first
+does not bypass authorization or bounded owner admission. Writer/disk/engine
+receipt-quota admission may reject a concurrent same-intent caller before Execute
+can find a winner's product receipt. Return that actual outer admission or
+OutcomeUnknown/NotSent error directly, with no hidden read, write or retry. A later
+explicit public retry begins with the one bounded read-only product receipt lookup
+and may recover the durable original result. This is an admission-qualified replay
+guarantee, not unconditional success under write pressure.
+
+A create plan freezes one domain payload, canonical ID-ordered generic manifest,
+complete tracking/pinned references and ordered node diff. Storage derives source
+reference identity and validates exact target branch/commit/version/root digest/
+component against its prospective transaction post-state, including a new
+resource's own planned main and manifest when referenced. These are staged finite
+facts, without a Core callback or another RPC. It atomically creates resource/main/version
+1 snapshot, exact bytes, references, complete aggregate audit and durable product
+receipt; initial revisions are 1 and next_version is 2. Returned metadata comes
+from persisted facts. No notification or applied claim precedes the owner COMMIT.
+
+Commit checks the exact branch ID/revision/head/content digest and explicit
+resource/namespace guards for global identity changes. For domains with current-main
+visibility, ConfigurationResourceCommit.Main carries the exact same-read current
+main branch/revision/head/content-digest pin, including nonmain publication.
+Storage checks this local point in the writer transaction; a concurrent main
+change conflicts with no pointer, version, reference, audit or receipt write.
+Ordinary domains do not require this visibility guard. Only main can change global
+name/location/main pointer. Actual snapshots allocate a unique resource-local
+version and update resource counter/revision, branch head/revision, immutable
+snapshot/references/audit and receipt in the same writer transaction. Current live
+source-head predicates fence removal of tracking-referenced components. Noop and
+move-only retain the original persistent payload/manifest bytes, immutable commit,
+version and branch revision; move-only increments the resource identity revision
+and writes its audit/receipt. Final audit/quota/receipt failure rolls everything
+back. Storage never calls a provider or runs typed workflow/domain compilation.
+
+Two outcome rules from the fixed current business reference apply before treating
+this shape as an implementation. CONFIG-V3-C1: after the applicable protected,
+nonmain and exact local identity guards, an unchanged guarded RootDigest with
+AppendUnchangedSnapshot=false and a changed canonical NameKey rejects with
+ErrInvalid-equivalent `invalid_argument` before noop or identity-only, without a
+receipt, counter or pointer write. A metadata rename cannot be acknowledged as a
+discarded noop. Identity-only is a location change with unchanged canonical name;
+it retains the original payload/manifest/commit/version and branch revision.
+
+CONFIG-V3-C2: when checking removal of a tracking-referenced component, exclude
+only the old outgoing set owned by the exact storage-derived resource source and
+branch being replaced. Other live sources remain blockers, including other
+branches of that same resource; historical/archived sources and immutable pinned
+references do not become live tracking blockers. Validate the complete new
+outgoing set against the transaction's post-state, including the new selected
+head/manifest and exact immutable pinned target facts. Deleting component X and
+that branch's tracking self-reference to X together can succeed. Retaining that
+tracking self-reference while deleting X must reject against the new state; an
+old pre-state head containing X cannot make it valid. This is bounded relational
+validation in the same transaction, with no extra SDK read or domain callback.
+
+These corrections and receipt/transport obligations are bound to astra3's static
+proposal review `/tmp/astra3-xrpc-review-20261009/sol15-config-v3-review/review-index.json`
+(SHA-256 `4c2751f55723a2c22da45cb446ba7f980bbae37dd54954b85a0658bd3a15135c`),
+using the fixed `commit.go` SHA-256
+`ac3ab5c91bfd0e14da7c8b5c816846807455a032fd4a2dfd25a5c49d81b3e2c9`.
+The consumer incorporates them in frozen v5; the review itself remains a fixed-v3
+proposal review, without retroactive v4/v5 or production review credit.
+The new SQL implementation has separate focused configuration tests; its evidence
+is not attributed to that earlier proposal review.
+
+Payload/Manifest are `[]byte` on the shared Go wire and base64 in outer JSON.
+CurrentMain.Identity is also byte[]/base64; the read projection preserves its raw
+JSON data and does not decode the opaque domain body. When selected is main,
+its raw identity member comes from the already read blob; otherwise SQL projects
+only current-main identity JSON from that authoritative blob, without materializing
+a second full opaque payload or storing a duplicate identity. Core's explicit frozen
+codec retains raw robot extension JSON as byte[], rather
+than re-encoding RawMessage. Manifest retains the existing generic NodeDraft
+`parentId/documentKind/payloadDigest/sortOrder` field names. The pure shared
+ConfigurationManifestNode/ConfigurationManifest representation and
+ValidateConfigurationManifest/DecodeConfigurationManifest/
+DiffConfigurationManifests helpers extract that data algorithm for actual reuse.
+NormalizeConfigurationName provides the common NFC display/folded NFC key rule,
+with separate name and identifier bounds. The module calls these helpers to check
+root digest, canonical ID ordering, parent graph, sibling names and the complete
+ordered audit diff; no domain interpreter is copied.
+
+All independent limits in model/configuration_limits.go apply:
+
+| Dimension | Limit |
+| --- | --- |
+| one decoded payload / manifest | 10 MiB / 1 MiB |
+| manifest nodes / outgoing refs / ordered node changes | 4096 / 4096 / 8192 |
+| complete decoded plan or snapshot | 12 MiB |
+| actual complete Named request or response wire | 16 MiB |
+| compact durable receipt result | 256 KiB |
+| current-main identity projection | 16 KiB |
+| clone namespaces / resources / references | 1024 / 4096 / 16384 |
+| clone manifest nodes / node changes plus summary | 65536 / 65537 |
+| namespace depth | 128 |
+| namespace name or key | 128 runes / 512 UTF-8 bytes |
+| resource name or key | 160 runes / 640 UTF-8 bytes |
+| branch name or key | 80 runes / 320 UTF-8 bytes |
+| reference slot | 64 runes / 256 UTF-8 bytes |
+| identifier | 255 UTF-8 bytes, separate from name |
+
+Whole budgets include metadata, complete refs, audit, receipt and the current-main
+identity projection even when derived from selected main; actual wire
+includes envelope, base64 and JSON escaping. Individual maxima cannot all coexist.
+Owner-computed ConfigurationBudget/ConfigurationCloneBudget helpers check these
+independent counters; they are not trusted RPC fields and do not estimate or
+validate a caller's schema on the owner's behalf. Consumers may run the same
+checks for early rejection. An oversized atomic plan is rejected before commit,
+never truncated or split. Current namespace.clone has also stopped passing the
+root name/key through textKey255; multibyte name/ID overflow and no-partial-write
+negatives exercise the separate bounds.
+
+Accepted object sizes do not establish peak RSS or bounded Prepare/Freeze/Compile
+and provider work. Core's existing owner budgets must bound authored input before
+preparation, construction/encoding expansion and simultaneous prepared plans;
+counts/bytes are checked while building and actual envelope bytes before submission.
+These preparation obligations do not add a scheduler or weaken atomic-plan limits.
+
+DeclareConfigurationDomains(ctx, *sql.Tx, declarations) is an explicit owner-held
+creation/deployment seam, not a named data operation. It opens no connection and
+is never invoked by a request to adopt an undeclared domain. At most 256 domain
+rows and 64 unique capabilities per declaration are accepted. Existing fixed
+schema version/capabilities/visibility/system policy cannot change; explicit owner
+synchronization may update only active schema/catalog identity and registry digest.
+A current accepted deployment catalog guard is required before any product
+receipt lookup, including a historical hit. A new accepted catalog can recover
+the original result/plan; a stale catalog fails before receipt lookup. After that
+admission fence, a matching receipt precedes source/Main guards and allocations.
+This historical
+metadata replay conveys no current typed/domain visibility approval.
+
+ConfigurationCreatePlanDigest/ConfigurationCommitPlanDigest hash the operation and
+complete typed plan with exact byte[] payload/manifest, guards, allocated IDs and
+ordered changes/references, excluding external transport RequestID. The plan uses
+Encoder.SetEscapeHTML(false) and no trailing newline. ConfigurationContentDigest
+uses the same SnapshotDigest algorithm as namespace operations: SHA-256 of
+`coredata.snapshot.bytes.v1\0`, then uint64 big-endian length plus exact payload,
+exact manifest, and canonical Slot-sorted references JSON. Control reference bodies
+use UseNumber and stable key ordering; frozen data bytes are never compacted. This
+is a new-schema algorithm, with no previous digest compatibility path.
+
+Tracking references have canonical explicit target branch and component. The
+commit/version/root triple is either entirely absent for logical tracking or fully
+present as a transaction-checked target pin. Pinned references always require that
+exact immutable triple. Storage derives sources from the immutable commit and
+live branch heads. An incoming reference on a shared commit remains active for
+every live branch pointing to that commit; excluding the replaced branch does not
+exclude another branch sharing its old head. Incoming materialization is bounded
+at 16384 rows/12MiB, target manifest materialization at 12MiB, and new outgoing refs
+at 4096. These are private in-transaction SQL points, not per-SQL RPC calls.
+
+Focused tests cover raw/module and actual engine.Named transactions: exact byte
+retention, product replay before loser guards/bytes, C1, C2/new self-reference and
+other live/shared-head branch blockers, complete audit validation, late product
+receipt and outer named_results rollback, canonical large versions/overflow,
+current-main visibility fences, unrelated outer scope writes, concurrent same
+branch CAS and same-product prepared attempts, TTL pruning/restart, and read-only
+receipt/snapshot classifications. Native authenticated transport, production Core
+Named consumer wiring and deployment owner registration are not established by
+these in-process tests. Execution-source reference admission remains a later
+explicit authority; no existing execution admission closure is claimed.
+Later branch/archive/history/reference admission and clone declaration/receipt
+extensions are not implied by this first group. Consumer hooks
+PrepareSnapshot/EncodePrepared/DecodeStored/RewriteFrozen receive bytes/data;
+no transaction, SQL callback, provider fallback or retired ORM belongs in them.

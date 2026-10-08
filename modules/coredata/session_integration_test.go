@@ -343,13 +343,21 @@ func TestSessionWorkflowSnapshot4096RunsAndOverflow(t *testing.T) {
 			r, err := f.snapshot("local", "session")
 			if count > model.MaxSessionWorkflowRuns {
 				requireSessionCode(t, err, "resource_exhausted")
+				if len(r.Result) != 0 || r.Receipt != nil {
+					t.Fatal("Run overflow returned a partial graph or receipt")
+				}
 				return
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
+			if r.Receipt != nil || len(sessionWire(r)) > api.MaxNamedResponseBytes {
+				t.Fatal("read minted a receipt or exceeded the complete wire limit")
+			}
 			var snapshot model.SessionWorkflowLogSnapshot
-			_ = json.Unmarshal(r.Result, &snapshot)
+			if err = json.Unmarshal(r.Result, &snapshot); err != nil {
+				t.Fatal(err)
+			}
 			if len(snapshot.Runs) != count {
 				t.Fatalf("truncated Runs: %d", len(snapshot.Runs))
 			}

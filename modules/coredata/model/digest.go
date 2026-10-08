@@ -4,6 +4,7 @@ package model
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -30,8 +31,39 @@ func SnapshotDigest(payload, manifest json.RawMessage, references []Reference) (
 	}
 	references = append([]Reference{}, references...)
 	sort.Slice(references, func(i, j int) bool { return references[i].Slot < references[j].Slot })
-	return digest(struct {
-		Payload, Manifest json.RawMessage
-		References        []Reference
-	}{payload, manifest, references}), nil
+	// The frozen data bytes are not JSON-normalized. Reference bodies contain
+	// control metadata; normalize their object key order with exact JSON numbers.
+	for i := range references {
+		if !object(references[i].Body) {
+			return "", fmt.Errorf("invalid reference object")
+		}
+		var value any
+		d := json.NewDecoder(bytes.NewReader(references[i].Body))
+		d.UseNumber()
+		if err := d.Decode(&value); err != nil {
+			return "", err
+		}
+		var b bytes.Buffer
+		e := json.NewEncoder(&b)
+		e.SetEscapeHTML(false)
+		if err := e.Encode(value); err != nil {
+			return "", err
+		}
+		references[i].Body = bytes.TrimSuffix(b.Bytes(), []byte("\n"))
+	}
+	var b bytes.Buffer
+	e := json.NewEncoder(&b)
+	e.SetEscapeHTML(false)
+	if err := e.Encode(references); err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write([]byte("coredata.snapshot.bytes.v1\x00"))
+	for _, part := range [][]byte{payload, manifest, bytes.TrimSuffix(b.Bytes(), []byte("\n"))} {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+		h.Write(size[:])
+		h.Write(part)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
