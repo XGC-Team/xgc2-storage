@@ -257,6 +257,39 @@ func TestConfigurationSameCommitOtherBranchStillBlocksAndBounds(t *testing.T) {
 		t.Fatal("ambiguous envelope accepted")
 	}
 }
+func TestConfigurationReferenceSharedHeadOwnership(t *testing.T) {
+	db, ctx, g := configurationFixture(t)
+	q := configurationCreateForTest(t, g, "target", nil)
+	first := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
+	b := first.Result.Head.Branch
+	b.ID, b.Name, b.NameKey = "target-dev", "dev", "dev"
+	body, _ := json.Marshal(b)
+	execSQL(t, db, ctx, "INSERT INTO core_branches VALUES(?,?,?,?,?,?,?,?)", testScope, g.Key, b.ID, b.ResourceID, b.NameKey, b.HeadCommitID, b.Revision, body)
+	refs := []model.ConfigurationReference{
+		{Slot: "tracking", Mode: "tracking", TargetDomain: g.Key, TargetResourceID: q.ResourceID, TargetBranch: "dev", TargetComponentID: "x"},
+		{Slot: "pinned", Mode: "pinned", TargetDomain: g.Key, TargetResourceID: q.ResourceID, TargetBranch: "dev", TargetComponentID: "x", TargetCommitID: q.CommitID, TargetVersion: "1", TargetRootDigest: q.Snapshot.RootDigest},
+	}
+	source := configurationWrite(t, db, ctx, model.ResourceCreateOperation, configurationCreateForTest(t, g, "source", refs))
+	if source.Result.Head.Commit.Version != "1" {
+		t.Fatal("shared owned immutable head was not accepted")
+	}
+	// Both individual FKs and the snapshot body agree, but its original branch
+	// belongs to another aggregate. Neither live selector nor exact pins bypass it.
+	c := first.Result.Head.Commit
+	c.BranchID = source.Result.Head.Branch.ID
+	body, _ = json.Marshal(c)
+	execSQL(t, db, ctx, "UPDATE core_snapshots SET branch_id=?,body=? WHERE scope=? AND domain=? AND id=?", c.BranchID, body, testScope, g.Key, c.ID)
+	for _, ref := range refs {
+		before := configurationCounts(t, db, ctx)
+		bad := configurationCreateForTest(t, g, "bad-"+ref.Mode, []model.ConfigurationReference{ref})
+		_, e := run(t, db, ctx, model.ResourceCreateOperation, bad)
+		configurationCode(t, e, "data_loss")
+		if before != configurationCounts(t, db, ctx) {
+			t.Fatal("invalid reference owner left rows or quota")
+		}
+	}
+}
+
 func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 	db, ctx, g := configurationFixture(t)
 	q := configurationCreateForTest(t, g, "resource", nil)

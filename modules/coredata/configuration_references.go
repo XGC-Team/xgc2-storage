@@ -65,7 +65,13 @@ func configurationValidateReferences(ctx context.Context, tx *sql.Tx, scope, dom
 				id = ref.TargetCommitID
 			}
 			var body, manifest []byte
-			e = tx.QueryRowContext(ctx, "SELECT body,manifest FROM core_snapshots WHERE scope=? AND domain=? AND resource_id=? AND id=?", scope, ref.TargetDomain, tr.ID, id).Scan(&body, &manifest)
+			var row model.ConfigurationCommit
+			var branchResource sql.NullString
+			// A live fork may share another branch's immutable head. Bind the
+			// snapshot's original branch to the resource, not to the live selector.
+			e = tx.QueryRowContext(ctx, `SELECT s.body,s.manifest,s.branch_id,s.version,s.source_commit_id,s.content_digest,b.resource_id
+ FROM core_snapshots s LEFT JOIN core_branches b ON b.scope=s.scope AND b.domain=s.domain AND b.id=s.branch_id
+ WHERE s.scope=? AND s.domain=? AND s.resource_id=? AND s.id=?`, scope, ref.TargetDomain, tr.ID, id).Scan(&body, &manifest, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &branchResource)
 			if errors.Is(e, sql.ErrNoRows) {
 				return failure("not_found", "exact owned reference target not found")
 			}
@@ -76,7 +82,7 @@ func configurationValidateReferences(ctx context.Context, tx *sql.Tx, scope, dom
 			if bytes > model.MaxConfigurationDecodedBytes {
 				return failure("resource_exhausted", "reference target materialization exceeds bound")
 			}
-			if json.Unmarshal(body, &target.commit) != nil || target.commit.ID != id || target.commit.ResourceID != tr.ID || target.commit.BranchID != tb.ID {
+			if !branchResource.Valid || branchResource.String != tr.ID || json.Unmarshal(body, &target.commit) != nil || target.commit.ID != id || target.commit.ResourceID != tr.ID || target.commit.BranchID != row.BranchID || target.commit.Version != row.Version || target.commit.SourceCommitID != row.SourceCommitID || target.commit.ContentDigest != row.ContentDigest || !positiveRevision(row.Version) {
 				return failure("data_loss", "reference commit ownership disagrees")
 			}
 			target.manifest, e = model.DecodeConfigurationManifest(manifest)
