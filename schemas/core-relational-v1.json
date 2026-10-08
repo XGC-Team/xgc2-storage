@@ -129,7 +129,7 @@
         {
           "id": "coredata",
           "schema": "core-relational-v1",
-          "digest": "01c748f5d944884e6bb8e8c34b1670b48b0482fa8eba726db2199a1ba5ff5717",
+          "digest": "78f828e92b92f28af9ad5a02a48c3bc4672182956ac67df3a6dd885261460a21",
           "operations": [
             {
               "id": "group.prepare",

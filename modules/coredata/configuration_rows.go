@@ -61,12 +61,21 @@ func configurationBranchNamed(ctx context.Context, tx *sql.Tx, scope, domain, re
 func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, resource, id string) (out model.ConfigurationResourceSnapshot, err error) {
 	var row model.ConfigurationCommit
 	var body []byte
-	err = tx.QueryRowContext(ctx, "SELECT id,resource_id,branch_id,version,source_commit_id,content_digest,payload,manifest,body FROM core_snapshots WHERE scope=? AND domain=? AND id=? AND resource_id=?", scope, domain, id, resource).Scan(&row.ID, &row.ResourceID, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &out.Payload, &out.Manifest, &body)
+	var branchResource sql.NullString
+	// A snapshot's resource FK and branch FK are independent. Bind the owning
+	// branch to that same aggregate in this indexed point read. Forked branches
+	// may share a head; its original branch need not be the selected live branch.
+	err = tx.QueryRowContext(ctx, `SELECT s.id,s.resource_id,s.branch_id,s.version,s.source_commit_id,s.content_digest,s.payload,s.manifest,s.body,b.resource_id
+ FROM core_snapshots s LEFT JOIN core_branches b ON b.scope=s.scope AND b.domain=s.domain AND b.id=s.branch_id
+ WHERE s.scope=? AND s.domain=? AND s.id=? AND s.resource_id=?`, scope, domain, id, resource).Scan(&row.ID, &row.ResourceID, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &out.Payload, &out.Manifest, &body, &branchResource)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, failure("not_found", "owned immutable commit not found")
 	}
 	if err != nil {
 		return out, err
+	}
+	if !branchResource.Valid || branchResource.String != row.ResourceID {
+		return out, failure("data_loss", "immutable snapshot branch belongs to another resource")
 	}
 	if json.Unmarshal(body, &out.Head.Commit) != nil || out.Head.Commit.ID != row.ID || out.Head.Commit.ResourceID != row.ResourceID || out.Head.Commit.BranchID != row.BranchID || out.Head.Commit.Version != row.Version || out.Head.Commit.SourceCommitID != row.SourceCommitID || out.Head.Commit.ContentDigest != row.ContentDigest || !positiveRevision(row.Version) || out.Head.Commit.SchemaVersion < 1 || !canonicalSessionPin(out.Head.Commit.RootDigest) {
 		return out, failure("data_loss", "immutable commit metadata disagrees")
@@ -151,21 +160,28 @@ func configurationCurrentMain(ctx context.Context, tx *sql.Tx, scope, domain str
 		payload = selected.Payload
 	} else {
 		var body []byte
+		var branchID, contentDigest string
+		var branchResource sql.NullString
 		// Project only the generic member from the authoritative blob. Do not
 		// materialize a second full opaque payload for historical/nonmain reads.
-		err = tx.QueryRowContext(ctx, "SELECT body,json_extract(CAST(payload AS TEXT),'$.identity') FROM core_snapshots WHERE scope=? AND domain=? AND resource_id=? AND id=?", scope, domain, r.ID, r.MainCommitID).Scan(&body, &identity)
+		err = tx.QueryRowContext(ctx, `SELECT s.body,json_extract(CAST(s.payload AS TEXT),'$.identity'),s.branch_id,s.content_digest,b.resource_id
+ FROM core_snapshots s LEFT JOIN core_branches b ON b.scope=s.scope AND b.domain=s.domain AND b.id=s.branch_id
+ WHERE s.scope=? AND s.domain=? AND s.resource_id=? AND s.id=?`, scope, domain, r.ID, r.MainCommitID).Scan(&body, &identity, &branchID, &contentDigest, &branchResource)
 		if errors.Is(err, sql.ErrNoRows) {
 			return out, failure("data_loss", "current main commit is missing")
 		}
 		if err != nil {
 			return out, err
 		}
-		if json.Unmarshal(body, &commit) != nil || commit.ID != r.MainCommitID || commit.ResourceID != r.ID || commit.BranchID != b.ID || commit.SchemaVersion < 1 || !canonicalSessionPin(commit.ContentDigest) {
+		if json.Unmarshal(body, &commit) != nil || !branchResource.Valid || branchResource.String != r.ID || commit.BranchID != branchID || commit.ContentDigest != contentDigest {
 			return out, failure("data_loss", "current main metadata disagrees")
 		}
 		if !object(identity) || len(identity) > model.MaxConfigurationIdentityBytes {
 			return out, failure("data_loss", "invalid bounded current-main identity projection")
 		}
+	}
+	if commit.ID != r.MainCommitID || commit.ResourceID != r.ID || commit.BranchID != b.ID || commit.SchemaVersion < 1 || !canonicalSessionPin(commit.ContentDigest) {
+		return out, failure("data_loss", "current main metadata disagrees")
 	}
 	if identity == nil {
 		var e error

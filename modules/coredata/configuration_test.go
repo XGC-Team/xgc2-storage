@@ -373,3 +373,45 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	configurationCode(t, e, "conflict")
 	tx.Rollback()
 }
+
+func TestConfigurationSnapshotBranchAggregateAndExactContentGuard(t *testing.T) {
+	db, ctx, g := configurationFixture(t)
+	q := configurationCreateForTest(t, g, "resource", nil)
+	first := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
+	bad := configurationCommitForTest(t, g, first, "wrong-content", "b", true, nil, q.Snapshot.Manifest)
+	bad.Branch.ContentDigest = strings.Repeat("0", 64)
+	before := configurationCounts(t, db, ctx)
+	_, e := run(t, db, ctx, model.ResourceCommitOperation, bad)
+	configurationCode(t, e, "conflict")
+	if before != configurationCounts(t, db, ctx) {
+		t.Fatal("correct head with wrong content pin wrote facts")
+	}
+	other := configurationCreateForTest(t, g, "other", nil)
+	second := configurationWrite(t, db, ctx, model.ResourceCreateOperation, other)
+	// Both declared FKs still hold, but the immutable snapshot points to the
+	// other aggregate's branch. Its scalar row and body deliberately agree.
+	c := first.Result.Head.Commit
+	c.BranchID = second.Result.Head.Branch.ID
+	body, _ := json.Marshal(c)
+	execSQL(t, db, ctx, "UPDATE core_snapshots SET branch_id=?,body=? WHERE scope=? AND domain=? AND id=?", c.BranchID, body, testScope, g.Key, c.ID)
+	before = configurationCounts(t, db, ctx)
+	validGuard := configurationCommitForTest(t, g, first, "foreign-owner", "b", true, nil, q.Snapshot.Manifest)
+	_, e = run(t, db, ctx, model.ResourceCommitOperation, validGuard)
+	configurationCode(t, e, "data_loss")
+	if before != configurationCounts(t, db, ctx) {
+		t.Fatal("foreign snapshot branch owner wrote facts")
+	}
+	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
+	configurationCode(t, e, "data_loss")
+	// Selecting a different immutable commit still validates current-main's
+	// owner while returning only its identity projection.
+	otherCommit := second.Result.Head.Commit
+	otherCommit.ID = "owned-history"
+	otherCommit.ResourceID = first.Result.Head.Resource.ID
+	otherCommit.BranchID = first.Result.Head.Branch.ID
+	otherCommit.Version = "2"
+	body, _ = json.Marshal(otherCommit)
+	execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)", testScope, g.Key, otherCommit.ID, otherCommit.ResourceID, otherCommit.BranchID, otherCommit.Version, "", otherCommit.ContentDigest, other.Snapshot.Payload, other.Snapshot.Manifest, body)
+	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, CommitID: otherCommit.ID})
+	configurationCode(t, e, "data_loss")
+}
