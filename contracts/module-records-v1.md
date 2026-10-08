@@ -47,11 +47,15 @@ Budgets are cumulative for one Execute invocation:
 | --- | --- |
 | State mutations | 4096, with any stricter compiled operation bound |
 | State preparation bytes | operation MaxRequestBytes, charging the larger of raw preparation cost and canonical mutation JSON |
-| Dependent query pages/helper query calls | 4096 |
+| Dependent query pages/helper query calls | 24576 |
 | Dependent query input bytes | operation MaxRequestBytes, charging raw input and encoded input, including internal page cursors |
 | Dependent scanned/materialized rows | 65536, including missing keys and index lookahead rows |
 | Dependent materialized bytes | operation MaxResponseBytes, charging encoded Record JSON including lookahead |
 | Named request / response | reviewed operation bounds, at most 16 MiB each, complete envelope/result plus receipt |
+
+The query budget covers the compiled session snapshot's 4096 Runs with five
+dependent reads each and two additional member/session reads (20482 total).
+The row, byte and exact-key page bounds remain independent of this query budget.
 
 Index lookahead is charged again if read on the next page. These finite work
 budgets include intermediate preparation; the final response has its independent

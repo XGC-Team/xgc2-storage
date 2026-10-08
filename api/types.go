@@ -17,7 +17,7 @@ const MaxNamedRequestBytes = 16 << 20
 const MaxNamedResponseBytes = 16 << 20
 const MaxNamedStateMutations = 4096
 const MaxNamedReadRows = 65536
-const MaxNamedReadQueries = 4096
+const MaxNamedReadQueries = 24576
 
 // Revisions are canonical decimal strings to preserve precision in every SDK.
 type Scope struct {
