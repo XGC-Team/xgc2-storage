@@ -208,6 +208,9 @@ type ConfigurationMutationResult struct {
 
 // Exactly one selector: resource+branch, resource+commit, or namespace+name_key.
 // The latter uses current main. Branch defaults explicitly to main in Core.
+// Branch is the canonical folded NameKey returned by NormalizeConfigurationName,
+// never the display Name or branch ID. For display Name "Review", supply "review";
+// the returned Head.Branch retains both original display Name and canonical key.
 type ConfigurationResourceRead struct {
 	Domain          ConfigurationDomainGuard `json:"domain"`
 	ResourceID      string                   `json:"resource_id"`

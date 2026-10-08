@@ -520,6 +520,11 @@ head and content digests. Revisions, versions and next_version are canonical
 signed-64-bit decimal strings, including values above 2^53. There is no whole-scope
 CAS. ConfigurationResourceRead selects exactly resource+explicit branch,
 resource+commit, or namespace+name key; Core explicitly chooses main when intended.
+Its Branch selector is the shared normalizer's canonical folded NameKey, never a
+display Name or branch ID. Name="Review"/NameKey="review" is selected only by
+Branch="review"; storage performs one name_key lookup and returns both fields.
+Core binds the read selector to Head.Branch.NameKey. No display-name retry,
+second lookup, alias or fallback is used.
 
 Every resource.snapshot returns the selected complete immutable facts plus
 CurrentMain{Branch,SchemaVersion,Identity}, from the same read transaction.

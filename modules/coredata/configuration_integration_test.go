@@ -28,7 +28,23 @@ type configNamedFixture struct {
 }
 
 func openConfigurationNamed(t *testing.T, dev, late bool) *configNamedFixture {
+	branch := ""
+	if dev {
+		branch = "dev"
+	}
+	return openConfigurationNamedBranch(t, branch, late)
+}
+
+func openConfigurationNamedBranch(t *testing.T, branch string, late bool) *configNamedFixture {
 	t.Helper()
+	var branchName, branchKey string
+	if branch != "" {
+		var e error
+		branchName, branchKey, e = model.NormalizeConfigurationName(model.ConfigurationBranchName, branch)
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	dir := t.TempDir()
@@ -56,16 +72,16 @@ func openConfigurationNamed(t *testing.T, dev, late bool) *configNamedFixture {
 		}
 		// Fixture-only branch seed models the later explicit branch-create authority;
 		// it is not a production named operation or consumer fallback.
-		if dev && op == model.ResourceCreateOperation {
+		if branch != "" && op == model.ResourceCreateOperation {
 			var out model.ConfigurationMutationResult
 			if e = json.Unmarshal(result, &out); e != nil {
 				return nil, e
 			}
 			if !out.Replayed && out.Result.Head.Resource.ID == "resource" {
 				b := out.Result.Head.Branch
-				b.ID = "resource-dev"
-				b.Name = "dev"
-				b.NameKey = "dev"
+				b.ID = "resource-" + branchKey
+				b.Name = branchName
+				b.NameKey = branchKey
 				b.CreatedFromCommitID = b.HeadCommitID
 				body, _ := json.Marshal(b)
 				_, e = tx.ExecContext(ctx, "INSERT INTO core_branches VALUES(?,?,?,?,?,?,?,?)", scope, g.Key, b.ID, b.ResourceID, b.NameKey, b.HeadCommitID, b.Revision, body)
@@ -150,6 +166,100 @@ func (f *configNamedFixture) read(t *testing.T, resource, branch, commit string)
 func configCommit(t *testing.T, f *configNamedFixture, s model.ConfigurationResourceSnapshot, key, tag string) model.ConfigurationResourceCommit {
 	h := s.Head
 	return model.ConfigurationResourceCommit{Domain: f.domain, Mutation: model.ConfigurationMutation{Key: key, IntentDigest: strings.Repeat("b", 64), Actor: "tester"}, ResourceID: h.Resource.ID, Branch: model.ConfigurationBranchGuard{ID: h.Branch.ID, ExpectedRevision: h.Branch.Revision, CommitID: h.Commit.ID, ContentDigest: h.Commit.ContentDigest}, Main: s.CurrentMain.Branch, CommitID: key + "-commit", Name: h.Resource.Name, NameKey: h.Resource.NameKey, Snapshot: configPrepared(t, key+"-change", tag, s.Manifest)}
+}
+
+func TestConfigurationNamedCanonicalBranchSelector(t *testing.T) {
+	f := openConfigurationNamedBranch(t, "Review", false)
+	create := configCreate(t, f, "resource")
+	r, e := f.named(model.ResourceCreateOperation, "create", create)
+	configResult(t, r, e)
+	display, key, e := model.NormalizeConfigurationName(model.ConfigurationBranchName, "Review")
+	if e != nil {
+		t.Fatal(e)
+	}
+	selected := f.read(t, create.ResourceID, key, "")
+	if selected.Head.Branch.Name != display || selected.Head.Branch.NameKey != key || selected.Head.Branch.HeadCommitID != selected.Head.Commit.ID {
+		t.Fatal("canonical selector did not identify display branch")
+	}
+	_, e = f.named(model.ResourceSnapshotOperation, "display-rejected", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: create.ResourceID, Branch: display})
+	requireSessionCode(t, e, "invalid_argument")
+	_, e = f.named(model.ResourceSnapshotOperation, "id-rejected", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: create.ResourceID, Branch: selected.Head.Branch.ID})
+	requireSessionCode(t, e, "not_found")
+	noop := configCommit(t, f, selected, "review-noop", "a")
+	r, e = f.named(model.ResourceCommitOperation, "review-noop", noop)
+	result := configResult(t, r, e)
+	if result.Replayed || result.Result.Disposition != "noop" || result.Result.Head.Branch != selected.Head.Branch || result.Result.Head.Commit != selected.Head.Commit {
+		t.Fatal("fresh noop changed selected immutable/branch facts")
+	}
+}
+
+func TestConfigurationNamedSharedHeadTrackingBranchBlocksRemoval(t *testing.T) {
+	f := openConfigurationNamedBranch(t, "other", false)
+	create := configCreate(t, f, "resource")
+	self := model.ConfigurationReference{Slot: "self", Mode: "tracking", TargetDomain: f.domain.Key, TargetResourceID: create.ResourceID, TargetBranch: "main", TargetComponentID: "x"}
+	create.Snapshot.References = []model.ConfigurationReference{self}
+	r, e := f.named(model.ResourceCreateOperation, "create", create)
+	configResult(t, r, e)
+	main := f.read(t, create.ResourceID, "main", "")
+	other := f.read(t, create.ResourceID, "other", "")
+	if main.Head.Commit.ID != other.Head.Commit.ID || other.Head.Branch.CreatedFromCommitID != main.Head.Commit.ID || len(other.References) != 1 || other.References[0] != self {
+		t.Fatal("fixture branch did not inherit the exact immutable tracking set")
+	}
+	before, e := model.DecodeConfigurationManifest(main.Manifest)
+	if e != nil {
+		t.Fatal(e)
+	}
+	manifest := model.ConfigurationManifest{Nodes: []model.ConfigurationManifestNode{{ID: "root", Kind: "root"}}}
+	after, e := model.ValidateConfigurationManifest(manifest)
+	if e != nil {
+		t.Fatal(e)
+	}
+	changes, summary, e := model.DiffConfigurationManifests(before, after)
+	if e != nil {
+		t.Fatal(e)
+	}
+	manifestBytes, e := json.Marshal(manifest)
+	if e != nil {
+		t.Fatal(e)
+	}
+	h := main.Head
+	q := model.ConfigurationResourceCommit{
+		Domain: f.domain, Mutation: model.ConfigurationMutation{Key: "remove-x", IntentDigest: strings.Repeat("b", 64), Actor: "tester"},
+		ResourceID: h.Resource.ID, Branch: model.ConfigurationBranchGuard{ID: h.Branch.ID, ExpectedRevision: h.Branch.Revision, CommitID: h.Commit.ID, ContentDigest: h.Commit.ContentDigest}, Main: main.CurrentMain.Branch,
+		CommitID: "remove-x-commit", Name: h.Resource.Name, NameKey: h.Resource.NameKey,
+		Snapshot: model.PreparedConfigurationSnapshot{RootDigest: after.RootDigest, Payload: []byte(`{"identity":{"active":true},"body":{}}`), Manifest: manifestBytes, Change: model.ConfigurationChange{ID: "remove-x-change", Summary: summary, Nodes: changes}},
+	}
+	// Inspect only this isolated fixture via a read-only connection. The other
+	// branch inherited C0; no new reference rows or production branch API exist.
+	db, e := sql.Open("sqlite", "file:"+f.config.Path+"?mode=ro")
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer db.Close()
+	state := func() string {
+		out := ""
+		for _, table := range []string{"core_resources", "core_branches", "core_snapshots", "core_references", "core_changes", "core_configuration_receipts", "receipts", "named_results"} {
+			var n int
+			if e := db.QueryRowContext(f.ctx, "SELECT count(*) FROM "+table).Scan(&n); e != nil {
+				t.Fatal(e)
+			}
+			out += fmt.Sprint(table, "=", n, ";")
+		}
+		var rows, bytes int64
+		if e := db.QueryRowContext(f.ctx, "SELECT coalesce(sum(rows),0),coalesce(sum(bytes),0) FROM core_data_usage").Scan(&rows, &bytes); e != nil {
+			t.Fatal(e)
+		}
+		return out + fmt.Sprint(rows, "/", bytes)
+	}
+	persisted := state()
+	r, e = f.named(model.ResourceCommitOperation, "remove-x", q)
+	requireSessionCode(t, e, "failed_precondition")
+	if r.Receipt != nil || state() != persisted {
+		t.Fatal("inherited live-source rejection left rows, receipts or quota")
+	}
+	if f.read(t, create.ResourceID, "main", "").Head != main.Head || f.read(t, create.ResourceID, "other", "").Head != other.Head {
+		t.Fatal("inherited live-source rejection changed pointers or counters")
+	}
 }
 
 func TestConfigurationNamedConcurrentProductReceiptAndRestartTTL(t *testing.T) {
