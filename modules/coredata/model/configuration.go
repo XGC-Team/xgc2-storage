@@ -45,7 +45,9 @@ type ConfigurationBranchGuard struct {
 }
 
 // Only the outgoing target is supplied. Storage derives source kind, resource,
-// branch and commit from the operation. TargetVersion is also decimal string.
+// branch and commit from the operation. TargetBranch is a canonical name.
+// Tracking requires all three pin fields empty; pinned requires exact immutable
+// commit/root and a positive canonical int64 decimal TargetVersion.
 type ConfigurationReference struct {
 	Slot              string `json:"slot"`
 	Mode              string `json:"mode"`

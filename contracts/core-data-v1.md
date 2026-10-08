@@ -706,10 +706,12 @@ exact manifest, and canonical Slot-sorted references JSON. Control reference bod
 use UseNumber and stable key ordering; frozen data bytes are never compacted. This
 is a new-schema algorithm, with no previous digest compatibility path.
 
-Tracking references have canonical explicit target branch and component. The
-commit/version/root triple is either entirely absent for logical tracking or fully
-present as a transaction-checked target pin. Pinned references always require that
-exact immutable triple. Storage derives sources from the immutable commit and
+Tracking references have canonical explicit target branch names and component.
+Their commit/version/root fields must all be empty; any nonempty field is
+invalid_argument, including noop/location-only plans. Pinned references require
+the exact immutable triple with a positive canonical int64 decimal version.
+Resolved tracking heads never replace the supplied logical refs in stored rows
+or shared digests. Storage derives sources from the immutable commit and
 live branch heads. An incoming reference on a shared commit remains active for
 every live branch pointing to that commit; excluding the replaced branch does not
 exclude another branch sharing its old head. Incoming materialization is bounded

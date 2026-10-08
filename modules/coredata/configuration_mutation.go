@@ -55,6 +55,11 @@ func configurationPlanBound(s model.PreparedConfigurationSnapshot, control any, 
 	if len(s.Payload) > model.MaxConfigurationPayloadBytes || len(s.Manifest) > model.MaxConfigurationManifestBytes || len(s.References) > model.MaxConfigurationReferences || len(s.Change.Nodes) > model.MaxConfigurationNodeChanges {
 		return failure("resource_exhausted", "configuration plan bound exceeded")
 	}
+	for _, ref := range s.References {
+		if e := model.ValidateConfigurationReferenceMode(ref); e != nil {
+			return failure("invalid_argument", e.Error())
+		}
+	}
 	b, e := encode(control)
 	if e != nil {
 		return e

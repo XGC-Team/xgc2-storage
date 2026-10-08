@@ -33,6 +33,32 @@ func configurationPlanDigest(operation string, r any) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Tracking stores a logical address; only pinned mode carries immutable facts.
+// This check is shared by snapshot hashing and writer plan admission, including
+// noop/location-only plans whose proposed immutable bytes are not published.
+func ValidateConfigurationReferenceMode(ref ConfigurationReference) error {
+	switch ref.Mode {
+	case "tracking":
+		if ref.TargetCommitID != "" || ref.TargetVersion != "" || ref.TargetRootDigest != "" {
+			return fmt.Errorf("tracking reference pin fields must all be empty")
+		}
+	case "pinned":
+		if err := ValidateConfigurationIdentifier(ref.TargetCommitID); err != nil {
+			return err
+		}
+		if err := ValidateConfigurationDecimal(ref.TargetVersion, false); err != nil {
+			return err
+		}
+		root, err := hex.DecodeString(ref.TargetRootDigest)
+		if err != nil || len(root) != sha256.Size || hex.EncodeToString(root) != ref.TargetRootDigest {
+			return fmt.Errorf("pinned reference requires a canonical SHA256 root digest")
+		}
+	default:
+		return fmt.Errorf("reference mode must be tracking or pinned")
+	}
+	return nil
+}
+
 // ConfigurationContentDigest shares the exact frozen-byte snapshot algorithm
 // with namespace operations. References are a complete set sorted by Slot;
 // caller slices are never mutated. This digest is distinct from business root.
@@ -43,6 +69,9 @@ func ConfigurationContentDigest(payload, manifest []byte, refs []ConfigurationRe
 	out := make([]Reference, 0, len(refs))
 	seen := map[string]bool{}
 	for _, ref := range refs {
+		if err := ValidateConfigurationReferenceMode(ref); err != nil {
+			return "", err
+		}
 		if ValidateConfigurationName(ConfigurationSlotName, ref.Slot) != nil || seen[ref.Slot] {
 			return "", fmt.Errorf("invalid or duplicate reference slot")
 		}

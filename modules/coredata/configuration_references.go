@@ -31,13 +31,8 @@ func configurationValidateReferences(ctx context.Context, tx *sql.Tx, scope, dom
 		if e != nil || branch != ref.TargetBranch || !textKey(ref.TargetDomain) || !textKey(ref.TargetResourceID) || ref.TargetComponentID != "" && !textKey(ref.TargetComponentID) {
 			return failure("invalid_argument", "explicit canonical reference target required")
 		}
-		if ref.Mode != "tracking" && ref.Mode != "pinned" {
-			return failure("invalid_argument", "reference mode must be tracking or pinned")
-		}
-		hasPin := ref.TargetCommitID != "" || ref.TargetVersion != "" || ref.TargetRootDigest != ""
-		if (ref.Mode == "pinned" || hasPin) && (!textKey(ref.TargetCommitID) || !positiveRevision(ref.TargetVersion) || !canonicalSessionPin(ref.TargetRootDigest)) {
-			return failure("invalid_argument", "complete exact reference pin required")
-		}
+		// configurationPlanBound admitted logical tracking or exact pinned mode;
+		// the resolver never fills a transient head pin into the supplied refs.
 		key := ref.TargetDomain + "\x00" + ref.TargetResourceID + "\x00" + ref.TargetBranch
 		if ref.Mode == "pinned" {
 			key += "\x00" + ref.TargetCommitID
@@ -91,7 +86,7 @@ func configurationValidateReferences(ctx context.Context, tx *sql.Tx, scope, dom
 			}
 			cache[key] = target
 		}
-		if hasPin && (ref.TargetCommitID != target.commit.ID || ref.TargetVersion != target.commit.Version || ref.TargetRootDigest != target.commit.RootDigest) {
+		if ref.Mode == "pinned" && (ref.TargetCommitID != target.commit.ID || ref.TargetVersion != target.commit.Version || ref.TargetRootDigest != target.commit.RootDigest) {
 			return failure("conflict", "reference target pin changed")
 		}
 		if ref.TargetComponentID != "" && !target.manifest.Contains(ref.TargetComponentID) {

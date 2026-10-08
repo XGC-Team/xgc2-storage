@@ -290,6 +290,77 @@ func TestConfigurationReferenceSharedHeadOwnership(t *testing.T) {
 	}
 }
 
+func TestConfigurationTrackingAndPinnedModeSeparation(t *testing.T) {
+	db, ctx, g := configurationFixture(t)
+	logical := model.ConfigurationReference{Slot: "self", Mode: "tracking", TargetDomain: g.Key, TargetResourceID: "resource", TargetBranch: "main", TargetComponentID: "x"}
+	q := configurationCreateForTest(t, g, "resource", []model.ConfigurationReference{logical})
+	first := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
+	content, e := model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, q.Snapshot.References)
+	if e != nil || content != first.Result.Head.Commit.ContentDigest {
+		t.Fatal("logical references changed during resolution/hash", e)
+	}
+	raw, e := run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
+	if e != nil {
+		t.Fatal(e)
+	}
+	var snapshot model.ConfigurationResourceSnapshot
+	if e = json.Unmarshal(raw, &snapshot); e != nil || len(snapshot.References) != 1 || snapshot.References[0] != logical {
+		t.Fatal("tracking reference was converted or filled with a resolved pin", e)
+	}
+	for _, fields := range []string{"all", "commit", "version", "root"} {
+		ref := logical
+		if fields == "all" || fields == "commit" {
+			ref.TargetCommitID = q.CommitID
+		}
+		if fields == "all" || fields == "version" {
+			ref.TargetVersion = "1"
+		}
+		if fields == "all" || fields == "root" {
+			ref.TargetRootDigest = q.Snapshot.RootDigest
+		}
+		for _, kind := range []string{"create", "commit", "noop"} {
+			key := "tracking-pin-" + fields + "-" + kind
+			var plan any
+			op := model.ResourceCommitOperation
+			if kind == "create" {
+				plan = configurationCreateForTest(t, g, key, []model.ConfigurationReference{ref})
+				op = model.ResourceCreateOperation
+			} else {
+				tag := "b"
+				if kind == "noop" {
+					tag = "a"
+				}
+				plan = configurationCommitForTest(t, g, first, key, tag, true, []model.ConfigurationReference{ref}, q.Snapshot.Manifest)
+			}
+			before := configurationCounts(t, db, ctx)
+			_, e = run(t, db, ctx, op, plan)
+			configurationCode(t, e, "invalid_argument")
+			if before != configurationCounts(t, db, ctx) {
+				t.Fatal("invalid tracking pin left rows or quota", key)
+			}
+		}
+		if _, e = model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, []model.ConfigurationReference{ref}); e == nil {
+			t.Fatal("shared content digest accepted tracking pin", fields)
+		}
+	}
+	pinned := logical
+	pinned.Mode, pinned.TargetCommitID, pinned.TargetVersion, pinned.TargetRootDigest = "pinned", q.CommitID, "1", q.Snapshot.RootDigest
+	bad := pinned
+	bad.TargetVersion = "9223372036854775808"
+	before := configurationCounts(t, db, ctx)
+	_, e = run(t, db, ctx, model.ResourceCreateOperation, configurationCreateForTest(t, g, "overflow-pin", []model.ConfigurationReference{bad}))
+	configurationCode(t, e, "invalid_argument")
+	if before != configurationCounts(t, db, ctx) {
+		t.Fatal("overflowing pinned version left rows or quota")
+	}
+	// Historical pinned X remains an immutable target when this new main lacks X.
+	commit := configurationCommitForTest(t, g, first, "pinned-history", "b", false, []model.ConfigurationReference{pinned}, q.Snapshot.Manifest)
+	second := configurationWrite(t, db, ctx, model.ResourceCommitOperation, commit)
+	if second.Result.Head.Commit.ID != commit.CommitID {
+		t.Fatal("historical pin was compared to the prospective live head")
+	}
+}
+
 func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 	db, ctx, g := configurationFixture(t)
 	q := configurationCreateForTest(t, g, "resource", nil)
