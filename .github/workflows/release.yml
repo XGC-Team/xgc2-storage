@@ -1,0 +1,60 @@
+name: release
+on:
+  workflow_dispatch:
+    inputs:
+      expected_version: {required: true, type: string}
+      expected_source_sha: {required: true, type: string}
+      prepare_action:
+        required: false
+        default: release
+        type: choice
+        options: [release, compatibility-verify]
+      apt_overlay_url: {required: false, default: "", type: string}
+      dependency_set_digest: {required: false, default: "", type: string}
+permissions:
+  contents: read
+  packages: read
+concurrency:
+  group: storage-release-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-debs:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-latest}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check requested source identity
+        env:
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          EXPECTED_VERSION: ${{ inputs.expected_version }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
+          test "$(awk -F': *' '/^version:/ {print $2;exit}' .xgc2/product.yml)" = "$EXPECTED_VERSION"
+      - name: Authenticate image pull
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and install the static storage package
+        run: |
+          set -euo pipefail
+          image='ghcr.io/xgc-team/xgc2-images/xgc2-build-focal-full-noetic@sha256:37f273f6d63c58ff90bf781b7684c7a034cbaf5054165861e3dd0928f2559f31'
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp \
+            -e GOMAXPROCS=2 \
+            -e GITHUB_RUN_ID -e GITHUB_SHA -e GITHUB_WORKFLOW -e GITHUB_WORKFLOW_REF \
+            -e RUNNER_TEMP=/out \
+            -v "$GITHUB_WORKSPACE:/work" -v "$RUNNER_TEMP:/out" -w /work \
+            "$image" bash .xgc2/scripts/build_ci.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xgc2-storage-debs-${{ matrix.arch }}
+          path: .ci/artifacts/
+          include-hidden-files: true
+          retention-days: 14

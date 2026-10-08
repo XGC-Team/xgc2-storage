@@ -1,5 +1,9 @@
 /build/
+__pycache__/
 *.db
 *.db-wal
 *.db-shm
 *.owner.lock
+
+/tests/faults/evidence/
+/.ci/

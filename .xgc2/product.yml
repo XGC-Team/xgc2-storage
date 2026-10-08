@@ -1,0 +1,38 @@
+schema: xgc2.product.v1
+id: xgc2-storage
+name: XGC2 Storage
+version: 0.1.0-1
+kind: toolchain-apt
+summary: Independent bounded SQLite owner with XRPC data transactions and durable receipts.
+apt:
+  distribution: focal,jammy,noble
+  install:
+  - xgc2-storage
+  packages:
+  - xgc2-storage
+  package_architectures:
+    xgc2-storage: [amd64, arm64]
+  depends: [ca-certificates]
+usage:
+  install: sudo apt install xgc2-storage
+  smoke_test: xgc2-storage --help
+  notes: >-
+    Deployment grants select database, manifest, owner credentials and sockets.
+    No systemd autostart, database root defaults, legacy imports or Core/ROS dependency.
+    Core and each Agent use separate local instances. Static Go builds embed the
+    shared XRPC implementation; the build receipt records its source identity.
+ownership:
+  paths:
+  - /usr/bin/xgc2-storage
+  - /usr/bin/xgc2-storage-admin
+  - /usr/share/xgc2-storage/contracts
+  - /usr/share/xgc2-storage/schemas
+release:
+  repository: XGC-Team/xgc2-storage
+  ref: main
+  requires: []
+  dependency_policy: {}
+  apt_versions:
+    focal: 0.1.0-1~focal
+    jammy: 0.1.0-1~jammy
+    noble: 0.1.0-1~noble
