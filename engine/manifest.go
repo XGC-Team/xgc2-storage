@@ -39,7 +39,8 @@ func revision(v string) (int64, error) {
 }
 func DecodeManifest(r io.Reader) (api.Manifest, error) {
 	var m api.Manifest
-	d := json.NewDecoder(io.LimitReader(r, 4<<20))
+	limited := &io.LimitedReader{R: r, N: (4 << 20) + 1}
+	d := json.NewDecoder(limited)
 	d.DisallowUnknownFields()
 	if err := d.Decode(&m); err != nil {
 		return m, err
@@ -47,6 +48,9 @@ func DecodeManifest(r io.Reader) (api.Manifest, error) {
 	var tail any
 	if err := d.Decode(&tail); err != io.EOF {
 		return m, fail("invalid_argument", "one manifest required")
+	}
+	if limited.N == 0 {
+		return m, fail("resource_exhausted", "manifest exceeds 4 MiB")
 	}
 	return m, ValidateManifest(m)
 }
@@ -71,7 +75,7 @@ func ValidateManifest(m api.Manifest) error {
 			}
 			ops := map[string]bool{}
 			for _, o := range m.Operations {
-				if !identifier(o.ID) || ops[o.ID] || o.MaxRequestBytes < 1 || o.MaxRequestBytes > 16<<20 || o.MaxResponseBytes < 1 || o.MaxResponseBytes > 16<<20 {
+				if !identifier(o.ID) || ops[o.ID] || o.MaxRequestBytes < 1 || o.MaxRequestBytes > api.MaxNamedRequestBytes || o.MaxResponseBytes < 1 || o.MaxResponseBytes > api.MaxNamedResponseBytes {
 					return fail("invalid_argument", "named operation bounds required")
 				}
 				ops[o.ID] = true

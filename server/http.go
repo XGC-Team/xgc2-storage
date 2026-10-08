@@ -24,8 +24,13 @@ func ValidateGrants(grants []Grant) error {
 		return errors.New("storage: 1..256 owner grants required")
 	}
 	for _, g := range grants {
-		if len(g.Token) < 32 || len(g.Token) > 256 || strings.ContainsAny(g.Token, " \r\n\x00") || g.Namespace == "" || g.User == "" || g.Workspace == "" {
+		if len(g.Token) < 32 || len(g.Token) > 256 || g.Namespace == "" || g.User == "" || g.Workspace == "" {
 			return errors.New("storage: explicit namespace/user/workspace grant and private >=32-byte token required")
+		}
+		for _, c := range g.Token {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~+/=", c)) {
+				return errors.New("storage: owner token must use portable ASCII Bearer token bytes")
+			}
 		}
 	}
 	return nil

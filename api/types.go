@@ -11,6 +11,14 @@ const MaxOperations = 256
 const MaxQueries = 64
 const MaxRows = 2048
 
+// Named operations have a reviewed, separate envelope and owner-local bounds.
+// Their typed module payloads are not expanded into ordinary Batch requests.
+const MaxNamedRequestBytes = 16 << 20
+const MaxNamedResponseBytes = 16 << 20
+const MaxNamedStateMutations = 4096
+const MaxNamedReadRows = 65536
+const MaxNamedReadQueries = 4096
+
 // Revisions are canonical decimal strings to preserve precision in every SDK.
 type Scope struct {
 	Namespace string `json:"namespace"`

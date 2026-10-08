@@ -67,7 +67,7 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 			return out, e
 		}
 		defer tx.Rollback()
-		out.Result, err = module.Execute(ctx, tx, id, r.Operation, r.Payload)
+		out.Result, err = s.executeModule(ctx, tx, id, n, module, operation, 0, r.Payload)
 		if err != nil {
 			return out, err
 		}
@@ -80,6 +80,19 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 		}
 		err = tx.Commit()
 		return out, err
+	}
+	var cachedDigest string
+	var cachedBody []byte
+	cacheError := s.reader.QueryRowContext(ctx, "SELECT r.digest,n.body FROM receipts r LEFT JOIN named_results n ON n.scope=r.scope AND n.request_id=r.request_id WHERE r.scope=? AND r.request_id=?", id, r.RequestID).Scan(&cachedDigest, &cachedBody)
+	if cacheError == nil {
+		if cachedDigest != digest {
+			return out, fail("conflict", "request identity reused with different named intent")
+		}
+		err = json.Unmarshal(cachedBody, &out)
+		return out, err
+	}
+	if !errors.Is(cacheError, sql.ErrNoRows) {
+		return out, cacheError
 	}
 	if err = s.diskCheck(); err != nil {
 		return out, err
@@ -135,7 +148,7 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 	if count >= n.MaxReceipts {
 		return out, fail("resource_exhausted", "named receipt quota reached")
 	}
-	out.Result, err = module.Execute(ctx, tx, id, r.Operation, r.Payload)
+	out.Result, err = s.executeModule(ctx, tx, id, n, module, operation, rev+1, r.Payload)
 	if err != nil {
 		return out, err
 	}

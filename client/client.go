@@ -36,11 +36,11 @@ func (c *Client) call(ctx context.Context, id, path, method string, request, res
 	}
 	requestMaximum, responseMaximum := api.MaxRequestBytes, api.MaxResponseBytes
 	if _, ok := request.(api.NamedRequest); ok {
-		requestMaximum = 16 << 20
-		responseMaximum = 16 << 20
+		requestMaximum = api.MaxNamedRequestBytes
+		responseMaximum = api.MaxNamedResponseBytes
 	}
 	if method == "NamedResult" {
-		responseMaximum = 16 << 20
+		responseMaximum = api.MaxNamedResponseBytes
 	}
 	if len(raw) > requestMaximum {
 		return &api.Error{Code: "resource_exhausted", Message: "request exceeds storage byte limit"}

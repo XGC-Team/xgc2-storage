@@ -67,6 +67,23 @@ func (s *Store) Checkpoint(ctx context.Context) (out CheckpointResult, err error
 	}
 	defer release()
 	err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
+	if err != nil {
+		return
+	}
+	// PASSIVE backfills frames but leaves the allocated WAL file in place. At
+	// the physical admission watermark, that file would otherwise prevent the
+	// next writer from resetting it. Attempt one non-waiting reset under this
+	// same owner admission and deadline; a pinned reader leaves Busy set and
+	// preserves pressure until a later maintenance call can reclaim the file.
+	var st unix.Stat_t
+	if e := unix.Fstatat(s.owner.parent, s.owner.name+"-wal", &st, unix.AT_SYMLINK_NOFOLLOW); e != nil {
+		if e != unix.ENOENT {
+			err = e
+		}
+		return
+	} else if st.Size >= s.config.MaxWALBytes {
+		err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
+	}
 	return
 }
 func (s *Store) PruneExpiredReceipts(ctx context.Context, before time.Time, limit int) (deleted int64, err error) {
@@ -125,6 +142,10 @@ func (s *Store) Backup(ctx context.Context, destination string) (receipt BackupR
 		return receipt, e
 	}
 	defer unix.Close(parent)
+	if e = unix.Flock(parent, unix.LOCK_EX|unix.LOCK_NB); e != nil {
+		return receipt, fail("conflict", "backup directory is already owned")
+	}
+	defer unix.Flock(parent, unix.LOCK_UN)
 	// Duplicate the descriptor so os.File cannot close the grant's original fd.
 	dup, e := unix.Dup(parent)
 	if e != nil {
@@ -136,7 +157,7 @@ func (s *Store) Backup(ctx context.Context, destination string) (receipt BackupR
 	if e != nil && e != io.EOF {
 		return receipt, e
 	}
-	if len(entries) > 128 {
+	if len(entries) >= 128 {
 		return receipt, fail("resource_exhausted", "backup directory count limit reached")
 	}
 	var total int64
@@ -155,6 +176,20 @@ func (s *Store) Backup(ctx context.Context, destination string) (receipt BackupR
 	}
 	if err = s.diskCheck(); err != nil {
 		return receipt, err
+	}
+	var pageCount, pageSize int64
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return receipt, err
+	}
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return receipt, err
+	}
+	var destinationFS unix.Statfs_t
+	if err = unix.Fstatfs(parent, &destinationFS); err != nil {
+		return receipt, err
+	}
+	if destinationFS.Bavail*uint64(destinationFS.Bsize) < uint64(pageCount*pageSize+s.config.MinFreeBytes) {
+		return receipt, fail("resource_exhausted", "backup destination free-space budget exhausted")
 	}
 	temp, e := os.CreateTemp(fmt.Sprintf("/proc/self/fd/%d", parent), ".storage-backup-*.db")
 	if e != nil {

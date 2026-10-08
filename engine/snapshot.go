@@ -59,121 +59,9 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 		return nil
 	}
 	for _, q := range r.Queries {
-		c, e := collection(n, q.Collection)
+		result, e := queryRecords(ctx, tx, id, n, q, api.MaxRows, nil, appendRecord)
 		if e != nil {
 			return out, e
-		}
-		if q.After != "" && !key(q.After) {
-			return out, fail("invalid_argument", "invalid page key")
-		}
-		result := api.QueryResult{Collection: q.Collection, Records: []api.Record{}}
-		if len(q.Keys) > 0 {
-			if len(q.Keys) > api.MaxRows || q.Index != "" || len(q.Equal) > 0 || q.After != "" || q.Limit != 0 {
-				return out, fail("invalid_argument", "exact-key query cannot contain page/index fields")
-			}
-			for _, k := range q.Keys {
-				if !key(k) {
-					return out, fail("invalid_argument", "invalid record key")
-				}
-				record := api.Record{Key: k}
-				var v int64
-				var deleted int
-				e := tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, c.ID, k).Scan(&v, &deleted, &record.Data)
-				if errors.Is(e, sql.ErrNoRows) {
-					record.Missing = true
-					v = 0
-				} else if e != nil {
-					return out, e
-				}
-				record.Version = strconv.FormatInt(v, 10)
-				record.Deleted = deleted != 0
-				if err = appendRecord(&result, record); err != nil {
-					return out, err
-				}
-			}
-		} else {
-			limit := q.Limit
-			if limit == 0 {
-				limit = 200
-			}
-			if limit < 1 || limit > api.MaxRows {
-				return out, fail("invalid_argument", "page limit outside 1..2048")
-			}
-			statement := "SELECT r.key,r.version,r.deleted,r.data FROM records r WHERE r.scope=? AND r.collection=? AND r.key>?"
-			args := []any{id, c.ID, q.After}
-			if !q.IncludeDeleted {
-				statement += " AND r.deleted=0"
-			}
-			if q.Index != "" {
-				var idx *api.Index
-				for i := range c.Indexes {
-					if c.Indexes[i].ID == q.Index {
-						idx = &c.Indexes[i]
-						break
-					}
-				}
-				if idx == nil || len(q.Equal) != len(idx.Fields) || q.IncludeDeleted {
-					return out, fail("invalid_argument", "registered scalar equality index required")
-				}
-				data := map[string]any{}
-				for i, v := range q.Equal {
-					d := json.NewDecoder(strings.NewReader(string(v)))
-					d.UseNumber()
-					var decoded any
-					if e = d.Decode(&decoded); e != nil {
-						return out, fail("invalid_argument", "invalid equality scalar")
-					}
-					var tail any
-					if e = d.Decode(&tail); e != io.EOF {
-						return out, fail("invalid_argument", "one equality scalar required")
-					}
-					data[idx.Fields[i]] = decoded
-				}
-				value, _, e := indexTuple(data, *idx)
-				if e != nil {
-					return out, e
-				}
-				statement = "SELECT r.key,r.version,r.deleted,r.data FROM lookups l JOIN records r ON r.scope=l.scope AND r.collection=l.collection AND r.key=l.key WHERE l.scope=? AND l.collection=? AND l.index_name=? AND l.index_value=? AND l.key>?"
-				args = []any{id, c.ID, q.Index, value, q.After}
-			} else if len(q.Equal) > 0 {
-				return out, fail("invalid_argument", "equal requires registered index")
-			}
-			if q.Index != "" {
-				statement += " ORDER BY l.key LIMIT ?"
-			} else {
-				statement += " ORDER BY r.key LIMIT ?"
-			}
-			args = append(args, limit+1)
-			rows, e := tx.QueryContext(ctx, statement, args...)
-			if e != nil {
-				return out, e
-			}
-			count := 0
-			for rows.Next() {
-				record := api.Record{}
-				var v int64
-				var deleted int
-				if e = rows.Scan(&record.Key, &v, &deleted, &record.Data); e != nil {
-					rows.Close()
-					return out, e
-				}
-				count++
-				if count > limit {
-					result.NextAfter = result.Records[len(result.Records)-1].Key
-					break
-				}
-				record.Version = strconv.FormatInt(v, 10)
-				record.Deleted = deleted != 0
-				if e = appendRecord(&result, record); e != nil {
-					rows.Close()
-					return out, e
-				}
-			}
-			e = rows.Err()
-			rows.Close()
-			if e != nil {
-				return out, e
-			}
 		}
 		out.Results = append(out.Results, result)
 	}
@@ -188,4 +76,138 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 		return api.SnapshotResponse{}, fail("resource_exhausted", fmt.Sprintf("snapshot response %d exceeds byte limit", len(raw)))
 	}
 	return out, nil
+}
+
+// queryRecords materializes one bounded data query in a caller-owned local
+// transaction. Snapshot and named modules share index validation and access.
+func queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q api.Query, maximumRows int, observeRecord func(api.Record) error, appendRecord func(*api.QueryResult, api.Record) error) (result api.QueryResult, err error) {
+	result = api.QueryResult{Collection: q.Collection, Records: []api.Record{}}
+	c, e := collection(n, q.Collection)
+	if e != nil {
+		return result, e
+	}
+	if q.After != "" && !key(q.After) {
+		return result, fail("invalid_argument", "invalid page key")
+	}
+	if len(q.Keys) > 0 {
+		if len(q.Keys) > maximumRows || q.Index != "" || len(q.Equal) > 0 || q.After != "" || q.Limit != 0 {
+			return result, fail("invalid_argument", "exact-key query cannot contain page/index fields")
+		}
+		for _, k := range q.Keys {
+			if !key(k) {
+				return result, fail("invalid_argument", "invalid record key")
+			}
+			record := api.Record{Key: k}
+			var v int64
+			var deleted int
+			e := tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, c.ID, k).Scan(&v, &deleted, &record.Data)
+			if errors.Is(e, sql.ErrNoRows) {
+				record.Missing = true
+				v = 0
+			} else if e != nil {
+				return result, e
+			}
+			record.Version = strconv.FormatInt(v, 10)
+			record.Deleted = deleted != 0
+			if observeRecord != nil {
+				if err = observeRecord(record); err != nil {
+					return result, err
+				}
+			}
+			if err = appendRecord(&result, record); err != nil {
+				return result, err
+			}
+		}
+	} else {
+		limit := q.Limit
+		if limit == 0 {
+			limit = 200
+		}
+		if limit < 1 || limit > maximumRows {
+			return result, fail("invalid_argument", "page limit outside 1..2048")
+		}
+		statement := "SELECT r.key,r.version,r.deleted,r.data FROM records r WHERE r.scope=? AND r.collection=? AND r.key>?"
+		args := []any{id, c.ID, q.After}
+		if !q.IncludeDeleted {
+			statement += " AND r.deleted=0"
+		}
+		if q.Index != "" {
+			var idx *api.Index
+			for i := range c.Indexes {
+				if c.Indexes[i].ID == q.Index {
+					idx = &c.Indexes[i]
+					break
+				}
+			}
+			if idx == nil || len(q.Equal) != len(idx.Fields) || q.IncludeDeleted {
+				return result, fail("invalid_argument", "registered scalar equality index required")
+			}
+			data := map[string]any{}
+			for i, v := range q.Equal {
+				d := json.NewDecoder(strings.NewReader(string(v)))
+				d.UseNumber()
+				var decoded any
+				if e = d.Decode(&decoded); e != nil {
+					return result, fail("invalid_argument", "invalid equality scalar")
+				}
+				var tail any
+				if e = d.Decode(&tail); e != io.EOF {
+					return result, fail("invalid_argument", "one equality scalar required")
+				}
+				data[idx.Fields[i]] = decoded
+			}
+			value, _, e := indexTuple(data, *idx)
+			if e != nil {
+				return result, e
+			}
+			statement = "SELECT r.key,r.version,r.deleted,r.data FROM lookups l JOIN records r ON r.scope=l.scope AND r.collection=l.collection AND r.key=l.key WHERE l.scope=? AND l.collection=? AND l.index_name=? AND l.index_value=? AND l.key>?"
+			args = []any{id, c.ID, q.Index, value, q.After}
+		} else if len(q.Equal) > 0 {
+			return result, fail("invalid_argument", "equal requires registered index")
+		}
+		if q.Index != "" {
+			statement += " ORDER BY l.key LIMIT ?"
+		} else {
+			statement += " ORDER BY r.key LIMIT ?"
+		}
+		args = append(args, limit+1)
+		rows, e := tx.QueryContext(ctx, statement, args...)
+		if e != nil {
+			return result, e
+		}
+		count := 0
+		for rows.Next() {
+			record := api.Record{}
+			var v int64
+			var deleted int
+			if e = rows.Scan(&record.Key, &v, &deleted, &record.Data); e != nil {
+				rows.Close()
+				return result, e
+			}
+			record.Version = strconv.FormatInt(v, 10)
+			record.Deleted = deleted != 0
+			if observeRecord != nil {
+				if e = observeRecord(record); e != nil {
+					rows.Close()
+					return result, e
+				}
+			}
+			count++
+			if count > limit {
+				result.NextAfter = result.Records[len(result.Records)-1].Key
+				break
+			}
+			if e = appendRecord(&result, record); e != nil {
+				rows.Close()
+				return result, e
+			}
+		}
+		e = rows.Err()
+		rows.Close()
+		if e != nil {
+			return result, e
+		}
+	}
+
+	return result, nil
 }

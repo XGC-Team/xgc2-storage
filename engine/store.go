@@ -102,9 +102,10 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 		return nil, e
 	}
 	s = &Store{config: c, owner: o, namespaces: map[string]api.Namespace{}, modules: map[string]DataModule{}, writers: make(chan struct{}, c.WriterQueue+1), gate: make(chan struct{}, 1), reads: make(chan struct{}, c.Readers)}
+	opened := s
 	defer func() {
 		if err != nil {
-			s.Close()
+			opened.Close()
 		}
 	}()
 	for _, n := range c.Manifest.Namespaces {
@@ -171,11 +172,28 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	} else {
 		var format, digest string
 		if err = s.writer.QueryRowContext(ctx, "SELECT format,database_id,manifest_hash FROM storage_meta WHERE id=1").Scan(&format, &s.dbid, &digest); err != nil {
-			return nil, fail("failed_precondition", "not a storage-v1 database; explicit import required")
+			return nil, fail("failed_precondition", "not a storage-v1 database; explicit new-data rebuild required")
 		}
 		if format != "storage-v1" || digest != hash(c.Manifest) {
-			return nil, fail("failed_precondition", "manifest mismatch; explicit offline schema migration required")
+			return nil, fail("failed_precondition", "manifest mismatch; exact deployed schema or explicit new-data rebuild required")
 		}
+	}
+	var pageSize, pageCount, pageLimit int64
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return nil, err
+	}
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return nil, err
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 || pageCount > c.MaxDBBytes/pageSize {
+		return nil, fail("resource_exhausted", "existing database exceeds configured page byte budget")
+	}
+	requestedPageLimit := c.MaxDBBytes / pageSize
+	if err = s.writer.QueryRowContext(ctx, fmt.Sprintf("PRAGMA max_page_count=%d", requestedPageLimit)).Scan(&pageLimit); err != nil {
+		return nil, err
+	}
+	if pageLimit > requestedPageLimit || pageLimit < pageCount {
+		return nil, fail("failed_precondition", "SQLite did not enforce configured page byte budget")
 	}
 	var journal string
 	if err = s.writer.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journal); err != nil {
@@ -184,7 +202,7 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if journal != "wal" {
 		return nil, fail("failed_precondition", "WAL unavailable")
 	}
-	for _, statement := range []string{"PRAGMA synchronous=FULL", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-4096", "PRAGMA wal_autocheckpoint=256", "PRAGMA journal_size_limit=1048576", fmt.Sprintf("PRAGMA max_page_count=%d", c.MaxDBBytes/4096)} {
+	for _, statement := range []string{"PRAGMA synchronous=FULL", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-4096", "PRAGMA wal_autocheckpoint=256", "PRAGMA journal_size_limit=1048576"} {
 		if _, err = s.writer.ExecContext(ctx, statement); err != nil {
 			return nil, err
 		}

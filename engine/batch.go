@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
-	"strconv"
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
@@ -27,54 +26,11 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 		return out, err
 	}
 	defer release()
-	seen := map[string]bool{}
-	requestBytes := 0
-	documents := make([]map[string]any, len(r.Mutations))
-	columns := make([]api.Collection, len(r.Mutations))
-	for i := range r.Mutations {
-		if err = ctx.Err(); err != nil {
-			return out, err
-		}
-		m := &r.Mutations[i]
-		c, e := collection(n, m.Collection)
-		if e != nil {
-			return out, e
-		}
-		columns[i] = c
-		requestBytes += len(m.Data) + len(m.Key) + len(m.Collection) + 128
-		if len(m.Data) > api.MaxRequestBytes || requestBytes > api.MaxRequestBytes {
-			return out, fail("resource_exhausted", "batch raw payload byte limit exceeded")
-		}
-		compound := m.Collection + "\x00" + m.Key
-		if !key(m.Key) || seen[compound] {
-			return out, fail("invalid_argument", "invalid/duplicate mutation key")
-		}
-		seen[compound] = true
-		if _, e = revision(m.ExpectedVersion); e != nil {
-			return out, e
-		}
-		if m.Delete {
-			if len(m.Data) > 0 {
-				return out, fail("invalid_argument", "delete must not contain data")
-			}
-			m.Data = json.RawMessage(`{}`)
-		} else {
-			canonical, obj, e := canonicalObject(m.Data)
-			if e != nil {
-				return out, e
-			}
-			if len(canonical) > c.MaxRecordBytes {
-				return out, fail("resource_exhausted", "record exceeds declared byte limit")
-			}
-			m.Data = canonical
-			documents[i] = obj
-			for _, idx := range c.Indexes {
-				if _, _, e = indexTuple(obj, idx); e != nil {
-					return out, e
-				}
-			}
-		}
+	prepared, err := prepareMutations(ctx, n, r.Mutations, api.MaxOperations, api.MaxRequestBytes)
+	if err != nil {
+		return out, err
 	}
+	r.Mutations = prepared.mutations
 	raw, e := json.Marshal(r)
 	if e != nil {
 		return out, e
@@ -83,6 +39,20 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 		return out, fail("resource_exhausted", "batch byte limit exceeded")
 	}
 	digest := hash(r)
+	// Replays read durable facts before applying new-write disk admission.
+	var cachedDigest string
+	var cachedBody []byte
+	cacheError := s.reader.QueryRowContext(ctx, "SELECT digest,body FROM receipts WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&cachedDigest, &cachedBody)
+	if cacheError == nil {
+		if cachedDigest != digest {
+			return out, fail("conflict", "request identity reused with different plan")
+		}
+		err = json.Unmarshal(cachedBody, &out)
+		return out, err
+	}
+	if !errors.Is(cacheError, sql.ErrNoRows) {
+		return out, cacheError
+	}
 	if err = s.diskCheck(); err != nil {
 		return out, err
 	}
@@ -144,81 +114,9 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 		return out, fail("resource_exhausted", "receipt quota reached; owner maintenance required")
 	}
 	out = api.Receipt{RequestID: r.RequestID, Digest: digest, Token: s.token(n, next), Durability: "sqlite-full", Versions: []api.Record{}}
-	// Remove all old indexes first, permitting valid swaps in an atomic batch.
-	for _, m := range r.Mutations {
-		var v int64
-		err = tx.QueryRowContext(ctx, "SELECT version FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v)
-		if errors.Is(err, sql.ErrNoRows) {
-			v = 0
-		} else if err != nil {
-			return out, err
-		}
-		if strconv.FormatInt(v, 10) != m.ExpectedVersion {
-			s.conflicts.Add(1)
-			return out, fail("conflict", "record version changed")
-		}
-		if _, err = tx.ExecContext(ctx, "DELETE FROM lookups WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key); err != nil {
-			return out, err
-		}
-	}
-	type totals struct {
-		count, bytes int64
-		collection   api.Collection
-	}
-	usage := map[string]*totals{}
-	for i, m := range r.Mutations {
-		c := columns[i]
-		values := usage[c.ID]
-		if values == nil {
-			values = &totals{collection: c}
-			usage[c.ID] = values
-			err = tx.QueryRowContext(ctx, "SELECT records,bytes FROM usage WHERE scope=? AND collection=?", id, c.ID).Scan(&values.count, &values.bytes)
-			if err != nil && !errors.Is(err, sql.ErrNoRows) {
-				return out, err
-			}
-		}
-		var oldBytes int64
-		err = tx.QueryRowContext(ctx, "SELECT length(data)+length(CAST(key AS BLOB)) FROM records WHERE scope=? AND collection=? AND key=?", id, c.ID, m.Key).Scan(&oldBytes)
-		if errors.Is(err, sql.ErrNoRows) {
-			values.count++
-		} else if err != nil {
-			return out, err
-		}
-		values.bytes += int64(len(m.Data)+len(m.Key)) - oldBytes
-	}
-	for idCollection, values := range usage {
-		if values.count > int64(values.collection.MaxRecords) || values.bytes > values.collection.MaxBytes {
-			return out, fail("resource_exhausted", "collection record/byte quota reached")
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO usage VALUES(?,?,?,?) ON CONFLICT(scope,collection) DO UPDATE SET records=excluded.records,bytes=excluded.bytes", id, idCollection, values.count, values.bytes); err != nil {
-			return out, err
-		}
-	}
-	for i, m := range r.Mutations {
-		c := columns[i]
-		deleted := 0
-		if m.Delete {
-			deleted = 1
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO records VALUES(?,?,?,?,?,?) ON CONFLICT(scope,collection,key) DO UPDATE SET version=excluded.version,deleted=excluded.deleted,data=excluded.data", id, c.ID, m.Key, next, deleted, []byte(m.Data)); err != nil {
-			return out, err
-		}
-		if !m.Delete {
-			for _, idx := range c.Indexes {
-				tuple, nullable, e := indexTuple(documents[i], idx)
-				if e != nil {
-					return out, e
-				}
-				var unique any
-				if idx.Unique && !nullable {
-					unique = tuple
-				}
-				if _, err = tx.ExecContext(ctx, "INSERT INTO lookups VALUES(?,?,?,?,?,?)", id, c.ID, idx.ID, tuple, m.Key, unique); err != nil {
-					return out, err
-				}
-			}
-		}
-		out.Versions = append(out.Versions, api.Record{Collection: m.Collection, Key: m.Key, Version: strconv.FormatInt(next, 10), Deleted: m.Delete})
+	out.Versions, err = s.applyMutations(ctx, tx, id, next, prepared)
+	if err != nil {
+		return out, err
 	}
 	now := time.Now().UTC()
 	out.CommittedAt = now.Format(time.RFC3339Nano)
