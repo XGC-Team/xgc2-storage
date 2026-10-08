@@ -232,6 +232,7 @@ func cloneNamespace(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 		}
 	}
 	resourcePlans := map[string]model.ResourceCopy{}
+	contentDigests := map[string]string{}
 	references := 0
 	for _, p := range r.Resources {
 		if !textKey(p.SourceID) || !textKey(p.TargetID) || !textKey(p.TargetBranchID) || !textKey(p.TargetCommitID) || !positiveRevision(p.ExpectedRevision) || !positiveRevision(p.ExpectedBranchRevision) || !object(p.Body) || !object(p.BranchBody) || !object(p.CommitBody) || !object(p.Payload) || !object(p.Manifest) || resourcePlans[p.SourceID].SourceID != "" {
@@ -250,6 +251,11 @@ func cloneNamespace(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 			}
 			slots[f.Slot] = true
 		}
+		pin, e := model.SnapshotDigest(p.Payload, p.Manifest, p.References)
+		if e != nil {
+			return out, failure("invalid_argument", e.Error())
+		}
+		contentDigests[p.SourceID] = pin
 		references += len(p.References)
 		resourcePlans[p.SourceID] = p
 	}
@@ -312,7 +318,7 @@ func cloneNamespace(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 		if _, err = tx.ExecContext(ctx, "INSERT INTO core_branches VALUES(?,?,?,?, 'main',?,1,?)", scope, r.Domain, p.TargetBranchID, p.TargetID, p.TargetCommitID, []byte(p.BranchBody)); err != nil {
 			return out, err
 		}
-		contentDigest, _ := model.SnapshotDigest(p.Payload, p.Manifest, p.References)
+		contentDigest := contentDigests[v.ID]
 		if _, err = tx.ExecContext(ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,1,?,?,?,?,?)", scope, r.Domain, p.TargetCommitID, p.TargetID, p.TargetBranchID, v.CommitID, contentDigest, []byte(p.Payload), []byte(p.Manifest), []byte(p.CommitBody)); err != nil {
 			return out, err
 		}

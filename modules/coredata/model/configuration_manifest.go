@@ -55,6 +55,11 @@ type ValidatedConfigurationManifest struct {
 }
 
 func (v ValidatedConfigurationManifest) Contains(id string) bool { _, ok := v.byID[id]; return ok }
+
+// NameKey returns the canonical key computed by validation, without normalizing
+// again or exposing the private map. Root, missing and zero-value return empty.
+func (v ValidatedConfigurationManifest) NameKey(id string) string { return v.keys[id] }
+
 func configurationSHA(s string) bool {
 	b, e := hex.DecodeString(s)
 	return e == nil && len(b) == sha256.Size && strings.ToLower(s) == s

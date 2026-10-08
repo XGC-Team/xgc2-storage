@@ -25,7 +25,9 @@ func digest(v any) string {
 
 // SnapshotDigest lets Core construct exact immutable data pins using this new
 // model. It does not validate a product's typed schema or freeze execution plans.
-func SnapshotDigest(payload, manifest json.RawMessage, references []Reference) (string, error) {
+// Payload and manifest never enter a JSON encoder: their lengths and original
+// bytes go directly to the hash. Only reference control metadata is canonicalized.
+func SnapshotDigest(payload, manifest []byte, references []Reference) (string, error) {
 	if !object(payload) || !object(manifest) {
 		return "", fmt.Errorf("invalid snapshot object")
 	}
