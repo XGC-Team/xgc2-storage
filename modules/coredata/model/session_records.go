@@ -59,7 +59,7 @@ func SessionGraphCollections() []api.Collection {
 		case DefinitionsCollection:
 			c.Indexes = []api.Index{{ID: "by_definition", Fields: []string{"id"}}, {ID: "by_execution_identity", Fields: []string{"targetId", "configDigest", "executionPlanDigest", "registryDigest", "digest"}}}
 		case RunsCollection:
-			c.Indexes = []api.Index{{ID: "by_target", Fields: []string{"targetId"}}, {ID: "by_admission", Fields: []string{"targetId", "admissionKey"}}, {ID: "by_dedupe", Fields: []string{"targetId", "dedupeKey"}, Unique: true}, {ID: "admission_slot", Fields: []string{"targetId", "admissionKey", "admissionSlot"}, Unique: true}, {ID: "by_replaced", Fields: []string{"replacesRunId"}}, {ID: "by_parent", Fields: []string{"parentRunId"}}}
+			c.Indexes = []api.Index{{ID: "by_automation", Fields: []string{"targetId", "automationResourceId"}}, {ID: "by_target", Fields: []string{"targetId"}}, {ID: "by_admission", Fields: []string{"targetId", "admissionKey"}}, {ID: "by_dedupe", Fields: []string{"targetId", "dedupeKey"}, Unique: true}, {ID: "admission_slot", Fields: []string{"targetId", "admissionKey", "admissionSlot"}, Unique: true}, {ID: "by_replaced", Fields: []string{"replacesRunId"}}, {ID: "by_parent", Fields: []string{"parentRunId"}}}
 			c.MaxBytes = 4 << 30
 		case SessionsCollection:
 			c.Indexes = []api.Index{
