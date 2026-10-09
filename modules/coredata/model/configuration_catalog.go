@@ -32,3 +32,14 @@ type ConfigurationNamespace struct {
 	UpdatedAt  string `json:"updated_at"`
 	ArchivedAt string `json:"archived_at"`
 }
+
+// One storage-owned audit aggregate retains the complete ordered node diff.
+type ConfigurationChangeRecord struct {
+	Operation  string                `json:"operation"`
+	ResourceID string                `json:"resource_id"`
+	CommitID   string                `json:"commit_id"`
+	Mutation   ConfigurationMutation `json:"mutation"`
+	Change     ConfigurationChange   `json:"change"`
+	BeforePath string                `json:"before_path"`
+	AfterPath  string                `json:"after_path"`
+}

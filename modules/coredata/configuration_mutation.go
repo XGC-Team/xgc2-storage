@@ -471,15 +471,7 @@ func configurationResourcePath(ctx context.Context, tx *sql.Tx, scope, domain, n
 	return "/" + strings.Join(parts, "/"), nil
 }
 func configurationChange(ctx context.Context, tx *sql.Tx, scope, domain, resource, commit, op string, m model.ConfigurationMutation, c model.ConfigurationChange, beforePath, afterPath string) error {
-	body, e := encode(struct {
-		Operation  string                      `json:"operation"`
-		ResourceID string                      `json:"resource_id"`
-		CommitID   string                      `json:"commit_id"`
-		Mutation   model.ConfigurationMutation `json:"mutation"`
-		Change     model.ConfigurationChange   `json:"change"`
-		BeforePath string                      `json:"before_path"`
-		AfterPath  string                      `json:"after_path"`
-	}{op, resource, commit, m, c, beforePath, afterPath})
+	body, e := encode(model.ConfigurationChangeRecord{Operation: op, ResourceID: resource, CommitID: commit, Mutation: m, Change: c, BeforePath: beforePath, AfterPath: afterPath})
 	if e != nil {
 		return e
 	}
