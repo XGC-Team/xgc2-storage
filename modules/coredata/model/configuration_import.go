@@ -1,6 +1,9 @@
 package model
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"github.com/XGC-Team/xgc2-storage/api"
+)
 
 // ConfigurationImport is an explicit offline owner input, never a Named
 // operation. The caller creates a fresh target and supplies its deployment.
@@ -12,6 +15,8 @@ type ConfigurationImport struct {
 	Resources    []ConfigurationImportResource    `json:"resources"`
 	Branches     []ConfigurationImportBranch      `json:"branches"`
 	Snapshots    []ConfigurationImportSnapshot    `json:"snapshots"`
+	Records      []api.Mutation                   `json:"execution_records,omitempty"`
+	Execution    *ExecutionImport                 `json:"execution,omitempty"`
 	Changes      []ConfigurationImportChange      `json:"changes"`
 }
 type ConfigurationImportNamespace struct {

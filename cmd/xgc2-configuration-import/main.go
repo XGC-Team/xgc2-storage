@@ -37,6 +37,19 @@ func readFile(path string, out any) error {
 	}
 	return nil
 }
+func sameDocument(a, b []byte) bool {
+	decode := func(raw []byte) (any, error) {
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.UseNumber()
+		var v any
+		e := d.Decode(&v)
+		return v, e
+	}
+	left, le := decode(a)
+	right, re := decode(b)
+	return le == nil && re == nil && reflect.DeepEqual(left, right)
+}
+
 func run() error {
 	archive := flag.String("archive", "", "private exported configuration archive")
 	path := flag.String("database", "", "new target database path")
@@ -86,13 +99,29 @@ func run() error {
 		if e := coredata.DeclareConfigurationDomains(ctx, tx, domains); e != nil {
 			return e
 		}
-		return coredata.ImportConfiguration(ctx, tx, string(scopeRaw), in)
+		if e := coredata.ImportConfiguration(ctx, tx, string(scopeRaw), in); e != nil {
+			return e
+		}
+		if in.Execution != nil {
+			return coredata.ImportExecution(ctx, tx, string(scopeRaw), *in.Execution)
+		}
+		return nil
 	}}}}
 	store, e := engine.Open(ctx, cfg)
 	if e != nil {
 		return e
 	}
 	defer store.Close()
+	// Bulk historical events were committed by the explicit owner deploy. Use
+	// its existing checkpoint before the next offline write admission.
+	if checkpoint, err := store.Checkpoint(ctx); err != nil {
+		return err
+	} else if checkpoint.Busy != 0 {
+		return errors.New("offline checkpoint is pinned")
+	}
+	if e = store.ImportRecords(ctx, scope, in.Records); e != nil {
+		return e
+	}
 	// Read through the same public engine operations used by the installed
 	// native owner, after the creation/import transaction has committed.
 	var marker string
@@ -145,10 +174,78 @@ func run() error {
 		maxWire = max(maxWire, len(raw))
 		refs += len(got.References)
 	}
+	for _, v := range in.Records {
+		read, e := store.Snapshot(ctx, api.SnapshotRequest{Scope: scope, Queries: []api.Query{{Collection: v.Collection, Keys: []string{v.Key}}}})
+		if e != nil {
+			return e
+		}
+		if len(read.Results) != 1 || len(read.Results[0].Records) != 1 {
+			return errors.New("imported record point read missing")
+		}
+		got := read.Results[0].Records[0]
+		if got.Key != v.Key || got.Missing || got.Deleted || got.Version != "1" || !sameDocument(got.Data, v.Data) {
+			return errors.New("imported record did not round trip")
+		}
+	}
+	commandsVerified, eventsVerified := 0, 0
+	if history := in.Execution; history != nil {
+		named := func(op string, input, output any) error {
+			body, e := json.Marshal(input)
+			if e != nil {
+				return e
+			}
+			result, e := store.Named(ctx, api.NamedRequest{Scope: scope, DatabaseID: snap.Token.DatabaseID, Schema: coredata.Schema, Module: spec.ID, Operation: op, RequestID: fmt.Sprintf("offline-history-%d-%d", commandsVerified, eventsVerified), Payload: body})
+			if e != nil {
+				return e
+			}
+			return json.Unmarshal(result.Result, output)
+		}
+		// Each list is finite; use the existing owner's bounded public read ports.
+		for start := 0; start < len(history.Commands); start += 1000 {
+			end := min(start+1000, len(history.Commands))
+			expected := map[string]model.CommandReceipt{}
+			read := model.CommandListRead{}
+			for _, v := range history.Commands[start:end] {
+				read.IDs = append(read.IDs, v.CommandID)
+				expected[v.CommandID] = v
+			}
+			var got model.CommandList
+			if e := named(model.ExecutionCommandListOperation, read, &got); e != nil {
+				return e
+			}
+			if len(got.Receipts) != len(expected) {
+				return errors.New("original command set did not round trip")
+			}
+			for _, v := range got.Receipts {
+				if !reflect.DeepEqual(v, expected[v.CommandID]) {
+					return errors.New("original command receipt changed")
+				}
+				commandsVerified++
+			}
+		}
+		after := "0"
+		for eventsVerified < len(history.Events) {
+			var page model.EventPage
+			if e := named(model.ExecutionEventReadOperation, model.EventRead{AfterOffset: after, Through: history.EventFrontier, Limit: 1000}, &page); e != nil {
+				return e
+			}
+			if page.Cursor.LatestOffset != history.EventFrontier || page.Cursor.StreamID == history.LegacyStreamID || len(page.Events) == 0 {
+				return errors.New("imported event frontier or new authority identity disagrees")
+			}
+			for _, v := range page.Events {
+				if eventsVerified >= len(history.Events) || !reflect.DeepEqual(v, history.Events[eventsVerified]) {
+					return errors.New("original event seq/offset/payload changed")
+				}
+				eventsVerified++
+			}
+			after = page.NextOffset
+		}
+	}
+
 	if e = store.Integrity(ctx); e != nil {
 		return e
 	}
-	return json.NewEncoder(os.Stdout).Encode(map[string]any{"sourceSHA256": in.SourceSHA256, "namespaces": len(in.Namespaces), "resources": len(in.Resources), "branches": len(in.Branches), "commitsVerified": len(in.Snapshots), "referencesVerified": refs, "changesImported": len(in.Changes), "maxNamedResponseBytes": maxWire, "integrity": "ok"})
+	return json.NewEncoder(os.Stdout).Encode(map[string]any{"sourceSHA256": in.SourceSHA256, "recordsVerified": len(in.Records), "commandsVerified": commandsVerified, "eventsVerified": eventsVerified, "namespaces": len(in.Namespaces), "resources": len(in.Resources), "branches": len(in.Branches), "commitsVerified": len(in.Snapshots), "referencesVerified": refs, "changesImported": len(in.Changes), "maxNamedResponseBytes": maxWire, "integrity": "ok"})
 }
 func main() {
 	if e := run(); e != nil {
