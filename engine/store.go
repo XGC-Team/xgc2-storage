@@ -310,7 +310,7 @@ func (s *Store) admitCall(ctx context.Context, write bool, maximum time.Duration
 		s.overloads.Add(1)
 		cancel()
 		s.lifecycle.RUnlock()
-		return nil, nil, fail("resource_exhausted", "storage execution capacity exhausted")
+		return nil, nil, fail("unavailable", "storage execution capacity exhausted")
 	}
 	start := time.Now()
 	if write {
