@@ -39,14 +39,29 @@ func (s *sessionGraphReader) read(collection, index string, equal ...string) ([]
 		b, _ := json.Marshal(v)
 		q.Equal = append(q.Equal, b)
 	}
-	r, err := engine.ReadRecords(s.ctx, s.tx, s.scope, q)
-	if err != nil {
-		return nil, err
+	q.Limit = api.MaxRows
+	out := []api.Record{}
+	for {
+		r, err := engine.ReadRecords(s.ctx, s.tx, s.scope, q)
+		if err != nil {
+			return nil, err
+		}
+		if err = s.charge(len(r.Records)); err != nil {
+			return nil, err
+		}
+		for _, record := range r.Records {
+			s.privateBytes += len(record.Data)
+			if s.privateBytes > MaxResponseBytes {
+				return nil, failure("resource_exhausted", "Session dependent fact byte limit exceeded")
+			}
+		}
+		out = append(out, r.Records...)
+		if r.NextAfter == "" {
+			return out, nil
+		}
+		q.After = r.NextAfter
 	}
-	if err = s.charge(len(r.Records)); err != nil {
-		return nil, err
-	}
-	return r.Records, nil
+
 }
 
 func (s *sessionGraphReader) point(collection, key string) (json.RawMessage, error) {

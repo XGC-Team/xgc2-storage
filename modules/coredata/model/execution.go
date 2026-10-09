@@ -11,7 +11,14 @@ const MaxExecutionStateMutations = api.MaxNamedStateMutations
 // ExecutionCommit describes one explicit atomic action, not a remote callback.
 // Command payloads, terminal results and event payloads retain encoded JSON
 // bytes. The consumer decodes seq/offset decimal strings at its domain boundary.
+type CommandAbsenceGuard struct {
+	Target   string   `json:"target"`
+	Action   string   `json:"action"`
+	Statuses []string `json:"statuses"`
+}
+
 type ExecutionCommit struct {
+	CommandAbsenceGuards  []CommandAbsenceGuard    `json:"command_absence_guards,omitempty"`
 	CommandAcceptedAt     time.Time                `json:"command_accepted_at,omitempty"`
 	ConfigurationPins     []ConfigurationReference `json:"configuration_pins,omitempty"`
 	ConfigurationMainPins []ConfigurationMainPin   `json:"configuration_main_pins,omitempty"`

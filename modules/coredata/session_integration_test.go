@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -69,7 +70,9 @@ func sessionMember(id, kind, owner string) map[string]any {
 	return map[string]any{"id": id, "targetId": "local", "sessionId": "session", "bindingId": id, "kind": kind, "ownerId": owner, "status": "running", "revision": 1}
 }
 func sessionLink(id, child string, bound, remote bool) map[string]any {
-	r := map[string]any{"id": id, "targetId": "local", "rootRunId": "root", "parentRunId": "root", "parentInvocationId": "invocation", "callNodeId": "call", "childRunId": child, "ownerRunId": "root", "childDefinitionId": "definition", "childDefinitionVersion": 1, "childConfigDigest": strings.Repeat("c", 64), "childExecutionPlanDigest": strings.Repeat("e", 64), "childRegistryDigest": strings.Repeat("b", 64), "childDefinitionDigest": strings.Repeat("d", 64), "targetRoot": remote, "relation": "attached", "ordinal": 0, "revision": 1, "targetRootParameters": "PRIVATE_SENTINEL", "runStatus": "forged", "runRevision": 99}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	r := map[string]any{"id": id, "targetId": "local", "rootRunId": "root", "parentRunId": "root", "parentInvocationId": "invocation", "callNodeId": "call", "childRunId": child, "ownerRunId": "root", "childDefinitionId": "definition", "childDefinitionVersion": 1, "childConfigDigest": strings.Repeat("c", 64), "childExecutionPlanDigest": strings.Repeat("e", 64), "childRegistryDigest": strings.Repeat("b", 64), "childDefinitionDigest": strings.Repeat("d", 64), "targetRoot": remote, "relation": "attached", "ordinal": int(h.Sum32()), "revision": 1, "targetRootParameters": "PRIVATE_SENTINEL", "runStatus": "forged", "runRevision": 99}
 	if bound {
 		r["boundAt"] = "2026-10-09T00:00:00Z"
 	}
@@ -77,7 +80,7 @@ func sessionLink(id, child string, bound, remote bool) map[string]any {
 }
 func sessionRelation(kind string, fact map[string]any) api.Mutation {
 	id := fact["id"].(string)
-	return sessionRow(model.RunRelationsCollection, model.RelationRecordKey(kind, id), model.RunRelationRecord{ID: id, RunID: "root", Kind: kind, Fact: sessionWire(fact)})
+	return sessionRow(model.RelationCollection(kind), id, fact)
 }
 
 func sessionBaseRows() []api.Mutation {
@@ -207,7 +210,7 @@ func TestSessionWorkflowSnapshotCorruptDependenciesFailCompleteRead(t *testing.T
 				a["invocationId"] = "absent"
 				rows[4].Data = sessionWire(a)
 			case "orphan-relation":
-				rows = append(rows, sessionRelation("childRunGroupMembers", map[string]any{"id": "orphan", "groupId": "absent", "childRunId": "absent", "revision": 1}))
+				rows = append(rows, sessionRelation("childRunGroups", map[string]any{"id": "group", "targetId": "local", "rootRunId": "root", "parentRunId": "root", "producerInvocationId": "invocation", "producerNodeId": "call", "memberCount": 1, "revision": 1}), sessionRelation("childRunGroupMembers", map[string]any{"id": "orphan", "groupId": "group", "childRunId": "absent", "revision": 1}))
 			case "duplicate-invocation-node":
 				rows = append(rows, sessionRow(model.InvocationsCollection, "duplicate", map[string]any{"id": "duplicate", "runId": "root", "nodeId": "call", "kind": "automation-call", "revision": 1}))
 			case "missing-producer":
@@ -392,16 +395,14 @@ func TestSessionWorkflowSnapshot16384DependentFactsAndOverflow(t *testing.T) {
 	}
 }
 
-func TestSessionWorkflowSnapshotConsumesSealedGroupPrepareAuthority(t *testing.T) {
+func TestSessionWorkflowSnapshotConsumesFlatGroupCommitAuthority(t *testing.T) {
 	f := openSessionFixture(t, nil)
-	rows := append(sessionBaseRows(), sessionRow("definitions", "definition", map[string]any{"id": "definition"}))
-	f.save("seed", rows)
-	parent := model.RecordGuard{Collection: model.RunsCollection, Key: "root", Version: "1"}
-	r := model.GroupPrepare{ID: "group", ParentID: "root", InvocationID: "invocation", GroupKey: "fanout", ParentGuard: parent, InvocationGuard: model.RecordGuard{Collection: model.InvocationsCollection, Key: "invocation", Version: "1"}, PinGuard: model.RecordGuard{Collection: "definitions", Key: "definition", Version: "1"}, Condition: model.GroupPrepareCondition{Parent: model.RunPrepareState{ID: "root", TargetID: "local", RootRunID: "root", ExecutionModel: model.OccurrenceExecutionModel, Status: "running"}, Producer: model.ProducerPrepareState{ID: "invocation", RunID: "root", NodeID: "call", Kind: "automation-call", Status: "running", ChildRunProducer: true}, Ancestors: []model.RecordGuard{parent}}, Body: sessionWire(map[string]any{"id": "group", "targetId": "local", "rootRunId": "root", "parentRunId": "root", "producerInvocationId": "invocation", "producerNodeId": "call", "groupKey": "fanout", "expectedMembers": 1, "memberCount": 1, "state": "sealed", "revision": 1, "resolution": "PRIVATE_SENTINEL"}), Members: []model.GroupMember{{ItemKey: "item", ChildID: "prepared", EventID: "event", Parameters: []byte(`{"private":"PRIVATE_SENTINEL"}`), Event: json.RawMessage(`{"secret":"PRIVATE_SENTINEL"}`), Link: sessionWire(sessionLink("link", "prepared", false, false)), Body: sessionWire(map[string]any{"id": "member", "groupId": "group", "childRunId": "prepared", "ordinal": 0, "itemKey": "item", "state": "queued", "revision": 1, "leaseToken": "PRIVATE_SENTINEL"})}}}
-	prepared, err := f.store.Named(f.ctx, api.NamedRequest{Scope: f.scope, DatabaseID: f.token.DatabaseID, Schema: f.token.Schema, Module: coredata.Spec().ID, Operation: model.GroupPrepareOperation, RequestID: "group-prepare", Payload: sessionWire(r)})
-	if err != nil || prepared.Receipt == nil {
-		t.Fatalf("prepare %v", err)
-	}
+	f.save("seed", sessionBaseRows())
+	link := sessionLink("link", "prepared", false, false)
+	link["ordinal"] = 0
+	group := map[string]any{"id": "group", "targetId": "local", "rootRunId": "root", "parentRunId": "root", "producerInvocationId": "invocation", "producerNodeId": "call", "groupKey": "fanout", "expectedMembers": 1, "memberCount": 1, "state": "sealed", "revision": 1, "resolution": "PRIVATE_SENTINEL"}
+	member := map[string]any{"id": "member", "groupId": "group", "childRunId": "prepared", "ordinal": 0, "itemKey": "item", "state": "queued", "revision": 1, "leaseToken": "PRIVATE_SENTINEL"}
+	f.save("group-commit", []api.Mutation{sessionRelation("childRuns", link), sessionRelation("childRunGroups", group), sessionRelation("childRunGroupMembers", member)})
 	read, err := f.snapshot("local", "session")
 	if err != nil {
 		t.Fatal(err)
@@ -421,23 +422,12 @@ func TestSessionWorkflowSnapshotConsumesSealedGroupPrepareAuthority(t *testing.T
 	}
 	_ = json.Unmarshal(snapshot.Runs[0].Relations, &rel)
 	if len(rel.Groups) != 1 || len(rel.Members) != 1 || len(rel.Links) != 1 {
-		t.Fatalf("sealed authority unavailable %s", snapshot.Runs[0].Relations)
+		t.Fatalf("flat authority unavailable %s", snapshot.Runs[0].Relations)
 	}
-	// Opaque preparation metadata cannot redefine physical group coordinates
-	// when consumed by the typed Session graph projection.
-	r.ID, r.GroupKey = "corrupt-group", "other-fanout"
-	var header map[string]any
-	_ = json.Unmarshal(r.Body, &header)
-	header["id"] = "wrong-group"
-	header["groupKey"] = r.GroupKey
-	r.Body = sessionWire(header)
-	r.Members[0].ChildID, r.Members[0].EventID = "other-prepared", "other-event"
-	r.Members[0].Link = sessionWire(sessionLink("other-link", "other-prepared", false, false))
-	r.Members[0].Body = sessionWire(map[string]any{"id": "other-member", "groupId": r.ID, "childRunId": "other-prepared", "ordinal": 0, "itemKey": "item", "state": "queued", "revision": 1})
-	_, err = f.store.Named(f.ctx, api.NamedRequest{Scope: f.scope, DatabaseID: f.token.DatabaseID, Schema: f.token.Schema, Module: coredata.Spec().ID, Operation: model.GroupPrepareOperation, RequestID: "corrupt-group-prepare", Payload: sessionWire(r)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// The record key is the physical identity. A forged body cannot redefine it.
+	group["id"] = "wrong-group"
+	group["groupKey"] = "other-fanout"
+	f.save("corrupt-group", []api.Mutation{sessionRow(model.ChildGroupsCollection, "corrupt-group", group)})
 	_, err = f.snapshot("local", "session")
 	requireSessionCode(t, err, "data_loss")
 }

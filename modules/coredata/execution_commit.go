@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
@@ -79,6 +80,9 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 			return out, failure("conflict", "execution decision source changed")
 		}
 	}
+	if err = checkCommandAbsence(ctx, tx, scope, r.CommandAbsenceGuards); err != nil {
+		return out, err
+	}
 	if err = configurationValidatePinnedTargets(ctx, tx, scope, r.ConfigurationPins); err != nil {
 		return out, err
 	}
@@ -98,4 +102,46 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 func executionGuardVersion(raw string) bool {
 	v, err := strconv.ParseUint(raw, 10, 64)
 	return err == nil && strconv.FormatUint(v, 10) == raw
+}
+
+func checkCommandAbsence(ctx context.Context, tx *sql.Tx, scope string, guards []model.CommandAbsenceGuard) error {
+	if len(guards) > model.MaxExecutionStateMutations {
+		return failure("resource_exhausted", "command guard count limit exceeded")
+	}
+	seen := map[string]bool{}
+	for _, guard := range guards {
+		if !textKey(guard.Target) || !textKey(guard.Action) || len(guard.Statuses) < 1 || len(guard.Statuses) > 4 {
+			return failure("invalid_argument", "exact command absence predicate required")
+		}
+		statuses := map[string]bool{}
+		args := []any{scope, guard.Target, guard.Action}
+		marks := make([]string, len(guard.Statuses))
+		for i, status := range guard.Statuses {
+			switch status {
+			case "accepted", "succeeded", "failed", "rejected":
+			default:
+				return failure("invalid_argument", "invalid command guard status")
+			}
+			if statuses[status] {
+				return failure("invalid_argument", "duplicate command guard status")
+			}
+			statuses[status] = true
+			marks[i] = "?"
+			args = append(args, status)
+		}
+		key := guard.Target + "\x00" + guard.Action + "\x00" + strings.Join(guard.Statuses, "\x00")
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		var exists int
+		err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM core_commands WHERE scope=? AND target=? AND action=? AND status IN ("+strings.Join(marks, ",")+"))", args...).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists != 0 {
+			return failure("conflict", "command-derived decision fence changed")
+		}
+	}
+	return nil
 }

@@ -14,6 +14,11 @@ func (s *sessionGraphReader) relations(run sessionFact, invocations map[string]s
 	for kind := range relationPublicFields {
 		out[kind] = []json.RawMessage{}
 	}
+	// No valid relation can exist without its producing occurrence. Empty
+	// Runs therefore need no per-kind dependent queries.
+	if len(invocations) == 0 {
+		return out, nil
+	}
 	appendFact := func(kind string, raw json.RawMessage) error {
 		fields, ok := relationPublicFields[kind]
 		if !ok {
@@ -89,89 +94,48 @@ func (s *sessionGraphReader) relations(run sessionFact, invocations map[string]s
 		out[kind] = append(out[kind], f.raw())
 		return nil
 	}
-	records, err := s.read(model.RunRelationsCollection, model.RunFactsIndex, id)
-	if err != nil {
-		return nil, err
-	}
-	for _, record := range records {
-		var r model.RunRelationRecord
-		if json.Unmarshal(record.Data, &r) != nil || r.RunID != id || !textKey(r.ID) || record.Key != model.RelationRecordKey(r.Kind, r.ID) {
-			return nil, failure("data_loss", "invalid authoritative relation record")
-		}
-		var fact sessionFact
-		_ = json.Unmarshal(r.Fact, &fact)
-		if fact.text("id") != r.ID {
-			return nil, failure("data_loss", "relation envelope identity disagrees")
-		}
-		if err = appendFact(r.Kind, r.Fact); err != nil {
+	// Each lifecycle has one flat typed authority. Members are selected by the
+	// groups owned by this Run; they do not duplicate parent coordinates.
+	kinds := []string{"childRuns", "childRunGroups", "waits", "effects", "runtimeGroups", "runtimes", "resources"}
+	for _, kind := range kinds {
+		records, err := s.read(model.RelationCollection(kind), model.RunFactsIndex, id)
+		if err != nil {
 			return nil, err
 		}
-	}
-	// group.prepare's immutable member/link facts retain one authority. The
-	// parent index selects only this Run's sealed groups, without an inventory.
-	rows, err := s.tx.QueryContext(s.ctx, "SELECT id,invocation_id,group_key FROM core_groups WHERE scope=? AND parent_id=? AND sealed=1 ORDER BY id LIMIT ?", s.scope, id, model.MaxSessionWorkflowSources+1)
-	if err != nil {
-		return nil, err
-	}
-	type sealedCoordinates struct{ id, invocation, key string }
-	groupIDs := []sealedCoordinates{}
-	for rows.Next() {
-		var groupID sealedCoordinates
-		if err = rows.Scan(&groupID.id, &groupID.invocation, &groupID.key); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err = s.charge(1); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		groupIDs = append(groupIDs, groupID)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return nil, err
-	}
-	for _, groupID := range groupIDs {
-		group, e := groupSnapshot(s.ctx, s.tx, s.scope, model.GroupRead{ID: groupID.id})
-		if e != nil {
-			return nil, e
-		}
-		if e = s.charge(2 * len(group.Members)); e != nil {
-			return nil, e
-		}
-		wire, _ := encode(group)
-		s.privateBytes += len(wire)
-		if s.privateBytes > MaxResponseBytes {
-			return nil, failure("resource_exhausted", "Session group materialization byte limit exceeded")
-		}
-		header, e := publicSessionFact(group.Body, relationPublicFields["childRunGroups"])
-		if e != nil {
-			return nil, e
-		}
-		if header.text("id") != groupID.id || header.text("producerInvocationId") != groupID.invocation || header.text("groupKey") != groupID.key || header.integer("memberCount") != int64(group.MemberCount) {
-			return nil, failure("data_loss", "sealed group metadata disagrees with indexed authority")
-		}
-		if e = appendFact("childRunGroups", group.Body); e != nil {
-			return nil, e
-		}
-		for ordinal, member := range group.Members {
-			link, e := publicSessionFact(member.Link, relationPublicFields["childRuns"])
-			if e != nil {
-				return nil, e
+		for _, record := range records {
+			var fact sessionFact
+			if json.Unmarshal(record.Data, &fact) != nil || !textKey(fact.text("id")) || record.Key != fact.text("id") {
+				return nil, failure("data_loss", "invalid typed relation identity")
 			}
-			fact, e := publicSessionFact(member.Body, relationPublicFields["childRunGroupMembers"])
-			if e != nil {
-				return nil, e
+			if kind == "childRunGroups" && (fact.text("state") == "resolved" || fact.text("state") == "canceled") {
+				var resolution sessionFact
+				if json.Unmarshal(fact["resolution"], &resolution) != nil || resolution.text("groupId") != fact.text("id") {
+					return nil, failure("data_loss", "invalid terminal group resolution")
+				}
+				for _, field := range []string{"outcome", "winnerChildRunId", "terminalCount"} {
+					if value, ok := resolution[field]; ok {
+						fact[field] = value
+					}
+				}
 			}
-			if link.text("childRunId") != member.ChildID || link.text("parentInvocationId") != groupID.invocation || link.integer("ordinal") != int64(ordinal) || fact.text("childRunId") != member.ChildID || fact.text("groupId") != groupID.id || fact.text("itemKey") != member.ItemKey || fact.integer("ordinal") != int64(ordinal) {
-				return nil, failure("data_loss", "sealed group member coordinates disagree with authority")
+			if err = appendFact(kind, fact.raw()); err != nil {
+				return nil, err
 			}
-			if e = appendFact("childRuns", member.Link); e != nil {
-				return nil, e
+			if kind != "childRunGroups" {
+				continue
 			}
-			if e = appendFact("childRunGroupMembers", member.Body); e != nil {
-				return nil, e
+			members, err := s.read(model.ChildGroupMembersCollection, "by_group", fact.text("id"))
+			if err != nil {
+				return nil, err
+			}
+			for _, member := range members {
+				var f sessionFact
+				if json.Unmarshal(member.Data, &f) != nil || member.Key != f.text("id") || f.text("groupId") != fact.text("id") {
+					return nil, failure("data_loss", "invalid typed member identity")
+				}
+				if err = appendFact("childRunGroupMembers", member.Data); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
