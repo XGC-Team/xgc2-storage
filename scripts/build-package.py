@@ -65,7 +65,7 @@ def main():
         binary_dir = package / "usr/bin"
         binary_dir.mkdir(parents=True)
         env = dict(os.environ, CGO_ENABLED="0", GOOS="linux", GOARCH=args.architecture, GOWORK="off")
-        for source, name in (("xgc2-storage", "xgc2-storage"), ("storage-admin", "xgc2-storage-admin")):
+        for source, name in (("xgc2-storage", "xgc2-storage"), ("storage-admin", "xgc2-storage-admin"), ("xgc2-configuration-import", "xgc2-configuration-import")):
             subprocess.run(["go", "build", "-mod=readonly", "-trimpath", "-o", str(binary_dir / name), "./cmd/" + source], cwd=storage_copy, env=env, check=True)
         for name in ("contracts", "schemas"):
             shutil.copytree(storage_copy / name, package / "usr/share/xgc2-storage" / name)
