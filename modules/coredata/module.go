@@ -33,13 +33,13 @@ const MaxReferences = 16384
 const MaxScopeRows = 1000000
 const MaxScopeBytes = 512 << 20
 
-//go:embed model/workflow_records.go model/workflow_relations.go schema.sql
+//go:embed schema.sql
 var SchemaSQL string
 
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed execution_reads.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go configuration_execution.go model/configuration_execution.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
+//go:embed model/workflow_records.go model/workflow_relations.go execution_reads.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go configuration_execution.go model/configuration_execution.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
