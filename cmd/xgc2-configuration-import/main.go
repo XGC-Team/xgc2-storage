@@ -20,13 +20,23 @@ import (
 	"time"
 )
 
+// This offline file boundary includes retained history; it is never an RPC limit.
+const maxOfflineArchiveBytes int64 = 8 << 30
+
 func readFile(path string, out any) error {
 	f, e := os.Open(path)
 	if e != nil {
 		return e
 	}
 	defer f.Close()
-	d := json.NewDecoder(io.LimitReader(f, coredata.MaxScopeBytes+1))
+	info, e := f.Stat()
+	if e != nil {
+		return e
+	}
+	if info.Size() > maxOfflineArchiveBytes {
+		return errors.New("offline archive exceeds finite file budget")
+	}
+	d := json.NewDecoder(io.LimitReader(f, maxOfflineArchiveBytes+1))
 	d.DisallowUnknownFields()
 	if e = d.Decode(out); e != nil {
 		return e
@@ -79,7 +89,7 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	spec := coredata.Spec()
 	declared := false
@@ -95,7 +105,7 @@ func run() error {
 	if !declared {
 		return errors.New("target manifest must explicitly contain current coredata module")
 	}
-	cfg := engine.Config{Path: *path, Create: true, Manifest: manifest, Modules: []engine.DataModule{{Spec: spec, Initialize: coredata.Initialize, Execute: coredata.Execute, Deploy: func(ctx context.Context, tx *sql.Tx) error {
+	cfg := engine.Config{Path: *path, Create: true, Manifest: manifest, MaxDBBytes: 8 << 30, Modules: []engine.DataModule{{Spec: spec, Initialize: coredata.Initialize, Execute: coredata.Execute, Deploy: func(ctx context.Context, tx *sql.Tx) error {
 		if e := coredata.DeclareConfigurationDomains(ctx, tx, domains); e != nil {
 			return e
 		}
@@ -121,6 +131,12 @@ func run() error {
 	}
 	if e = store.ImportRecords(ctx, scope, in.Records); e != nil {
 		return e
+	}
+	// Checkpoint the offline bulk transaction before ordinary read admission.
+	if checkpoint, err := store.Checkpoint(ctx); err != nil {
+		return err
+	} else if checkpoint.Busy != 0 {
+		return errors.New("offline checkpoint is pinned")
 	}
 	// Read through the same public engine operations used by the installed
 	// native owner, after the creation/import transaction has committed.
@@ -174,19 +190,39 @@ func run() error {
 		maxWire = max(maxWire, len(raw))
 		refs += len(got.References)
 	}
-	for _, v := range in.Records {
-		read, e := store.Snapshot(ctx, api.SnapshotRequest{Scope: scope, Queries: []api.Query{{Collection: v.Collection, Keys: []string{v.Key}}}})
+	for offset := 0; offset < len(in.Records); {
+		collection := in.Records[offset].Collection
+		count, size := 0, 0
+		keys := []string{}
+		for offset+count < len(in.Records) && count < api.MaxRows {
+			v := in.Records[offset+count]
+			if v.Collection != collection {
+				break
+			}
+			bytes := len(v.Key) + len(v.Data) + 128
+			if count > 0 && size+bytes > api.MaxResponseBytes/2 {
+				break
+			}
+			size += bytes
+			keys = append(keys, v.Key)
+			count++
+		}
+		read, e := store.Snapshot(ctx, api.SnapshotRequest{Scope: scope, Queries: []api.Query{{Collection: collection, Keys: keys}}})
 		if e != nil {
 			return e
 		}
-		if len(read.Results) != 1 || len(read.Results[0].Records) != 1 {
-			return errors.New("imported record point read missing")
+		if len(read.Results) != 1 || len(read.Results[0].Records) != count {
+			return errors.New("imported record bounded read missing")
 		}
-		got := read.Results[0].Records[0]
-		if got.Key != v.Key || got.Missing || got.Deleted || got.Version != "1" || !sameDocument(got.Data, v.Data) {
-			return errors.New("imported record did not round trip")
+		for i, got := range read.Results[0].Records {
+			v := in.Records[offset+i]
+			if got.Key != v.Key || got.Missing || got.Deleted || got.Version != "1" || !sameDocument(got.Data, v.Data) {
+				return errors.New("imported record did not round trip")
+			}
 		}
+		offset += count
 	}
+
 	commandsVerified, eventsVerified := 0, 0
 	if history := in.Execution; history != nil {
 		named := func(op string, input, output any) error {

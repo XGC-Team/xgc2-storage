@@ -20,7 +20,7 @@ func (s *Store) ImportRecords(ctx context.Context, scope api.Scope, records []ap
 	if len(records) == 0 {
 		return nil
 	}
-	ctx, release, err := s.beginCall(ctx, true)
+	ctx, release, err := s.admitCall(ctx, true, 0)
 	if err != nil {
 		return err
 	}

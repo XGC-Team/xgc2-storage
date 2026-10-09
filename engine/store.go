@@ -278,6 +278,12 @@ func collection(n api.Namespace, id string) (api.Collection, error) {
 	return api.Collection{}, fail("invalid_argument", "collection is not registered")
 }
 func (s *Store) beginCall(ctx context.Context, write bool) (context.Context, func(), error) {
+	return s.admitCall(ctx, write, s.config.MaxCallTime)
+}
+
+// admitCall shares lifecycle/capacity admission with the explicit offline owner.
+// A zero internal clamp still requires the caller to supply a finite deadline.
+func (s *Store) admitCall(ctx context.Context, write bool, maximum time.Duration) (context.Context, func(), error) {
 	s.lifecycle.RLock()
 	if s.closed.Load() {
 		s.lifecycle.RUnlock()
@@ -288,7 +294,12 @@ func (s *Store) beginCall(ctx context.Context, write bool) (context.Context, fun
 		s.lifecycle.RUnlock()
 		return nil, nil, fail("invalid_argument", "finite caller deadline required")
 	}
-	ctx, cancel := context.WithTimeout(ctx, s.config.MaxCallTime)
+	var cancel context.CancelFunc
+	if maximum > 0 {
+		ctx, cancel = context.WithTimeout(ctx, maximum)
+	} else {
+		ctx, cancel = context.WithCancel(ctx)
+	}
 	slot := s.reads
 	if write {
 		slot = s.writers
