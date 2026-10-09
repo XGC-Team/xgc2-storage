@@ -39,12 +39,12 @@ var SchemaSQL string
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed execution_reads.go configuration_execution.go model/configuration_execution.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go
+//go:embed execution_reads.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go configuration_execution.go model/configuration_execution.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
 	h := sha256.New()
-	for _, path := range []string{"execution_reads.go", "configuration_execution.go", "model/configuration_execution.go", "module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go"} {
+	for _, path := range []string{"execution_reads.go", "module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "configuration_metadata.go", "model/configuration_metadata.go", "configuration_execution.go", "model/configuration_execution.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go", "configuration_source.go", "configuration_clone.go", "model/configuration_clone.go", "configuration_incoming.go", "model/configuration_incoming.go"} {
 		b, _ := moduleSource.ReadFile(path)
 		h.Write([]byte(path + "\x00"))
 		h.Write(b)
@@ -66,10 +66,14 @@ func Spec() api.Module {
 		{ID: model.ConfigurationBranchCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationBranchArchiveOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationResourceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationResourceMetadataOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ResourceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ResourceCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ResourceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationIncomingOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationNamespaceCloneOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationNamespaceCloneReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationNamespaceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationNamespaceUpdateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationNamespaceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
@@ -195,7 +199,6 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			if err = decode(raw, &r); err == nil {
 				result, err = commitExecution(ctx, tx, scope, r)
 			}
-
 		case model.ExecutionCommandListOperation:
 			var r model.CommandListRead
 			if err = decode(raw, &r); err == nil {
@@ -241,6 +244,11 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			if err = decode(raw, &r); err == nil {
 				result, err = configurationResourceState(ctx, tx, scope, r)
 			}
+		case model.ConfigurationResourceMetadataOperation:
+			var r model.ConfigurationResourceMetadata
+			if err = decode(raw, &r); err == nil {
+				result, err = configurationResourceMetadata(ctx, tx, scope, r)
+			}
 		case model.ResourceCreateOperation:
 			var r model.ConfigurationResourceCreate
 			if err = decode(raw, &r); err == nil {
@@ -255,6 +263,21 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			var r model.ConfigurationResourceRead
 			if err = decode(raw, &r); err == nil {
 				result, err = configurationRead(ctx, tx, scope, r)
+			}
+		case model.ConfigurationIncomingOperation:
+			var r model.ConfigurationIncomingRead
+			if err = decode(raw, &r); err == nil {
+				result, err = configurationIncomingRead(ctx, tx, scope, r)
+			}
+		case model.ConfigurationNamespaceCloneOperation:
+			var r model.ConfigurationNamespaceClone
+			if err = decode(raw, &r); err == nil {
+				result, err = configurationClone(ctx, tx, scope, r)
+			}
+		case model.ConfigurationNamespaceCloneReceiptOperation:
+			var r model.ConfigurationNamespaceCloneReceipt
+			if err = decode(raw, &r); err == nil {
+				result, err = configurationCloneReceipt(ctx, tx, scope, r)
 			}
 		case model.ConfigurationNamespaceCreateOperation, model.ConfigurationNamespaceUpdateOperation, model.ConfigurationNamespaceStateOperation:
 			var r model.ConfigurationNamespaceWrite

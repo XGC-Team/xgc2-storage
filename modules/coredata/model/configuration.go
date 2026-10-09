@@ -89,7 +89,17 @@ type PreparedConfigurationSnapshot struct {
 	Change     ConfigurationChange      `json:"change"`
 }
 
+type ConfigurationSourcePin struct {
+	ResourceID               string                    `json:"resource_id"`
+	ExpectedResourceRevision string                    `json:"expected_resource_revision"`
+	CommitID                 string                    `json:"commit_id"`
+	ContentDigest            string                    `json:"content_digest"`
+	Branch                   *ConfigurationBranchGuard `json:"branch,omitempty"`
+	Main                     ConfigurationBranchGuard  `json:"main"`
+}
+
 type ConfigurationResourceCreate struct {
+	Source     *ConfigurationSourcePin       `json:"source,omitempty"`
 	Domain     ConfigurationDomainGuard      `json:"domain"`
 	Mutation   ConfigurationMutation         `json:"mutation"`
 	ResourceID string                        `json:"resource_id"`
@@ -109,6 +119,7 @@ type ConfigurationResourceCreate struct {
 // replaced branch old outgoing set is excluded from incoming blockers. The
 // complete new self-reference set still must resolve against the new manifest.
 type ConfigurationResourceCommit struct {
+	Source     *ConfigurationSourcePin  `json:"source,omitempty"`
 	Domain     ConfigurationDomainGuard `json:"domain"`
 	Mutation   ConfigurationMutation    `json:"mutation"`
 	ResourceID string                   `json:"resource_id"`
@@ -163,6 +174,7 @@ type ConfigurationCommit struct {
 	ResourceID     string `json:"resource_id"`
 	BranchID       string `json:"branch_id"`
 	Version        string `json:"version"`
+	BranchRevision string `json:"branch_revision"`
 	ParentCommitID string `json:"parent_commit_id"`
 	SourceCommitID string `json:"source_commit_id"`
 	RootDigest     string `json:"root_digest"`

@@ -2,6 +2,7 @@ package coredata
 
 import (
 	"context"
+
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -133,6 +134,11 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err != nil {
 		return out, err
 	}
+	if q.Source != nil {
+		if _, err = configurationSource(ctx, tx, scope, q.Domain.Key, *q.Source); err != nil {
+			return out, err
+		}
+	}
 	if err = configurationName(q.Name, q.NameKey); err != nil {
 		return out, err
 	}
@@ -173,8 +179,16 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	r := model.ConfigurationResource{ID: q.ResourceID, NamespaceID: q.Namespace.ID, Name: q.Name, NameKey: q.NameKey, Revision: "1", MainCommitID: q.CommitID, NextVersion: "2", System: q.System, SystemKey: q.SystemKey, CreatedAt: now, UpdatedAt: now}
+	if q.Source != nil {
+		r.OriginResourceID = q.Source.ResourceID
+		r.OriginCommitID = q.Source.CommitID
+	}
 	b := model.ConfigurationBranch{ID: q.BranchID, ResourceID: r.ID, Name: "main", NameKey: "main", Revision: "1", HeadCommitID: q.CommitID, CreatedAt: now, UpdatedAt: now}
-	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: "1", RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: "1", BranchRevision: "1", RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	if q.Source != nil {
+		c.SourceCommitID = q.Source.CommitID
+		b.CreatedFromCommitID = c.ID
+	}
 	if err = configurationValidateReferences(ctx, tx, scope, q.Domain.Key, r, b, c, manifest, q.Snapshot.References); err != nil {
 		return out, err
 	}
@@ -183,7 +197,7 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = reserve(ctx, tx, scope, 2, int64(len(rb)+len(bb))); err != nil {
 		return out, err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", scope, q.Domain.Key, r.ID, configurationNullable(r.NamespaceID), r.Name, r.NameKey, r.Revision, r.MainCommitID, 0, "", "", []byte(rb)); err != nil {
+	if _, err = tx.ExecContext(ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", scope, q.Domain.Key, r.ID, configurationNullable(r.NamespaceID), r.Name, r.NameKey, r.Revision, r.MainCommitID, 0, r.OriginResourceID, r.OriginCommitID, []byte(rb)); err != nil {
 		return out, err
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT INTO core_branches VALUES(?,?,?,?,?,?,?,?)", scope, q.Domain.Key, b.ID, r.ID, b.NameKey, b.HeadCommitID, b.Revision, []byte(bb)); err != nil {
@@ -238,6 +252,15 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	}
 	if err = configurationGuard(b, base.Head.Commit, q.Branch); err != nil {
 		return out, err
+	}
+	if q.Source != nil {
+		source, e := configurationSource(ctx, tx, scope, q.Domain.Key, *q.Source)
+		if e != nil {
+			return out, e
+		}
+		if source.Head.Resource.ID != r.ID || q.Source.Branch == nil || b.NameKey != "main" {
+			return out, failure("invalid_argument", "promotion needs an owned named source branch")
+		}
 	}
 	mainBytes := 0
 	if d.MainVisibility || q.Main.ID != "" {
@@ -388,7 +411,10 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	r.UpdatedAt = now
 	b.HeadCommitID = q.CommitID
 	b.UpdatedAt = now
-	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: version, ParentCommitID: base.Head.Commit.ID, RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: version, BranchRevision: b.Revision, ParentCommitID: base.Head.Commit.ID, RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	if q.Source != nil {
+		c.SourceCommitID = q.Source.CommitID
+	}
 	if err = configurationValidateReferences(ctx, tx, scope, q.Domain.Key, r, b, c, manifest, q.Snapshot.References); err != nil {
 		return out, err
 	}

@@ -205,6 +205,20 @@ func configurationRead(ctx context.Context, tx *sql.Tx, scope string, q model.Co
 	var r model.ConfigurationResource
 	var b model.ConfigurationBranch
 	var commitID string
+	// A commit identity is an indexed immutable point. Its owner is derived by
+	// the storage transaction, never supplied as a guessed Core sidecar.
+	if q.ResourceID == "" && q.CommitID != "" && q.Branch == "" && q.NamespaceID == "" && q.NameKey == "" {
+		if !textKey(q.CommitID) {
+			return out, failure("invalid_argument", "exact commit identity required")
+		}
+		err = tx.QueryRowContext(ctx, "SELECT resource_id FROM core_snapshots WHERE scope=? AND domain=? AND id=?", scope, q.Domain.Key, q.CommitID).Scan(&q.ResourceID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return out, failure("not_found", "immutable commit not found")
+		}
+		if err != nil {
+			return out, err
+		}
+	}
 	if q.ResourceID != "" {
 		if !textKey(q.ResourceID) || q.NamespaceID != "" || q.NameKey != "" || (q.Branch == "") == (q.CommitID == "") {
 			return out, failure("invalid_argument", "exact resource+branch or resource+commit selector required")
@@ -322,7 +336,7 @@ func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model
 		return out, failure("invalid_argument", "product receipt identity/allowed operation required")
 	}
 	for i, op := range q.Operations {
-		if op != model.ResourceCreateOperation && op != model.ResourceCommitOperation && op != model.ConfigurationBranchCreateOperation && op != model.ConfigurationBranchArchiveOperation && op != model.ConfigurationResourceStateOperation || i > 0 && op == q.Operations[0] {
+		if op != model.ResourceCreateOperation && op != model.ResourceCommitOperation && op != model.ConfigurationBranchCreateOperation && op != model.ConfigurationBranchArchiveOperation && op != model.ConfigurationResourceStateOperation && op != model.ConfigurationResourceMetadataOperation || i > 0 && op == q.Operations[0] {
 			return out, failure("invalid_argument", "invalid product receipt operation")
 		}
 	}
