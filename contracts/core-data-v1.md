@@ -737,3 +737,16 @@ Later branch/archive/history/reference admission and clone declaration/receipt
 extensions are not implied by this first group. Consumer hooks
 PrepareSnapshot/EncodePrepared/DecodeStored/RewriteFrozen receive bytes/data;
 no transaction, SQL callback, provider fallback or retired ORM belongs in them.
+
+### Configuration catalog lifecycle
+
+`configuration.branch.create`, `configuration.branch.archive` and
+`configuration.resource.state` use the same current domain fence and durable
+product mutation receipt as immutable snapshot writes. Branch creation pins an
+owned immutable source and the current main, and creates a new live branch
+without copying snapshot bytes or references. Archiving releases its canonical
+name; historical commits retain their original owner. Live tracking references
+block archive, including branches sharing another branch's immutable head.
+Resource restore checks the prospective outgoing graph in the same transaction;
+invalid targets roll back state, quota, audit and receipt together. All inputs
+and projections are declared in `model/configuration_state.go`.

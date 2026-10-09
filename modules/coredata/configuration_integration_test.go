@@ -420,3 +420,78 @@ func TestConfigurationNamedOuterResultFailureRollsBackProduct(t *testing.T) {
 		t.Fatal("late fault leaked allocation")
 	}
 }
+
+func TestConfigurationNamedBranchAndArchiveLifecycle(t *testing.T) {
+	f := openConfigurationNamed(t, false, false)
+	create := configCreate(t, f, "target")
+	r, e := f.named(model.ResourceCreateOperation, "target-create", create)
+	configResult(t, r, e)
+	main := f.read(t, "target", "main", "")
+	meta := func(key string) model.ConfigurationMutation {
+		return model.ConfigurationMutation{Key: key, IntentDigest: strings.Repeat("c", 64), Actor: "tester"}
+	}
+	fork := model.ConfigurationBranchCreate{Domain: f.domain, Mutation: meta("fork"), ResourceID: "target", ExpectedResourceRevision: main.Head.Resource.Revision, Main: main.CurrentMain.Branch, ID: "review-v1", Name: "Review", FromCommitID: main.Head.Commit.ID, FromContentDigest: main.Head.Commit.ContentDigest}
+	r, e = f.named(model.ConfigurationBranchCreateOperation, "fork-attempt", fork)
+	first := configResult(t, r, e)
+	if first.Result.Head.Branch.NameKey != "review" || first.Result.Head.Branch.HeadCommitID != main.Head.Commit.ID {
+		t.Fatal("fork did not retain exact shared head")
+	}
+	losing := fork
+	losing.ID = "losing-branch"
+	losing.FromContentDigest = strings.Repeat("f", 64)
+	r, e = f.named(model.ConfigurationBranchCreateOperation, "fork-retry", losing)
+	replay := configResult(t, r, e)
+	if !replay.Replayed || replay.PlanDigest != first.PlanDigest || replay.Result.Head.Branch.ID != fork.ID {
+		t.Fatal("product replay re-evaluated mutable pins")
+	}
+	branch := f.read(t, "target", "review", "")
+	linked := configCreate(t, f, "linked")
+	linked.Snapshot.References = []model.ConfigurationReference{{Slot: "target", Mode: "tracking", TargetDomain: f.domain.Key, TargetResourceID: "target", TargetBranch: "review", TargetComponentID: "x"}}
+	r, e = f.named(model.ResourceCreateOperation, "linked-create", linked)
+	configResult(t, r, e)
+	guard := model.ConfigurationBranchGuard{ID: branch.Head.Branch.ID, ExpectedRevision: branch.Head.Branch.Revision, CommitID: branch.Head.Commit.ID, ContentDigest: branch.Head.Commit.ContentDigest}
+	archive := model.ConfigurationBranchArchive{Domain: f.domain, Mutation: meta("archive-branch"), ResourceID: "target", Main: main.CurrentMain.Branch, Branch: guard}
+	_, e = f.named(model.ConfigurationBranchArchiveOperation, "branch-blocked", archive)
+	if executionErrorCode(e) != "failed_precondition" {
+		t.Fatalf("tracking branch archive: %v", e)
+	}
+	current := f.read(t, "linked", "main", "")
+	state := model.ConfigurationResourceState{Domain: f.domain, Mutation: meta("archive-linked"), ResourceID: "linked", ExpectedRevision: current.Head.Resource.Revision, Main: current.CurrentMain.Branch, Archived: true}
+	r, e = f.named(model.ConfigurationResourceStateOperation, "linked-archive", state)
+	archivedLinked := configResult(t, r, e)
+	r, e = f.named(model.ConfigurationBranchArchiveOperation, "branch-archive", archive)
+	archived := configResult(t, r, e)
+	if archived.Result.Head.Branch.Revision != "2" || archived.Result.Head.Branch.ArchivedAt == "" {
+		t.Fatal("archive did not advance branch")
+	}
+	fork.ID = "review-v2"
+	fork.Mutation = meta("fork-again")
+	r, e = f.named(model.ConfigurationBranchCreateOperation, "fork-again", fork)
+	second := configResult(t, r, e)
+	if second.Result.Head.Branch.ID == first.Result.Head.Branch.ID {
+		t.Fatal("archived name did not become reusable")
+	}
+	if f.read(t, "target", "review", "").Head.Branch.ID != fork.ID {
+		t.Fatal("canonical selector did not select live replacement")
+	}
+	targetState := model.ConfigurationResourceState{Domain: f.domain, Mutation: meta("archive-target"), ResourceID: "target", ExpectedRevision: main.Head.Resource.Revision, Main: main.CurrentMain.Branch, Archived: true}
+	r, e = f.named(model.ConfigurationResourceStateOperation, "target-archive", targetState)
+	archivedTarget := configResult(t, r, e)
+	state.ExpectedRevision = archivedLinked.Result.Head.Resource.Revision
+	state.Archived = false
+	state.Mutation = meta("restore-linked")
+	_, e = f.named(model.ConfigurationResourceStateOperation, "linked-restore-blocked", state)
+	if executionErrorCode(e) != "not_found" {
+		t.Fatalf("restore with archived target: %v", e)
+	}
+	targetState.ExpectedRevision = archivedTarget.Result.Head.Resource.Revision
+	targetState.Archived = false
+	targetState.Mutation = meta("restore-target")
+	r, e = f.named(model.ConfigurationResourceStateOperation, "target-restore", targetState)
+	configResult(t, r, e)
+	r, e = f.named(model.ConfigurationResourceStateOperation, "linked-restore", state)
+	restored := configResult(t, r, e)
+	if restored.Result.Head.Resource.ArchivedAt != "" || restored.Result.Head.Resource.Revision != "3" {
+		t.Fatal("restoration was not atomic")
+	}
+}

@@ -47,9 +47,14 @@ func configurationBranch(ctx context.Context, tx *sql.Tx, scope, domain, id stri
 	}
 	return out, nil
 }
-func configurationBranchNamed(ctx context.Context, tx *sql.Tx, scope, domain, resource, name string) (model.ConfigurationBranch, error) {
+func configurationBranchNamed(ctx context.Context, tx *sql.Tx, scope, domain, resource, name string, includeArchived ...bool) (model.ConfigurationBranch, error) {
 	var id string
-	err := tx.QueryRowContext(ctx, "SELECT id FROM core_branches WHERE scope=? AND domain=? AND resource_id=? AND name_key=?", scope, domain, resource, name).Scan(&id)
+	query := "SELECT id FROM core_branches WHERE scope=? AND domain=? AND resource_id=? AND name_key=?"
+	if len(includeArchived) == 0 || !includeArchived[0] {
+		query += " AND coalesce(json_extract(CAST(body AS TEXT),'$.archived_at'),'')=''"
+	}
+	query += " ORDER BY coalesce(json_extract(CAST(body AS TEXT),'$.archived_at'),'') ASC,json_extract(CAST(body AS TEXT),'$.updated_at') DESC,id LIMIT 1"
+	err := tx.QueryRowContext(ctx, query, scope, domain, resource, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.ConfigurationBranch{}, failure("not_found", "branch not found")
 	}
@@ -218,7 +223,7 @@ func configurationRead(ctx context.Context, tx *sql.Tx, scope string, q model.Co
 			if e != nil || key != q.Branch {
 				return out, failure("invalid_argument", "canonical bounded branch selector required")
 			}
-			b, err = configurationBranchNamed(ctx, tx, scope, q.Domain.Key, r.ID, q.Branch)
+			b, err = configurationBranchNamed(ctx, tx, scope, q.Domain.Key, r.ID, q.Branch, q.IncludeArchived)
 			if err != nil {
 				return out, err
 			}
@@ -317,7 +322,7 @@ func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model
 		return out, failure("invalid_argument", "product receipt identity/allowed operation required")
 	}
 	for i, op := range q.Operations {
-		if op != model.ResourceCreateOperation && op != model.ResourceCommitOperation || i > 0 && op == q.Operations[0] {
+		if op != model.ResourceCreateOperation && op != model.ResourceCommitOperation && op != model.ConfigurationBranchCreateOperation && op != model.ConfigurationBranchArchiveOperation && op != model.ConfigurationResourceStateOperation || i > 0 && op == q.Operations[0] {
 			return out, failure("invalid_argument", "invalid product receipt operation")
 		}
 	}
