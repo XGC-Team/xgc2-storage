@@ -430,3 +430,55 @@ func TestEngineExecutionReadGuardsRejectChangedDecisionWithoutGlobalCAS(t *testi
 		t.Fatalf("guard rejection wrote task: %+v %v", snapshot, err)
 	}
 }
+
+// A prepared decision already owns the source bodies. Revalidating its exact
+// record versions must not materialize the historic bodies a second time.
+func TestEngineExecutionReadGuardsDoNotRereadHistoricBodies(t *testing.T) {
+	f := newExecutionFixture(t, "", 1000)
+	var guards []model.RecordGuard
+	bodyBytes := 0
+	for batch := 0; batch < 2; batch++ {
+		var state []api.Mutation
+		for i := 0; i < 300; i++ {
+			id := fmt.Sprintf("historic-%03d", batch*300+i)
+			body, err := json.Marshal(map[string]string{"name": id, "padding": strings.Repeat("x", 30<<10)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			bodyBytes += len(body)
+			state = append(state, api.Mutation{Collection: "runs", Key: id, ExpectedVersion: "0", Data: body})
+		}
+		_, sources := committedExecution(t, f, fmt.Sprintf("historic-batch-%d", batch), model.ExecutionCommit{State: state})
+		for _, record := range sources.State {
+			guards = append(guards, model.RecordGuard{Collection: record.Collection, Key: record.Key, Version: record.Version})
+		}
+	}
+	if bodyBytes <= model.MaxResponseBytes {
+		t.Fatal("history does not exceed the unchanged dependent body-read budget")
+	}
+	committedExecution(t, f, "metadata-guarded-decision", model.ExecutionCommit{
+		Guards: guards,
+		State:  []api.Mutation{{Collection: "tasks", Key: "new-run-admission", ExpectedVersion: "0", Data: recordData("admission")}},
+	})
+	// Exact missing and tombstone facts retain distinct canonical versions.
+	_, deleted := committedExecution(t, f, "historic-delete", model.ExecutionCommit{State: []api.Mutation{{Collection: "runs", Key: guards[0].Key, ExpectedVersion: guards[0].Version, Delete: true}}})
+	committedExecution(t, f, "missing-and-tombstone", model.ExecutionCommit{
+		Guards: []model.RecordGuard{{Collection: "runs", Key: "absent", Version: "0"}, {Collection: "runs", Key: guards[0].Key, Version: deleted.State[0].Version}},
+		State:  []api.Mutation{{Collection: "tasks", Key: "after-delete", ExpectedVersion: "0", Data: recordData("after-delete")}},
+	})
+	for _, guard := range []model.RecordGuard{guards[0], {Collection: "runs", Key: guards[0].Key, Version: "0"}, {Collection: "undeclared", Key: "absent", Version: "0"}, {Collection: "runs", Key: "invalid\nkey", Version: "0"}} {
+		id := fmt.Sprintf("rejected-guard-%s-%s", guard.Collection, guard.Version)
+		_, err := f.named(id, model.ExecutionCommitOperation, model.ExecutionCommit{
+			Guards: []model.RecordGuard{guard},
+			State:  []api.Mutation{{Collection: "tasks", Key: "must-not-exist", ExpectedVersion: "0", Data: recordData("rejected")}},
+		})
+		expected := "conflict"
+		if guard.Collection == "undeclared" || strings.Contains(guard.Key, "\n") {
+			expected = "invalid_argument"
+		}
+		if executionErrorCode(err) != expected {
+			t.Fatalf("guard %+v: %v", guard, err)
+		}
+		noExecutionReceipt(t, f, id)
+	}
+}

@@ -7,8 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/XGC-Team/xgc2-storage/api"
-
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
@@ -72,11 +70,11 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 			return out, failure("invalid_argument", "unique exact record read guards required")
 		}
 		seen[key] = true
-		rows, readErr := engine.ReadRecords(ctx, tx, scope, api.Query{Collection: guard.Collection, Keys: []string{guard.Key}, IncludeDeleted: true})
+		version, readErr := engine.ReadRecordVersion(ctx, tx, scope, guard.Collection, guard.Key)
 		if readErr != nil {
 			return out, readErr
 		}
-		if len(rows.Records) != 1 || rows.Records[0].Version != guard.Version {
+		if version != guard.Version {
 			return out, failure("conflict", "execution decision source changed")
 		}
 	}
