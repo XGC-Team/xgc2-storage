@@ -91,8 +91,10 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 			s.conflicts.Add(1)
 			return nil, fail("conflict", "record version changed")
 		}
-		if _, err = tx.ExecContext(ctx, "DELETE FROM lookups WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key); err != nil {
-			return nil, err
+		if v > 0 {
+			if _, err = tx.ExecContext(ctx, "DELETE FROM lookups WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key); err != nil {
+				return nil, err
+			}
 		}
 	}
 	type totals struct {
