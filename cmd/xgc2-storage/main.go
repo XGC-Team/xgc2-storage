@@ -39,7 +39,9 @@ func main() {
 func run() error {
 	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, identityOut, configurationDomains string
 	var create, printModules bool
+	var maxDBBytes int64
 	flag.StringVar(&path, "db", "", "explicit managed database file grant (existing by default)")
+	flag.Int64Var(&maxDBBytes, "max-db-bytes", 1<<30, "finite owner database capacity in bytes")
 	flag.StringVar(&manifest, "manifest", "", "reviewed deployment manifest")
 	flag.StringVar(&grantsFile, "grants", "", "private mode0600 owner grant JSON array")
 	flag.StringVar(&socket, "http-socket", "", "private XRPC HTTP Unix endpoint")
@@ -160,7 +162,7 @@ func run() error {
 		}
 		modules = registry.ConfigurationDeployment(domains)
 	}
-	store, e := engine.Open(startup, engine.Config{Path: path, Create: create, Manifest: m, Modules: modules})
+	store, e := engine.Open(startup, engine.Config{Path: path, Create: create, Manifest: m, Modules: modules, MaxDBBytes: maxDBBytes})
 	if e != nil {
 		return e
 	}
