@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -114,6 +115,7 @@ func run() error {
 	}
 	instance := hex.EncodeToString(random[:])
 	var refs []xrpc.ServiceRef
+	var httpRef xrpc.ServiceRef
 	for _, endpoint := range []struct {
 		address string
 		profile string
@@ -126,6 +128,9 @@ func run() error {
 			return e
 		}
 		refs = append(refs, ref)
+		if endpoint.profile == xrpc.HTTP {
+			httpRef = ref
+		}
 	}
 	requestBytes, responseBytes := registry.TransportBounds(m)
 	policy, e := xrpc.ResolvePolicy(xrpc.PolicyOptions{
@@ -207,7 +212,7 @@ func run() error {
 		}
 	}()
 	defer func() { maintenanceStop(); <-maintenanceDone }()
-	httpOptions, e := (httpx.HostOptions{InstanceID: instance, Service: api.Service, Diagnostics: diagnostics}).WithPolicy(policy)
+	httpOptions, e := (httpx.HostOptions{InstanceID: instance, Service: api.Service, DiscoveryPaths: []string{"/v1/describe"}, Diagnostics: diagnostics}).WithPolicy(policy)
 	if e != nil {
 		return e
 	}
@@ -233,7 +238,7 @@ func run() error {
 			lease.Close()
 			return e
 		}
-		httpHost, e = httpx.Serve(listener, lease, handler, httpOptions)
+		httpHost, e = httpx.Serve(listener, lease, withDescription(handler, httpRef), httpOptions)
 		if e != nil {
 			lease.Close()
 			return e
@@ -295,6 +300,23 @@ func run() error {
 		err = errors.Join(err, grpcHost.Shutdown(shutdown))
 	}
 	return err
+}
+
+func withDescription(handler http.Handler, ref xrpc.ServiceRef) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/describe", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			ServiceRef xrpc.ServiceRef `json:"service_ref"`
+		}{ServiceRef: ref})
+	})
+	mux.Handle("/", handler)
+	return mux
 }
 func publishPrivateJSON(path string, value any) error {
 	parent := filepath.Dir(path)
