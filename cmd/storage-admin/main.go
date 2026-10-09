@@ -34,7 +34,9 @@ func run() error {
 	flags := flag.NewFlagSet(operation, flag.ContinueOnError)
 	var path, manifest, oldManifest, destination string
 	var limit int
+	var maxDBBytes int64
 	flags.StringVar(&path, "db", "", "explicit offline database grant")
+	flags.Int64Var(&maxDBBytes, "max-db-bytes", 1<<30, "finite owner database capacity in bytes")
 	flags.StringVar(&manifest, "manifest", "", "exact deployed manifest or update-modules target")
 	flags.StringVar(&oldManifest, "old-manifest", "", "exact old manifest required by update-modules")
 	flags.StringVar(&destination, "destination", "", "absent backup destination in private managed directory")
@@ -84,7 +86,7 @@ func run() error {
 		}
 		return json.NewEncoder(os.Stdout).Encode(result)
 	}
-	store, e := engine.Open(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled()})
+	store, e := engine.Open(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled(), MaxDBBytes: maxDBBytes})
 	if e != nil {
 		return e
 	}
