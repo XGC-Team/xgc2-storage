@@ -36,7 +36,10 @@ type Config struct {
 type DataModule struct {
 	Spec       api.Module
 	Initialize func(context.Context, *sql.Tx) error
-	Execute    func(context.Context, *sql.Tx, string, string, json.RawMessage) (json.RawMessage, error)
+	// Deploy applies explicit owner-supplied deployment facts before RPC starts.
+	// It is compiled code, never an operation supplied by a data caller.
+	Deploy  func(context.Context, *sql.Tx) error
+	Execute func(context.Context, *sql.Tx, string, string, json.RawMessage) (json.RawMessage, error)
 }
 type Store struct {
 	config                      Config
@@ -205,6 +208,27 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	for _, statement := range []string{"PRAGMA synchronous=FULL", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-4096", "PRAGMA wal_autocheckpoint=256", "PRAGMA journal_size_limit=1048576"} {
 		if _, err = s.writer.ExecContext(ctx, statement); err != nil {
 			return nil, err
+		}
+	}
+	deployed := map[string]bool{}
+	for _, namespace := range c.Manifest.Namespaces {
+		for _, registered := range namespace.Modules {
+			module := s.modules[registered.ID]
+			if deployed[registered.ID] || module.Deploy == nil {
+				continue
+			}
+			deployed[registered.ID] = true
+			tx, e := s.writer.BeginTx(ctx, nil)
+			if e != nil {
+				return nil, e
+			}
+			if e = module.Deploy(ctx, tx); e != nil {
+				tx.Rollback()
+				return nil, e
+			}
+			if e = tx.Commit(); e != nil {
+				return nil, e
+			}
 		}
 	}
 	readDSN := (&url.URL{Scheme: "file", Path: o.path(), RawQuery: "mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(0)&_pragma=cache_size(-2048)&_pragma=temp_store(2)"}).String()

@@ -39,6 +39,11 @@ python3 scripts/build-package.py --architecture amd64 --distribution noble \
 
 ## Explicit deployment
 
+For Core configuration, the owner supplies `--configuration-domains` with the
+compiled catalog declaration array. Storage applies those facts in its own
+startup transaction before publishing a ServiceRef. Existing schema and
+capability changes are rejected; normal data requests never adopt declarations.
+
 The deployment owner supplies a mode0700 managed database directory, a reviewed
 manifest, an absent new DB for an explicit rebuild, a mode0600 owner-grant file,
 and a private runtime directory. No HOME/CWD/tmp default or old database fallback.

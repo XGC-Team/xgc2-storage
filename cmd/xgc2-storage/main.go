@@ -19,6 +19,7 @@ import (
 
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	pb "github.com/XGC-Team/xgc2-storage/protocol"
 	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
@@ -36,7 +37,7 @@ func main() {
 	}
 }
 func run() error {
-	var path, manifest, grantsFile, socket, grpcSocket, target, refOut string
+	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, configurationDomains string
 	var create bool
 	flag.StringVar(&path, "db", "", "explicit managed database file grant (existing by default)")
 	flag.StringVar(&manifest, "manifest", "", "reviewed deployment manifest")
@@ -45,6 +46,7 @@ func run() error {
 	flag.StringVar(&grpcSocket, "grpc-socket", "", "private XRPC gRPC Unix endpoint")
 	flag.StringVar(&target, "target-id", "", "local target identity")
 	flag.StringVar(&refOut, "ref-out", "", "private runtime file for bound ServiceRef array")
+	flag.StringVar(&configurationDomains, "configuration-domains", "", "explicit Core compiled domain declarations applied by this owner before serving")
 	flag.BoolVar(&create, "create", false, "explicitly initialize absent DB; never replace existing")
 	flag.Parse()
 	if flag.NArg() != 0 {
@@ -124,7 +126,32 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	store, e := engine.Open(startup, engine.Config{Path: path, Create: create, Manifest: m, Modules: registry.Compiled()})
+	modules := registry.Compiled()
+	if configurationDomains != "" {
+		file, err := os.Open(configurationDomains)
+		if err != nil {
+			return err
+		}
+		raw, err := io.ReadAll(io.LimitReader(file, (256<<10)+1))
+		file.Close()
+		if err != nil {
+			return err
+		}
+		if len(raw) == 0 || len(raw) > 256<<10 {
+			return errors.New("storage: configuration declarations exceed 256 KiB or are empty")
+		}
+		var domains []model.ConfigurationDomainDeclaration
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&domains); err != nil {
+			return err
+		}
+		if decoder.Decode(new(any)) != io.EOF || len(domains) == 0 || len(domains) > 256 {
+			return errors.New("storage: one bounded domain declaration array required")
+		}
+		modules = registry.ConfigurationDeployment(domains)
+	}
+	store, e := engine.Open(startup, engine.Config{Path: path, Create: create, Manifest: m, Modules: modules})
 	if e != nil {
 		return e
 	}
