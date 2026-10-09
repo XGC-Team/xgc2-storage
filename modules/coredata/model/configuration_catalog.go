@@ -43,3 +43,23 @@ type ConfigurationChangeRecord struct {
 	BeforePath string                `json:"before_path"`
 	AfterPath  string                `json:"after_path"`
 }
+
+const (
+	ConfigurationNamespaceCreateOperation = "configuration.namespace.create"
+	ConfigurationNamespaceUpdateOperation = "configuration.namespace.update"
+	ConfigurationNamespaceStateOperation  = "configuration.namespace.state"
+)
+
+type ConfigurationNamespaceWrite struct {
+	Domain           ConfigurationDomainGuard     `json:"domain"`
+	Mutation         ConfigurationMutation        `json:"mutation"`
+	ID               string                       `json:"id"`
+	ExpectedRevision string                       `json:"expected_revision"`
+	Parent           *ConfigurationNamespaceGuard `json:"parent,omitempty"`
+	Name             string                       `json:"name"`
+	Archived         bool                         `json:"archived"`
+}
+type ConfigurationNamespaceResult struct {
+	Namespace ConfigurationNamespace `json:"namespace"`
+	Replayed  bool                   `json:"replayed"`
+}

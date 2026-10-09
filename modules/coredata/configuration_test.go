@@ -556,3 +556,77 @@ func TestConfigurationCatalogUsesCurrentDomainAndBoundedOwnerViews(t *testing.T)
 		t.Fatalf("commits: %s %v", raw, err)
 	}
 }
+
+func TestConfigurationNamespaceOwnerCreateCASCycleReplayAndEmptyArchive(t *testing.T) {
+	db, ctx, g := configurationFixture(t)
+	root := model.ConfigurationNamespaceGuard{ExpectedRevision: "0"}
+	create := model.ConfigurationNamespaceWrite{Domain: g, Mutation: model.ConfigurationMutation{Key: "ns-first", IntentDigest: strings.Repeat("a", 64), Actor: "tester"}, ID: "first", ExpectedRevision: "0", Parent: &root, Name: "First"}
+	raw, err := run(t, db, ctx, model.ConfigurationNamespaceCreateOperation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first model.ConfigurationNamespaceResult
+	if err = json.Unmarshal(raw, &first); err != nil {
+		t.Fatal(err)
+	}
+	create.ID = "different-attempt-id"
+	raw, err = run(t, db, ctx, model.ConfigurationNamespaceCreateOperation, create)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replay model.ConfigurationNamespaceResult
+	json.Unmarshal(raw, &replay)
+	if !replay.Replayed || replay.Namespace.ID != first.Namespace.ID {
+		t.Fatalf("replay lost winner: %s", raw)
+	}
+	parent := model.ConfigurationNamespaceGuard{ID: first.Namespace.ID, ExpectedRevision: first.Namespace.Revision}
+	child := create
+	child.ID = "child"
+	child.Name = "Child"
+	child.Mutation.Key = "ns-child"
+	child.Parent = &parent
+	raw, err = run(t, db, ctx, model.ConfigurationNamespaceCreateOperation, child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second model.ConfigurationNamespaceResult
+	json.Unmarshal(raw, &second)
+	state := model.ConfigurationNamespaceWrite{Domain: g, Mutation: model.ConfigurationMutation{Key: "ns-archive-first", IntentDigest: strings.Repeat("b", 64), Actor: "tester"}, ID: "first", ExpectedRevision: "1", Archived: true}
+	_, err = run(t, db, ctx, model.ConfigurationNamespaceStateOperation, state)
+	configurationCode(t, err, "failed_precondition")
+	descendant := model.ConfigurationNamespaceGuard{ID: "child", ExpectedRevision: "1"}
+	move := model.ConfigurationNamespaceWrite{Domain: g, Mutation: model.ConfigurationMutation{Key: "ns-cycle", IntentDigest: strings.Repeat("c", 64), Actor: "tester"}, ID: "first", ExpectedRevision: "1", Parent: &descendant}
+	_, err = run(t, db, ctx, model.ConfigurationNamespaceUpdateOperation, move)
+	configurationCode(t, err, "failed_precondition")
+	state.ID = "child"
+	state.Mutation.Key = "ns-archive-child"
+	raw, err = run(t, db, ctx, model.ConfigurationNamespaceStateOperation, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var archived model.ConfigurationNamespaceResult
+	json.Unmarshal(raw, &archived)
+	if archived.Namespace.ArchivedAt == "" || archived.Namespace.Revision != "2" {
+		t.Fatalf("archive: %s", raw)
+	}
+	state.ExpectedRevision = "2"
+	state.Mutation.Key = "ns-already-archived"
+	raw, err = run(t, db, ctx, model.ConfigurationNamespaceStateOperation, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.Unmarshal(raw, &archived)
+	if archived.Namespace.Revision != "2" {
+		t.Fatalf("noop changed revision: %s", raw)
+	}
+	// Catalog reads include archived entries only when explicitly requested.
+	raw, err = run(t, db, ctx, model.ConfigurationNamespacesOperation, model.ConfigurationCatalogRead{Domain: g})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var namespaces []model.ConfigurationNamespace
+	json.Unmarshal(raw, &namespaces)
+	if len(namespaces) != 1 || namespaces[0].ID != "first" {
+		t.Fatalf("namespaces: %s", raw)
+	}
+}

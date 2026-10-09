@@ -329,7 +329,7 @@ func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model
 	}
 	var intent, op string
 	var body []byte
-	err = tx.QueryRowContext(ctx, "SELECT intent_digest,operation,body FROM core_configuration_receipts WHERE scope=? AND domain=? AND mutation_key=?", scope, q.Domain.Key, q.Key).Scan(&intent, &op, &body)
+	err = tx.QueryRowContext(ctx, `SELECT intent_digest,operation,body FROM core_configuration_receipts WHERE scope=? AND domain=? AND mutation_key=? UNION ALL SELECT intent_digest,operation,body FROM core_catalog_receipts WHERE scope=? AND domain=? AND mutation_key=?`, scope, q.Domain.Key, q.Key, scope, q.Domain.Key, q.Key).Scan(&intent, &op, &body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.ConfigurationMutationResult{Key: q.Key, Domain: q.Domain.Key, IntentDigest: q.IntentDigest}, nil
 	}

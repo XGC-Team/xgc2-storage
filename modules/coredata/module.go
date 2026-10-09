@@ -39,12 +39,12 @@ var SchemaSQL string
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go
+//go:embed module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
 	h := sha256.New()
-	for _, path := range []string{"module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go"} {
+	for _, path := range []string{"module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go"} {
 		b, _ := moduleSource.ReadFile(path)
 		h.Write([]byte(path + "\x00"))
 		h.Write(b)
@@ -65,6 +65,9 @@ func Spec() api.Module {
 		{ID: model.ResourceCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ResourceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationNamespaceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationNamespaceUpdateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ConfigurationNamespaceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationNamespacesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationResourcesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationBranchesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
@@ -221,6 +224,11 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			var r model.ConfigurationResourceRead
 			if err = decode(raw, &r); err == nil {
 				result, err = configurationRead(ctx, tx, scope, r)
+			}
+		case model.ConfigurationNamespaceCreateOperation, model.ConfigurationNamespaceUpdateOperation, model.ConfigurationNamespaceStateOperation:
+			var r model.ConfigurationNamespaceWrite
+			if err = decode(raw, &r); err == nil {
+				result, err = configurationNamespaceWrite(ctx, tx, scope, operation, r)
 			}
 		case model.ConfigurationNamespacesOperation, model.ConfigurationResourcesOperation, model.ConfigurationBranchesOperation, model.ConfigurationCommitsOperation, model.ConfigurationChangesOperation:
 			var r model.ConfigurationCatalogRead
