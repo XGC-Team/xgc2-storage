@@ -519,3 +519,40 @@ func TestConfigurationSnapshotBranchAggregateAndExactContentGuard(t *testing.T) 
 	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, CommitID: otherCommit.ID})
 	configurationCode(t, e, "data_loss")
 }
+
+func TestConfigurationCatalogUsesCurrentDomainAndBoundedOwnerViews(t *testing.T) {
+	db, ctx, guard := configurationFixture(t)
+	first := configurationWrite(t, db, ctx, model.ResourceCreateOperation, configurationCreateForTest(t, guard, "first", nil))
+	configurationWrite(t, db, ctx, model.ResourceCreateOperation, configurationCreateForTest(t, guard, "second", nil))
+	raw, err := run(t, db, ctx, model.ConfigurationResourcesOperation, model.ConfigurationCatalogRead{Domain: guard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resources []model.ConfigurationResource
+	if err = json.Unmarshal(raw, &resources); err != nil {
+		t.Fatal(err)
+	}
+	if len(resources) != 2 || resources[0].ID != first.Result.Head.Resource.ID {
+		t.Fatalf("catalog: %s", raw)
+	}
+	// A requested page is bounded without falsely failing when more rows exist.
+	raw, err = run(t, db, ctx, model.ConfigurationResourcesOperation, model.ConfigurationCatalogRead{Domain: guard, Limit: 1, Offset: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = json.Unmarshal(raw, &resources); err != nil || len(resources) != 1 || resources[0].ID != "second" {
+		t.Fatalf("page: %s %v", raw, err)
+	}
+	stale := guard
+	stale.RegistryDigest = strings.Repeat("b", 64)
+	_, err = run(t, db, ctx, model.ConfigurationResourcesOperation, model.ConfigurationCatalogRead{Domain: stale})
+	configurationCode(t, err, "conflict")
+	raw, err = run(t, db, ctx, model.ConfigurationCommitsOperation, model.ConfigurationCatalogRead{Domain: guard, ID: "first"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var commits []model.ConfigurationCommit
+	if err = json.Unmarshal(raw, &commits); err != nil || len(commits) != 1 || commits[0].ID != first.Result.Head.Commit.ID {
+		t.Fatalf("commits: %s %v", raw, err)
+	}
+}
