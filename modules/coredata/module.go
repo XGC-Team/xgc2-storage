@@ -39,12 +39,12 @@ var SchemaSQL string
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go
+//go:embed execution_reads.go configuration_execution.go model/configuration_execution.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
 	h := sha256.New()
-	for _, path := range []string{"module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go"} {
+	for _, path := range []string{"execution_reads.go", "configuration_execution.go", "model/configuration_execution.go", "module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go"} {
 		b, _ := moduleSource.ReadFile(path)
 		h.Write([]byte(path + "\x00"))
 		h.Write(b)
@@ -57,6 +57,8 @@ func Spec() api.Module {
 		{ID: model.NamespaceGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.NamespaceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ExecutionCommandListOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
+		{ID: model.ExecutionJobEventPageOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionCommandGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionEventCursorOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ExecutionEventReadOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
@@ -192,6 +194,17 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 			var r model.ExecutionCommit
 			if err = decode(raw, &r); err == nil {
 				result, err = commitExecution(ctx, tx, scope, r)
+			}
+
+		case model.ExecutionCommandListOperation:
+			var r model.CommandListRead
+			if err = decode(raw, &r); err == nil {
+				result, err = readExecutionCommands(ctx, tx, scope, r)
+			}
+		case model.ExecutionJobEventPageOperation:
+			var r model.JobEventPageRead
+			if err = decode(raw, &r); err == nil {
+				result, err = readExecutionEventPage(ctx, tx, scope, r)
 			}
 		case model.ExecutionCommandGetOperation:
 			var r model.CommandRead

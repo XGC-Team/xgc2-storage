@@ -105,6 +105,10 @@ func randomIdentity() (string, error) {
 }
 
 func acceptCommand(ctx context.Context, tx *sql.Tx, scope string, r model.CommandRequest) (model.CommandReceipt, bool, error) {
+	return acceptCommandAt(ctx, tx, scope, r, time.Now().UTC())
+}
+
+func acceptCommandAt(ctx context.Context, tx *sql.Tx, scope string, r model.CommandRequest, acceptedAt time.Time) (model.CommandReceipt, bool, error) {
 	prior, err := findCommand(ctx, tx, scope, r)
 	if err != nil {
 		return model.CommandReceipt{}, false, err
@@ -122,7 +126,7 @@ func acceptCommand(ctx context.Context, tx *sql.Tx, scope string, r model.Comman
 			return model.CommandReceipt{}, false, err
 		}
 	}
-	saved := model.CommandReceipt{CommandRequest: r, Status: "accepted", CreatedAt: time.Now().UTC()}
+	saved := model.CommandReceipt{CommandRequest: r, Status: "accepted", CreatedAt: acceptedAt.UTC()}
 	body, err := encode(saved)
 	if err != nil {
 		return model.CommandReceipt{}, false, err

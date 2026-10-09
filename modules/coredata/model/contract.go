@@ -15,6 +15,8 @@ const (
 	NamespaceSnapshotOperation          = "namespace.snapshot"
 	ExecutionCommitOperation            = "execution.commit"
 	ExecutionCommandGetOperation        = "execution.command.get"
+	ExecutionCommandListOperation       = "execution.commands.read"
+	ExecutionJobEventPageOperation      = "execution.job_events.page"
 	ExecutionEventCursorOperation       = "execution.events.cursor"
 	ExecutionEventReadOperation         = "execution.events.read"
 	SessionWorkflowLogSnapshotOperation = "session.workflow_logs.snapshot"

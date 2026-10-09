@@ -398,3 +398,35 @@ func TestEngineExecutionRejectsEmptyLimitsAndMismatchedCommand(t *testing.T) {
 		t.Fatal("invalid action leaked state")
 	}
 }
+
+func TestEngineExecutionReadGuardsRejectChangedDecisionWithoutGlobalCAS(t *testing.T) {
+	f := newExecutionFixture(t, "", 32)
+	committedExecution(t, f, "sources", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "runs", Key: "decision", ExpectedVersion: "0", Data: recordData("decision")},
+		{Collection: "runs", Key: "unrelated", ExpectedVersion: "0", Data: recordData("unrelated")},
+	}})
+	committedExecution(t, f, "unrelated-change", model.ExecutionCommit{State: []api.Mutation{{Collection: "runs", Key: "unrelated", ExpectedVersion: "1", Data: recordData("unrelated-next")}}})
+	// A point guard still succeeds after an unrelated record changed.
+	committedExecution(t, f, "guard-still-valid", model.ExecutionCommit{Guards: []model.RecordGuard{{Collection: "runs", Key: "decision", Version: "1"}}, State: []api.Mutation{{Collection: "tasks", Key: "independent", ExpectedVersion: "0", Data: recordData("independent")}}})
+	committedExecution(t, f, "decision-changed", model.ExecutionCommit{State: []api.Mutation{{Collection: "runs", Key: "decision", ExpectedVersion: "1", Data: recordData("decision-next")}}})
+	before := executionCursor(t, f)
+	_, err := f.named("stale-decision", model.ExecutionCommitOperation, model.ExecutionCommit{
+		Guards:  []model.RecordGuard{{Collection: "runs", Key: "decision", Version: "1"}},
+		Command: commandFor("stale"), Events: []model.ExecutionEventInput{eventFor("stale")},
+		State: []api.Mutation{{Collection: "tasks", Key: "stale", ExpectedVersion: "0", Data: recordData("stale")}},
+	})
+	if executionErrorCode(err) != "conflict" {
+		t.Fatalf("changed decision accepted: %v", err)
+	}
+	noExecutionReceipt(t, f, "stale-decision")
+	if readCommandFact(t, f, "stale").Found {
+		t.Fatal("guard rejection left command receipt")
+	}
+	if got := executionCursor(t, f); got != before {
+		t.Fatalf("guard rejection emitted event: %+v %+v", before, got)
+	}
+	snapshot, err := f.store.Snapshot(f.ctx, api.SnapshotRequest{Scope: f.scope, Queries: []api.Query{{Collection: "tasks", Keys: []string{"stale"}}}})
+	if err != nil || len(snapshot.Results) != 1 || len(snapshot.Results[0].Records) != 1 || !snapshot.Results[0].Records[0].Missing {
+		t.Fatalf("guard rejection wrote task: %+v %v", snapshot, err)
+	}
+}

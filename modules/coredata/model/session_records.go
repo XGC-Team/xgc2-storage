@@ -11,16 +11,19 @@ import (
 // These coordinates are shared by deployment, authoritative execution writers
 // and the bounded reader. They are new data classes, not retired SQL table names.
 const (
-	SessionsCollection       = "sessions"
-	SessionMembersCollection = "session_members"
-	RunsCollection           = "runs"
-	InvocationsCollection    = "invocations"
-	AttemptsCollection       = "attempts"
-	RunRelationsCollection   = "run_relations"
-	WorkflowJobsCollection   = "workflow_jobs"
-	SessionOwnershipIndex    = "by_session"
-	RunFactsIndex            = "by_run"
-	WorkflowOriginIndex      = "by_origin"
+	SessionsCollection           = "sessions"
+	SessionMembersCollection     = "session_members"
+	SessionBindingsCollection    = "session_bindings"
+	SessionStopIntentsCollection = "session_stop_intents"
+	ExecutionLeasesCollection    = "execution_leases"
+	RunsCollection               = "runs"
+	InvocationsCollection        = "invocations"
+	AttemptsCollection           = "attempts"
+	RunRelationsCollection       = "run_relations"
+	WorkflowJobsCollection       = "workflow_jobs"
+	SessionOwnershipIndex        = "by_session"
+	RunFactsIndex                = "by_run"
+	WorkflowOriginIndex          = "by_origin"
 )
 
 // RunRelationRecord stores one authoritative relation, including its private
@@ -60,12 +63,26 @@ func RelationRecordKey(kind, id string) string {
 // reachable through this package. A fresh slice is returned on each call.
 func SessionGraphCollections() []api.Collection {
 	var out []api.Collection
-	for _, id := range []string{SessionsCollection, SessionMembersCollection, RunsCollection, InvocationsCollection, AttemptsCollection, RunRelationsCollection, WorkflowJobsCollection, "definitions"} {
+	for _, id := range []string{SessionsCollection, SessionMembersCollection, SessionBindingsCollection, SessionStopIntentsCollection, ExecutionLeasesCollection, RunsCollection, InvocationsCollection, AttemptsCollection, RunRelationsCollection, WorkflowJobsCollection, "definitions"} {
 		c := api.Collection{ID: id, MaxRecordBytes: 3 << 20, MaxRecords: 100000, MaxBytes: 256 << 20,
 			Retention: "Core owns current/recovery facts; reviewed explicit retention cleanup only", Recovery: "storage-owned consistent new-data backup/restore"}
 		switch id {
+		case SessionsCollection:
+			c.Indexes = []api.Index{
+				{ID: "active_target", Fields: []string{"targetId", "activeSlot"}, Unique: true},
+				{ID: "active_experiment", Fields: []string{"targetId", "experimentResourceId", "activeSlot"}},
+				{ID: "by_target", Fields: []string{"targetId"}},
+				{ID: "by_experiment", Fields: []string{"experimentResourceId"}},
+				{ID: "by_target_experiment", Fields: []string{"targetId", "experimentResourceId"}},
+				{ID: "by_opening_run", Fields: []string{"targetId", "openingRunId"}},
+				{ID: "by_active", Fields: []string{"activeSlot"}},
+			}
 		case SessionMembersCollection:
-			c.Indexes = []api.Index{{ID: SessionOwnershipIndex, Fields: []string{"targetId", "sessionId"}}}
+			c.Indexes = []api.Index{
+				{ID: SessionOwnershipIndex, Fields: []string{"targetId", "sessionId"}},
+				{ID: "by_owner", Fields: []string{"targetId", "sessionId", "kind", "ownerId"}, Unique: true},
+				{ID: "by_workflow_owner", Fields: []string{"targetId", "kind", "ownerId"}},
+			}
 		case InvocationsCollection, AttemptsCollection, RunRelationsCollection:
 			c.Indexes = []api.Index{{ID: RunFactsIndex, Fields: []string{"runId"}}}
 		case WorkflowJobsCollection:

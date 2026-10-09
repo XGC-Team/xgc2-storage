@@ -12,10 +12,14 @@ const MaxExecutionStateMutations = api.MaxNamedStateMutations
 // Command payloads, terminal results and event payloads retain encoded JSON
 // bytes. The consumer decodes seq/offset decimal strings at its domain boundary.
 type ExecutionCommit struct {
-	State      []api.Mutation        `json:"state,omitempty"`
-	Events     []ExecutionEventInput `json:"events,omitempty"`
-	Command    *CommandRequest       `json:"command,omitempty"`
-	Completion *CommandCompletion    `json:"completion,omitempty"`
+	CommandAcceptedAt     time.Time                `json:"command_accepted_at,omitempty"`
+	ConfigurationPins     []ConfigurationReference `json:"configuration_pins,omitempty"`
+	ConfigurationMainPins []ConfigurationMainPin   `json:"configuration_main_pins,omitempty"`
+	State                 []api.Mutation           `json:"state,omitempty"`
+	Guards                []RecordGuard            `json:"guards,omitempty"`
+	Events                []ExecutionEventInput    `json:"events,omitempty"`
+	Command               *CommandRequest          `json:"command,omitempty"`
+	Completion            *CommandCompletion       `json:"completion,omitempty"`
 }
 
 type CommandRequest struct {
@@ -110,4 +114,23 @@ type EventPage struct {
 	Through    string           `json:"through"`
 	NextOffset string           `json:"next_offset"`
 	Events     []ExecutionEvent `json:"events"`
+}
+
+// CommandListRead is a finite recovery/read set, never an inventory predicate.
+type CommandListRead struct {
+	IDs            []string `json:"ids,omitempty"`
+	AcceptedAction string   `json:"accepted_action,omitempty"`
+}
+type CommandList struct {
+	Receipts []CommandReceipt `json:"receipts"`
+}
+type JobEventPageRead struct {
+	Page     int    `json:"page"`
+	PageSize int    `json:"page_size"`
+	Level    string `json:"level,omitempty"`
+	Query    string `json:"query,omitempty"`
+}
+type JobEventPage struct {
+	Events []ExecutionEvent `json:"events"`
+	Total  int64            `json:"total"`
 }
