@@ -58,6 +58,15 @@ build/xgc2-storage --db "$XGC_STORAGE_DATABASE_GRANT" \
   --target-id "$XGC_STORAGE_TARGET_ID" --ref-out "$XGC_STORAGE_REFERENCE_FILE"
 ```
 
+`--print-modules` emits the compiled module declarations without opening a database
+or listener. Deployment composition can combine these with the client product's
+compiled namespaces and domain declarations.
+
+`--identity-out` optionally writes the actual database identity to a private
+runtime file before references become ready. It uses the same atomic mode0600
+publication as `--ref-out`; consumers do not infer database identity from a data
+read.
+
 `--ref-out` contains a JSON array of fully bound ServiceRef values. A fresh process
 instance ID is generated for each start; database_id remains in snapshot tokens.
 Core and every Agent have separate locally recoverable storage instances. Client

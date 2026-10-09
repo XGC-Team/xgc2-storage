@@ -37,8 +37,8 @@ func main() {
 	}
 }
 func run() error {
-	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, configurationDomains string
-	var create bool
+	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, identityOut, configurationDomains string
+	var create, printModules bool
 	flag.StringVar(&path, "db", "", "explicit managed database file grant (existing by default)")
 	flag.StringVar(&manifest, "manifest", "", "reviewed deployment manifest")
 	flag.StringVar(&grantsFile, "grants", "", "private mode0600 owner grant JSON array")
@@ -46,11 +46,20 @@ func run() error {
 	flag.StringVar(&grpcSocket, "grpc-socket", "", "private XRPC gRPC Unix endpoint")
 	flag.StringVar(&target, "target-id", "", "local target identity")
 	flag.StringVar(&refOut, "ref-out", "", "private runtime file for bound ServiceRef array")
+	flag.StringVar(&identityOut, "identity-out", "", "private runtime file for this owner's actual database identity")
 	flag.StringVar(&configurationDomains, "configuration-domains", "", "explicit Core compiled domain declarations applied by this owner before serving")
 	flag.BoolVar(&create, "create", false, "explicitly initialize absent DB; never replace existing")
+	flag.BoolVar(&printModules, "print-modules", false, "print this storage binary's compiled module declarations without starting")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return errors.New("storage: unexpected positional arguments")
+	}
+	if printModules {
+		var specs []api.Module
+		for _, module := range registry.Compiled() {
+			specs = append(specs, module.Spec)
+		}
+		return json.NewEncoder(os.Stdout).Encode(specs)
 	}
 	if path == "" || manifest == "" || grantsFile == "" || target == "" || refOut == "" || (socket == "" && grpcSocket == "") {
 		return errors.New("storage: db/manifest/grants/target-id/ref-out and a socket required")
@@ -250,7 +259,16 @@ func run() error {
 		}
 		defer grpcHost.Stop()
 	}
-	if e = publishRefs(refOut, refs); e != nil {
+	if identityOut != "" {
+		stats, err := store.Stats()
+		if err != nil {
+			return err
+		}
+		if e = publishPrivateJSON(identityOut, map[string]string{"database_id": stats.DatabaseID}); e != nil {
+			return e
+		}
+	}
+	if e = publishPrivateJSON(refOut, refs); e != nil {
 		return e
 	}
 	var doneHTTP, doneGRPC <-chan struct{}
@@ -276,7 +294,7 @@ func run() error {
 	}
 	return err
 }
-func publishRefs(path string, refs []xrpc.ServiceRef) error {
+func publishPrivateJSON(path string, value any) error {
 	parent := filepath.Dir(path)
 	st, e := os.Lstat(parent)
 	if e != nil || !st.IsDir() || st.Mode().Perm() != 0700 {
@@ -294,7 +312,7 @@ func publishRefs(path string, refs []xrpc.ServiceRef) error {
 		f.Close()
 		return e
 	}
-	e = json.NewEncoder(f).Encode(refs)
+	e = json.NewEncoder(f).Encode(value)
 	if e == nil {
 		e = f.Sync()
 	}
