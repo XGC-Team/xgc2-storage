@@ -29,7 +29,10 @@ func RuntimeCollections() []api.Collection {
 			{ID: "by_owner", Fields: []string{"ownerKind", "ownerId"}, Unique: true},
 			{ID: "by_enabled", Fields: []string{"enabled"}},
 		},
-		RobotBindingsCollection: {{ID: "by_run", Fields: []string{"targetId", "runId"}}},
+		RobotBindingsCollection: {
+			{ID: "by_run", Fields: []string{"targetId", "runId"}},
+			{ID: "by_provider", Fields: []string{"targetId", "runId", "providerDefinitionId"}, Unique: true},
+		},
 		RobotConnectionsCollection: {
 			{ID: "by_run", Fields: []string{"targetId", "runId"}},
 			{ID: "by_state", Fields: []string{"state"}},
@@ -40,16 +43,22 @@ func RuntimeCollections() []api.Collection {
 			{ID: "by_run", Fields: []string{"targetId", "runId"}},
 			{ID: "by_binding_run", Fields: []string{"targetId", "bindingRunId"}},
 			{ID: "by_phase", Fields: []string{"phase"}},
+			{ID: "by_attempt", Fields: []string{"currentAttemptId"}, Unique: true},
 		},
 		RobotAttemptsCollection: {
 			{ID: "by_operation", Fields: []string{"operationId"}},
+			{ID: "by_number", Fields: []string{"operationId", "number"}, Unique: true},
+			{ID: "by_adapter", Fields: []string{"adapterIdempotencyKey"}, Unique: true},
 			{ID: "by_owner", Fields: []string{"operationId", "ownerAttempt"}, Unique: true},
 		},
 		RobotBatchesCollection: {
 			{ID: "by_state", Fields: []string{"state"}},
 			{ID: "by_owner", Fields: []string{"targetId", "initiatingRunId", "rootRunId", "controllerCheckpointDigest"}},
 		},
-		RobotBatchItemsCollection: {{ID: "by_batch", Fields: []string{"batchId"}}},
+		RobotBatchItemsCollection: {
+			{ID: "by_batch", Fields: []string{"batchId"}},
+			{ID: "by_attempt", Fields: []string{"attemptId"}, Unique: true},
+		},
 	}
 	var out []api.Collection
 	for _, id := range []string{ProcessInstancesCollection, SchedulesCollection, RobotBindingsCollection, RobotConnectionsCollection, RobotOperationsCollection, RobotAttemptsCollection, RobotBatchesCollection, RobotBatchItemsCollection} {
