@@ -304,15 +304,25 @@ func (s *Store) admitCall(ctx context.Context, write bool, maximum time.Duration
 	if write {
 		slot = s.writers
 	}
-	select {
-	case slot <- struct{}{}:
-	default:
-		s.overloads.Add(1)
-		cancel()
-		s.lifecycle.RUnlock()
-		return nil, nil, fail("unavailable", "storage execution capacity exhausted")
-	}
 	start := time.Now()
+	if write {
+		select {
+		case slot <- struct{}{}:
+		default:
+			s.overloads.Add(1)
+			cancel()
+			s.lifecycle.RUnlock()
+			return nil, nil, fail("unavailable", "storage execution capacity exhausted")
+		}
+	} else {
+		select {
+		case slot <- struct{}{}:
+		case <-ctx.Done():
+			cancel()
+			s.lifecycle.RUnlock()
+			return nil, nil, ctx.Err()
+		}
+	}
 	if write {
 		select {
 		case s.gate <- struct{}{}:
