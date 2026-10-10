@@ -34,6 +34,9 @@ func sessionBytes(v model.Session) int64 {
 	return int64(rowOverhead + len(v.ID) + len(v.TargetID) + len(v.ExperimentResourceID) + len(v.ExperimentCommitID) + len(v.RootRunID) + len(v.StopIntent))
 }
 
+// liveSessionOfTarget is fixed text so that the plan test can run it as written.
+const liveSessionOfTarget = "SELECT id FROM sessions WHERE scope=? AND target_id=? AND status IN ('open','stopping')"
+
 func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSession) (model.Session, bool, error) {
 	if !textKey(q.ID) || !textKey(q.TargetID) || !textKey(q.ExperimentResourceID) || !textKey(q.ExperimentCommitID) {
 		return model.Session{}, false, failure("invalid_argument", "session, target, experiment resource and commit identities are required")
@@ -53,7 +56,7 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 		return model.Session{}, false, err
 	}
 	var live string
-	switch err = tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE scope=? AND target_id=? AND status IN ('open','stopping')", scope, q.TargetID).Scan(&live); {
+	switch err = tx.QueryRowContext(ctx, liveSessionOfTarget, scope, q.TargetID).Scan(&live); {
 	case err == nil:
 		return model.Session{}, false, failure("conflict", "target already has a live session "+live)
 	case !errors.Is(err, sql.ErrNoRows):
@@ -110,10 +113,9 @@ func getSession(ctx context.Context, tx *sql.Tx, scope, id string) (model.Sessio
 	return v, err
 }
 
-func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.SessionFilter) (model.SessionPage, error) {
-	limit, err := pageLimit(f.Limit)
-	if err != nil {
-		return model.SessionPage{}, err
+func sessionQuery(scope string, f model.SessionFilter) (query string, args []any, limit int, err error) {
+	if limit, err = pageLimit(f.Limit); err != nil {
+		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
 	if f.TargetID != "" {
@@ -126,7 +128,7 @@ func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.Session
 		marks := make([]string, len(f.Statuses))
 		for i, s := range f.Statuses {
 			if s != model.SessionOpen && s != model.SessionStopping && s != model.SessionClosed && s != model.SessionInterrupted {
-				return model.SessionPage{}, failure("invalid_argument", "unknown session status")
+				return "", nil, 0, failure("invalid_argument", "unknown session status")
 			}
 			marks[i], args = "?", append(args, string(s))
 		}
@@ -135,11 +137,19 @@ func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.Session
 	if f.Cursor != "" {
 		at, id, err := decodeCursor(f.Cursor)
 		if err != nil {
-			return model.SessionPage{}, err
+			return "", nil, 0, err
 		}
 		where, args = append(where, "(opened_at,id)<(?,?)"), append(args, at, id)
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT "+sessionColumns+" FROM sessions WHERE "+strings.Join(where, " AND ")+" ORDER BY opened_at DESC,id DESC LIMIT ?", append(args, limit+1)...)
+	return "SELECT " + sessionColumns + " FROM sessions WHERE " + strings.Join(where, " AND ") + " ORDER BY opened_at DESC,id DESC LIMIT ?", append(args, limit+1), limit, nil
+}
+
+func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.SessionFilter) (model.SessionPage, error) {
+	query, args, limit, err := sessionQuery(scope, f)
+	if err != nil {
+		return model.SessionPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return model.SessionPage{}, err
 	}

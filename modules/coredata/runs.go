@@ -134,6 +134,10 @@ func selectRun(ctx context.Context, tx *sql.Tx, scope, where string, args ...any
 	return scanRun(tx.QueryRowContext(ctx, "SELECT "+runColumns+" FROM runs WHERE scope=? AND "+where, append([]any{scope}, args...)...))
 }
 
+// byKey selects the Run of an idempotency key. The second term states the
+// condition of the partial index, which the planner cannot infer from a parameter.
+const byKey = "idempotency_key=? AND idempotency_key<>''"
+
 // rowOverhead is the fixed cost charged to the live quota for every row.
 const rowOverhead = 256
 
@@ -187,7 +191,7 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 		return model.Run{}, false, err
 	}
 	if q.IdempotencyKey != "" {
-		existing, err := selectRun(ctx, tx, scope, "idempotency_key=?", q.IdempotencyKey)
+		existing, err := selectRun(ctx, tx, scope, byKey, q.IdempotencyKey)
 		if err == nil {
 			return existing, false, nil
 		}
@@ -309,17 +313,18 @@ func findRunByKey(ctx context.Context, tx *sql.Tx, scope, key string) (model.Run
 	if !textKey(key) {
 		return model.Run{}, false, failure("invalid_argument", "idempotency key required")
 	}
-	r, err := selectRun(ctx, tx, scope, "idempotency_key=?", key)
+	r, err := selectRun(ctx, tx, scope, byKey, key)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Run{}, false, nil
 	}
 	return r, err == nil, err
 }
 
-func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) (model.RunPage, error) {
-	limit, err := pageLimit(f.Limit)
-	if err != nil {
-		return model.RunPage{}, err
+// runQuery builds the statement of one page of Runs. Every term is a fixed
+// column comparison with a bound value; the filter never reaches the SQL text.
+func runQuery(scope string, f model.RunFilter) (query string, args []any, limit int, err error) {
+	if limit, err = pageLimit(f.Limit); err != nil {
+		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
 	for column, value := range map[string]string{"target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID} {
@@ -327,19 +332,29 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 			continue
 		}
 		if !textKey(value) {
-			return model.RunPage{}, failure("invalid_argument", "filter values must be bounded identifiers")
+			return "", nil, 0, failure("invalid_argument", "filter values must be bounded identifiers")
 		}
 		where, args = append(where, column+"=?"), append(args, value)
+		if column == "session_id" {
+			// The condition of the partial index on session_id.
+			where = append(where, "session_id<>''")
+		}
 	}
 	if len(f.Statuses) > 0 {
-		marks := make([]string, len(f.Statuses))
+		marks, open := make([]string, len(f.Statuses)), true
 		for i, s := range f.Statuses {
 			if !s.Open() && !s.Terminal() {
-				return model.RunPage{}, failure("invalid_argument", "unknown run status")
+				return "", nil, 0, failure("invalid_argument", "unknown run status")
 			}
+			open = open && s.Open()
 			marks[i], args = "?", append(args, string(s))
 		}
 		where = append(where, "status IN ("+strings.Join(marks, ",")+")")
+		if open {
+			// The condition of the partial index on open Runs, which makes
+			// "what is running" independent of the length of the history.
+			where = append(where, "status IN ('queued','running','stopping')")
+		}
 	}
 	if !f.Since.IsZero() {
 		where, args = append(where, "created_at>=?"), append(args, nanos(f.Since))
@@ -350,7 +365,7 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 	if f.Cursor != "" {
 		at, id, err := decodeCursor(f.Cursor)
 		if err != nil {
-			return model.RunPage{}, err
+			return "", nil, 0, err
 		}
 		where, args = append(where, "(created_at,id)<(?,?)"), append(args, at, id)
 	}
@@ -358,7 +373,15 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 	if f.OmitPayloads {
 		columns = runSummaryColumns
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT "+columns+" FROM runs WHERE "+strings.Join(where, " AND ")+" ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1)...)
+	return "SELECT " + columns + " FROM runs WHERE " + strings.Join(where, " AND ") + " ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1), limit, nil
+}
+
+func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) (model.RunPage, error) {
+	query, args, limit, err := runQuery(scope, f)
+	if err != nil {
+		return model.RunPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return model.RunPage{}, err
 	}
@@ -379,8 +402,18 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 	return page, rows.Err()
 }
 
+// The statements below are fixed text, so that the plan test can run them as written.
+const (
+	interruptOpen = "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')"
+
+	// A finished Run is only eligible for pruning when its root is finished too.
+	eligibleRuns = "scope=? AND finished_at>0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0)"
+	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
+	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"
+)
+
 func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Time) (int, error) {
-	result, err := tx.ExecContext(ctx, "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')", nanos(nowOr(at)), len("interrupted"), scope)
+	result, err := tx.ExecContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope)
 	if err != nil {
 		return 0, err
 	}
@@ -399,8 +432,6 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 	if limit < 0 || limit > 10000 || r.KeepNewest < 0 || (r.OlderThan.IsZero() && r.KeepNewest == 0) {
 		return 0, failure("invalid_argument", "an age or count limit and a limit within 1..10000 are required")
 	}
-	// A finished Run is only eligible when its root is finished too.
-	const eligible = "scope=? AND finished_at>0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0)"
 	type victim struct {
 		id    string
 		bytes int64
@@ -426,12 +457,12 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 		return rows.Err()
 	}
 	if !r.OlderThan.IsZero() {
-		if err := collect("SELECT id,bytes FROM runs r WHERE "+eligible+" AND finished_at<? ORDER BY finished_at,id LIMIT ?", scope, nanos(r.OlderThan), limit); err != nil {
+		if err := collect(pruneByAge, scope, nanos(r.OlderThan), limit); err != nil {
 			return 0, err
 		}
 	}
 	if r.KeepNewest > 0 {
-		if err := collect("SELECT id,bytes FROM runs r WHERE "+eligible+" ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?", scope, limit, r.KeepNewest); err != nil {
+		if err := collect(pruneByCount, scope, limit, r.KeepNewest); err != nil {
 			return 0, err
 		}
 	}

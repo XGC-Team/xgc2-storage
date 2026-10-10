@@ -52,6 +52,13 @@ Statuses: `queued`, `running`, `stopping`, `succeeded`, `failed`, `stopped`, `ca
 | `InterruptOpenRuns` | Durable | Core's boot step: every open Run becomes `interrupted`; no half-run graph resumes |
 | `PruneRuns` | Relaxed | deletes finished Runs by age and/or by count (newest kept), at most `Limit` per call; never a Run whose root is still open |
 
+Listings are answered from an index in page order, so a page costs the same however long the
+history is: creation order, target, root, session, workflow, a time window, and the open
+statuses (`queued`, `running`, `stopping`; "what is running" reads only the open Runs). A
+filter by a finished status alone walks Runs in creation order until the page is full, which
+`PruneRuns` retention bounds. `TestRecordQueriesUseTheirIndexes` runs the statements the code
+builds through `EXPLAIN QUERY PLAN`.
+
 ## Sessions
 
 One Session per target is live (`open` or `stopping`); the database enforces it.

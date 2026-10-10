@@ -73,10 +73,9 @@ func getRecording(ctx context.Context, tx *sql.Tx, scope, id string) (model.Reco
 	return v, err
 }
 
-func listRecordings(ctx context.Context, tx *sql.Tx, scope string, f model.RecordingFilter) (model.RecordingPage, error) {
-	limit, err := pageLimit(f.Limit)
-	if err != nil {
-		return model.RecordingPage{}, err
+func recordingQuery(scope string, f model.RecordingFilter) (query string, args []any, limit int, err error) {
+	if limit, err = pageLimit(f.Limit); err != nil {
+		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
 	for column, value := range map[string]string{"session_id": f.SessionID, "run_id": f.RunID, "kind": f.Kind} {
@@ -84,18 +83,30 @@ func listRecordings(ctx context.Context, tx *sql.Tx, scope string, f model.Recor
 			continue
 		}
 		if !textKey(value) {
-			return model.RecordingPage{}, failure("invalid_argument", "filter values must be bounded identifiers")
+			return "", nil, 0, failure("invalid_argument", "filter values must be bounded identifiers")
 		}
 		where, args = append(where, column+"=?"), append(args, value)
+		if column == "session_id" {
+			// The condition of the partial index on session_id.
+			where = append(where, "session_id<>''")
+		}
 	}
 	if f.Cursor != "" {
 		at, id, err := decodeCursor(f.Cursor)
 		if err != nil {
-			return model.RecordingPage{}, err
+			return "", nil, 0, err
 		}
 		where, args = append(where, "(created_at,id)>(?,?)"), append(args, at, id)
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT "+recordingColumns+" FROM recordings WHERE "+strings.Join(where, " AND ")+" ORDER BY created_at,id LIMIT ?", append(args, limit+1)...)
+	return "SELECT " + recordingColumns + " FROM recordings WHERE " + strings.Join(where, " AND ") + " ORDER BY created_at,id LIMIT ?", append(args, limit+1), limit, nil
+}
+
+func listRecordings(ctx context.Context, tx *sql.Tx, scope string, f model.RecordingFilter) (model.RecordingPage, error) {
+	query, args, limit, err := recordingQuery(scope, f)
+	if err != nil {
+		return model.RecordingPage{}, err
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return model.RecordingPage{}, err
 	}
