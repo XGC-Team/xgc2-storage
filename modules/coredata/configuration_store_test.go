@@ -446,3 +446,75 @@ func TestFailedOperationRollsBackEveryFact(t *testing.T) {
 		t.Fatal("late fault leaked allocation")
 	}
 }
+
+// Every exported configuration function reaches the right operation: the
+// behavior itself is covered where it is implemented, this walks the typed API.
+func TestEveryConfigurationFunctionIsWired(t *testing.T) {
+	f := openStore(t)
+	root := model.ConfigurationNamespaceGuard{ExpectedRevision: "0"}
+	meta := func(key, tag string) model.ConfigurationMutation {
+		return model.ConfigurationMutation{Key: key, IntentDigest: strings.Repeat(tag, 64), Actor: "tester"}
+	}
+	created := must(f.core.CreateNamespace(f.ctx, model.ConfigurationNamespaceWrite{Domain: f.domain, Mutation: meta("ns", "1"), ID: "source", ExpectedRevision: "0", Parent: &root, Name: "Source"}))
+	renamed := must(f.core.UpdateNamespace(f.ctx, model.ConfigurationNamespaceWrite{Domain: f.domain, Mutation: meta("ns-rename", "2"), ID: "source", ExpectedRevision: created.Namespace.Revision, Name: "Origin"}))
+	if renamed.Namespace.Name != "Origin" || renamed.Namespace.Revision != "2" {
+		t.Fatalf("update: %+v", renamed)
+	}
+	spare := must(f.core.CreateNamespace(f.ctx, model.ConfigurationNamespaceWrite{Domain: f.domain, Mutation: meta("spare", "3"), ID: "spare", ExpectedRevision: "0", Parent: &root, Name: "Spare"}))
+	archived := must(f.core.SetNamespaceState(f.ctx, model.ConfigurationNamespaceWrite{Domain: f.domain, Mutation: meta("spare-archive", "4"), ID: "spare", ExpectedRevision: spare.Namespace.Revision, Archived: true}))
+	if archived.Namespace.ArchivedAt == "" {
+		t.Fatalf("state: %+v", archived)
+	}
+
+	source := f.create(t, "r")
+	source.Namespace = model.ConfigurationNamespaceGuard{ID: "source", ExpectedRevision: "2"}
+	head := must(f.core.CreateResource(f.ctx, source)).Result.Head
+	protect := must(f.core.UpdateResourceMetadata(f.ctx, model.ConfigurationResourceMetadata{Domain: f.domain, Mutation: meta("protect", "5"), ResourceID: "r", ExpectedRevision: head.Resource.Revision,
+		Main: model.ConfigurationBranchGuard{ID: head.Branch.ID, ExpectedRevision: head.Branch.Revision, CommitID: head.Commit.ID, ContentDigest: head.Commit.ContentDigest}, Protect: true}))
+	if !protect.Result.Head.Resource.System {
+		t.Fatalf("metadata: %+v", protect.Result.Head.Resource)
+	}
+	head = protect.Result.Head
+
+	copyOf := f.create(t, "copy-r")
+	copyOf.Name, copyOf.NameKey = head.Resource.Name, head.Resource.NameKey
+	copyOf.Namespace = model.ConfigurationNamespaceGuard{ID: "copy-ns", ExpectedRevision: "1"}
+	copyOf.Source = &model.ConfigurationSourcePin{ResourceID: head.Resource.ID, ExpectedResourceRevision: head.Resource.Revision, CommitID: head.Commit.ID, ContentDigest: head.Commit.ContentDigest,
+		Main: model.ConfigurationBranchGuard{ID: head.Branch.ID, ExpectedRevision: head.Branch.Revision, CommitID: head.Commit.ID, ContentDigest: head.Commit.ContentDigest}}
+	clone := model.ConfigurationNamespaceClone{Domain: f.domain, Mutation: meta("clone", "6"), SourceID: "source", ExpectedRevision: renamed.Namespace.Revision, TargetParent: root, Name: "Copy",
+		Namespaces: []model.ConfigurationNamespaceMapping{{SourceID: "source", ExpectedRevision: renamed.Namespace.Revision, TargetID: "copy-ns"}}, Resources: []model.ConfigurationResourceCreate{copyOf}}
+	cloned := must(f.core.CloneNamespace(f.ctx, clone))
+	if cloned.Namespace.ID != "copy-ns" {
+		t.Fatalf("clone: %+v", cloned)
+	}
+	replay := must(f.core.CloneReceipt(f.ctx, model.ConfigurationNamespaceCloneReceipt{Domain: f.domain, Mutation: clone.Mutation}))
+	if !replay.Replayed || replay.Namespace.ID != "copy-ns" {
+		t.Fatalf("clone receipt: %+v", replay)
+	}
+
+	tree := must(f.core.NamespaceTree(f.ctx, model.NamespaceRead{Domain: f.domain.Key, ID: "copy-ns"}))
+	if len(tree.Namespaces) != 1 || len(tree.Resources) != 1 || tree.Resources[0].ID != "copy-r" {
+		t.Fatalf("tree: %+v", tree)
+	}
+	namespaces := must(f.core.Namespaces(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain}))
+	resources := must(f.core.Resources(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain}))
+	branches := must(f.core.Branches(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ID: "copy-r"}))
+	commits := must(f.core.Commits(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ID: "copy-r"}))
+	changes := must(f.core.Changes(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ID: "copy-r"}))
+	if len(namespaces) != 2 || len(resources) != 2 || len(branches) != 1 || len(commits) != 1 || len(changes) != 1 {
+		t.Fatalf("catalog: %d namespaces, %d resources, %d branches, %d commits, %d changes", len(namespaces), len(resources), len(branches), len(commits), len(changes))
+	}
+	if commits[0].SourceCommitID != head.Commit.ID || resources[0].Name == "" {
+		t.Fatalf("catalog content: %+v %+v", commits[0], resources[0])
+	}
+	// A resource that tracks another shows up as its incoming reference.
+	target := f.create(t, "target")
+	must(f.core.CreateResource(f.ctx, target))
+	linked := f.create(t, "linked")
+	linked.Snapshot.References = []model.ConfigurationReference{{Slot: "target", Mode: "tracking", TargetDomain: f.domain.Key, TargetResourceID: "target", TargetBranch: "main", TargetComponentID: "x"}}
+	must(f.core.CreateResource(f.ctx, linked))
+	incoming := must(f.core.IncomingReferences(f.ctx, model.ConfigurationIncomingRead{Domain: f.domain, ResourceID: "target"}))
+	if len(incoming) != 1 || incoming[0].SourceResourceID != "linked" {
+		t.Fatalf("incoming: %+v", incoming)
+	}
+}
