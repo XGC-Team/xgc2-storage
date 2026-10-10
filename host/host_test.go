@@ -3,15 +3,18 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/client"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"github.com/XGC-Team/xgc2-storage/server"
 	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 	"github.com/XGC-Team/xgc2-xrpc/go/httpx"
@@ -196,4 +199,85 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 		Queries: []api.Query{{Collection: "documents", Keys: []string{"layout"}}}}); err == nil {
 		t.Fatal("old XRPC instance remained usable after owner restart")
 	}
+}
+
+func TestCoreDataThroughTheHostAndItsStats(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	dir, err := os.MkdirTemp("", "storage-host-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	scope := api.Scope{Namespace: "core", User: "operator", Workspace: "station"}
+	manifest := api.Manifest{Format: "storage-v1", Namespaces: []api.Namespace{{ID: "core", Owner: "tests", Schema: "core.test", MaxScopes: 2, MaxReceipts: 16, ReceiptTTLSeconds: 3600,
+		Modules:     []string{model.Module},
+		Collections: []api.Collection{{ID: "settings", MaxRecordBytes: 4096, MaxRecords: 10, MaxBytes: 1 << 20, Retention: "tests", Recovery: "backup"}}}}}
+	domains := []model.ConfigurationDomainDeclaration{{Key: "automation", SchemaIdentity: "catalog", SchemaVersion: 1, RegistryDigest: strings.Repeat("a", 64), MainVisibility: true}}
+	config := Config{Path: filepath.Join(dir, "core.db"), Create: true, Manifest: manifest, ConfigurationDomains: domains,
+		Readers: 2, WriterQueue: 8, CallBudget: 5 * time.Second, MaxDBBytes: 64 << 20}
+	owner, err := Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close(ctx)
+	core, err := owner.Core(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := owner.Stats()
+	if err != nil || before.ReaderCapacity != 2 || before.WriterCapacity != 8 {
+		t.Fatalf("host configuration did not reach the engine: %+v %v", before, err)
+	}
+	run, created, err := core.CreateRun(ctx, model.NewRun{ID: "run", TargetID: "local", WorkflowResourceID: "wf", WorkflowCommitID: "v1", DefinitionDigest: "d", ActionID: "run", Inputs: json.RawMessage(`{}`), Trigger: json.RawMessage(`{}`)})
+	if err != nil || !created || run.Status != model.RunQueued {
+		t.Fatalf("typed call through the host: %+v %v", run, err)
+	}
+	if err = core.UpdateRunStatus(ctx, model.RunStatusUpdate{ID: "run", Status: model.RunRunning}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := owner.Stats()
+	if after.CommitsDurable-before.CommitsDurable != 1 || after.CommitsRelaxed-before.CommitsRelaxed != 1 {
+		t.Fatalf("commit classes: %+v -> %+v", before, after)
+	}
+	// The declared domain is part of the catalog; an unknown one is refused.
+	guard := model.ConfigurationDomainGuard{Key: "automation", SchemaIdentity: "catalog", SchemaVersion: 1, RegistryDigest: strings.Repeat("a", 64)}
+	if _, err = core.ReadResource(ctx, model.ConfigurationResourceRead{Domain: guard, ResourceID: "none", Branch: "main"}); errorCode(err) != "not_found" {
+		t.Fatalf("declared domain: %v", err)
+	}
+	guard.Key = "undeclared"
+	if _, err = core.ReadResource(ctx, model.ConfigurationResourceRead{Domain: guard, ResourceID: "none", Branch: "main"}); err == nil {
+		t.Fatal("an undeclared domain was served")
+	}
+	// A namespace that does not name the module has no typed Core API.
+	if _, err = owner.Core(api.Scope{Namespace: "docs", User: "u", Workspace: "w"}); err == nil {
+		t.Fatal("Core data bound to a foreign scope")
+	}
+	if err = owner.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = owner.Core(scope); err == nil {
+		t.Fatal("a closed owner handed out a typed handle")
+	}
+	config.Create = false
+	restarted, err := Open(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close(ctx)
+	again, err := restarted.Core(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := again.GetRun(ctx, "run"); err != nil || got.Status != model.RunRunning {
+		t.Fatalf("run after restart: %+v %v", got, err)
+	}
+}
+
+func errorCode(err error) string {
+	var domain *api.Error
+	if errors.As(err, &domain) {
+		return domain.Code
+	}
+	return ""
 }
