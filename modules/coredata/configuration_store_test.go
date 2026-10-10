@@ -174,6 +174,15 @@ func must[T any](v T, e error) T {
 	return v
 }
 
+// must3 does the same for calls that also report whether they created the result.
+func must3[T any](v T, _ bool, e error) T { return must(v, e) }
+
+func check(e error) {
+	if e != nil {
+		panic(e)
+	}
+}
+
 func TestCanonicalBranchSelector(t *testing.T) {
 	f := openStore(t)
 	create := f.create(t, "resource")

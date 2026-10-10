@@ -43,6 +43,19 @@ func (s *Store) usedModules() map[string]bool {
 	return used
 }
 
+// namespacesOf lists the manifest namespaces that name a module.
+func (s *Store) namespacesOf(module string) []string {
+	var out []string
+	for _, n := range s.config.Manifest.Namespaces {
+		for _, id := range n.Modules {
+			if id == module {
+				out = append(out, n.ID)
+			}
+		}
+	}
+	return out
+}
+
 func setVersion(ctx context.Context, tx *sql.Tx, module string, version int) error {
 	_, err := tx.ExecContext(ctx, "INSERT INTO schema_versions VALUES(?,?) ON CONFLICT(module) DO UPDATE SET version=excluded.version", module, version)
 	return err
@@ -93,7 +106,7 @@ type migrationStep struct {
 	module string
 	from   int
 	to     int
-	apply  func(context.Context, *sql.Tx) error
+	apply  func(context.Context, *sql.Tx, []string) error
 }
 
 func hasTable(ctx context.Context, q Queryer, name string) (bool, error) {
@@ -185,7 +198,8 @@ func (s *Store) upgrade(ctx context.Context) error {
 		case stored > m.Version:
 			return fail("failed_precondition", fmt.Sprintf("database schema of module %s is version %d, newer than this release supports (%d); upgrade the software", id, stored, m.Version))
 		case stored == 0:
-			plan = append(plan, migrationStep{module: id, from: 0, to: m.Version, apply: m.Install})
+			install := m.Install
+			plan = append(plan, migrationStep{module: id, from: 0, to: m.Version, apply: func(ctx context.Context, tx *sql.Tx, _ []string) error { return install(ctx, tx) }})
 		case stored < m.Version:
 			path, err := m.path(stored)
 			if err != nil {
@@ -209,7 +223,7 @@ func (s *Store) upgrade(ctx context.Context) error {
 		}
 		defer tx.Rollback()
 		for _, step := range plan {
-			if err = step.apply(ctx, tx); err != nil {
+			if err = step.apply(ctx, tx, s.namespacesOf(step.module)); err != nil {
 				return fmt.Errorf("migrating %s from version %d: %w", step.module, step.from, err)
 			}
 			if err = setVersion(ctx, tx, step.module, step.to); err != nil {
@@ -245,12 +259,12 @@ func (s *Store) backupBeforeMigration(ctx context.Context, plan []migrationStep)
 }
 
 // engineMigrations[v] upgrades the engine's own tables from version v to v+1.
-var engineMigrations = map[int]func(context.Context, *sql.Tx) error{1: migrateEngine1}
+var engineMigrations = map[int]func(context.Context, *sql.Tx, []string) error{1: migrateEngine1}
 
 // migrateEngine1 upgrades the engine tables from version 1 to 2: the manifest hash
 // and Named results disappear, receipts get incremental counters and usage
 // counts live records and bytes instead of every key ever written.
-func migrateEngine1(ctx context.Context, tx *sql.Tx) error {
+func migrateEngine1(ctx context.Context, tx *sql.Tx, _ []string) error {
 	for _, statement := range []string{
 		"ALTER TABLE storage_meta DROP COLUMN format",
 		"ALTER TABLE storage_meta DROP COLUMN manifest_hash",

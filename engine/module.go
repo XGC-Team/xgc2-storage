@@ -28,10 +28,12 @@ type Module struct {
 }
 
 // Migration moves a module from version From to From+1 inside the migration
-// transaction. It must only use the transaction it is given.
+// transaction. It must only use the transaction it is given. Apply learns which
+// manifest namespaces name the module, so a migration that retires document
+// collections touches those namespaces only.
 type Migration struct {
 	From  int
-	Apply func(ctx context.Context, tx *sql.Tx) error
+	Apply func(ctx context.Context, tx *sql.Tx, namespaces []string) error
 }
 
 // Queryer is the read access a legacy probe needs.

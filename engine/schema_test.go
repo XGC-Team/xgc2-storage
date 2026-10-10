@@ -120,7 +120,7 @@ func TestOlderSchemaMigratesInOneTransactionAfterABackup(t *testing.T) {
 	s.Close()
 
 	steps := 0
-	migrate := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx) error {
+	migrate := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx, _ []string) error {
 		steps++
 		if _, err := tx.ExecContext(ctx, "ALTER TABLE toy_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
@@ -169,7 +169,7 @@ func TestFailedMigrationLeavesTheDatabaseUntouched(t *testing.T) {
 	}
 	exec(t, s, "INSERT INTO toy_items(name) VALUES('one')")
 	s.Close()
-	broken := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx) error {
+	broken := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx, _ []string) error {
 		if _, err := tx.ExecContext(ctx, "DROP TABLE toy_items"); err != nil {
 			return err
 		}
@@ -200,7 +200,7 @@ func TestNoMigrateRefusesAnOlderSchema(t *testing.T) {
 	}
 	s.Close()
 	config.Create, config.NoMigrate = false, true
-	config.Modules = []Module{toy(2, Migration{From: 1, Apply: func(context.Context, *sql.Tx) error { return nil }})}
+	config.Modules = []Module{toy(2, Migration{From: 1, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})}
 	if _, err = Open(ctx, config); code(err) != "failed_precondition" || !strings.Contains(err.Error(), "older") {
 		t.Fatalf("read-only administration migrated or failed unclearly: %v", err)
 	}
@@ -241,11 +241,11 @@ func TestAModuleAddedToAnExistingDatabaseIsInstalled(t *testing.T) {
 }
 
 func TestModuleMigrationsMustNotHaveGaps(t *testing.T) {
-	skip := toy(3, Migration{From: 2, Apply: func(context.Context, *sql.Tx) error { return nil }})
+	skip := toy(3, Migration{From: 2, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})
 	if err := skip.validate(); err != nil {
 		t.Fatalf("a module may drop support for older versions: %v", err)
 	}
-	gap := toy(4, Migration{From: 1, Apply: func(context.Context, *sql.Tx) error { return nil }}, Migration{From: 3, Apply: func(context.Context, *sql.Tx) error { return nil }})
+	gap := toy(4, Migration{From: 1, Apply: func(context.Context, *sql.Tx, []string) error { return nil }}, Migration{From: 3, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})
 	if err := gap.validate(); err == nil {
 		t.Fatal("gap in the migration path accepted")
 	}

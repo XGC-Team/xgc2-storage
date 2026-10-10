@@ -36,18 +36,24 @@ const MaxScopeBytes = 512 << 20
 //go:embed schema.sql
 var SchemaSQL string
 
+// RecordsSQL creates the Run, Session and recording tables.
+//
+//go:embed records.sql
+var RecordsSQL string
+
 // SchemaVersion is the current schema version of the Core data module. Version
 // 1 is the module that also held the workflow engine's tables.
 const SchemaVersion = 2
 
 // Module registers the Core data module with the storage engine.
 func Module() engine.Module {
-	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize}
+	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize, Legacy: legacy,
+		Migrations: []engine.Migration{{From: 1, Apply: migrate1}}}
 }
 
 // Initialize creates the current schema in a database that has none.
 func Initialize(ctx context.Context, tx *sql.Tx) error {
-	_, err := tx.ExecContext(ctx, SchemaSQL)
+	_, err := tx.ExecContext(ctx, SchemaSQL+RecordsSQL)
 	return err
 }
 
@@ -85,6 +91,23 @@ func digest(v any) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
+
+// release returns rows and bytes that were deleted to the scope's live total.
+func release(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
+	_, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=max(rows-?,0),bytes=max(bytes-?,0) WHERE scope=?", rows, bytes, scope)
+	return err
+}
+
+// charge accounts rows and bytes without a limit check, for a change that
+// finishes work already admitted (a Run's outcome must be recorded).
+func charge(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=max(rows+?,0),bytes=max(bytes+?,0) WHERE scope=?", rows, bytes, scope)
+	return err
+}
+
 func reserve(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
 	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
 		return err
