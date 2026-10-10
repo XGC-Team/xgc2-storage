@@ -11,154 +11,181 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 )
 
+// errReplayed rolls back a transaction that found its own receipt already stored.
+var errReplayed = &api.Error{Code: "replayed", Message: "request already committed"}
+
+// Batch applies one atomic compare-and-set group of document mutations. A
+// request with a RequestID is idempotent: its receipt is stored and a replay
+// of the same intent returns it. A request without one leaves no receipt.
 func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt, err error) {
-	if snapshotContext(ctx) != nil {
+	defer func() { err = classify(err) }()
+	if viewOf(ctx) != nil {
 		return out, fail("failed_precondition", "mutation cannot use a read snapshot")
 	}
 	r.Mutations = append([]api.Mutation(nil), r.Mutations...)
-	defer func() { err = classify(err) }()
 	n, err := s.scope(r.Scope)
 	if err != nil {
 		return out, err
 	}
-	if !identifier(r.RequestID) || len(r.Mutations) == 0 || len(r.Mutations) > api.MaxOperations {
-		return out, fail("invalid_argument", "request identity and 1..256 mutations required")
+	if len(r.Mutations) == 0 || len(r.Mutations) > api.MaxOperations || (r.RequestID != "" && !identifier(r.RequestID)) {
+		return out, fail("invalid_argument", "1..256 mutations and a canonical request identity (or none) required")
 	}
-	ctx, release, err := s.beginCall(ctx, true)
-	if err != nil {
-		return out, err
-	}
-	defer release()
+	ctx, cancel := context.WithTimeout(ctx, s.config.CallBudget)
+	defer cancel()
 	prepared, err := prepareMutations(ctx, n, r.Mutations, api.MaxOperations, api.MaxRequestBytes)
 	if err != nil {
 		return out, err
 	}
 	r.Mutations = prepared.mutations
-	raw, e := json.Marshal(r)
-	if e != nil {
-		return out, e
-	}
-	if len(raw) > api.MaxRequestBytes {
-		return out, fail("resource_exhausted", "batch byte limit exceeded")
-	}
-	digest := hash(r)
-	// Replays read durable facts before applying new-write disk admission.
-	var cachedDigest string
-	var cachedBody []byte
-	cacheError := s.reader.QueryRowContext(ctx, "SELECT digest,body FROM receipts WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&cachedDigest, &cachedBody)
-	if cacheError == nil {
-		if cachedDigest != digest {
-			return out, fail("conflict", "request identity reused with different plan")
+	id := ScopeID(r.Scope)
+	var digest string
+	if r.RequestID != "" {
+		raw, e := json.Marshal(r)
+		if e != nil {
+			return out, e
 		}
-		err = json.Unmarshal(cachedBody, &out)
-		return out, err
+		if len(raw) > api.MaxRequestBytes {
+			return out, fail("resource_exhausted", "batch byte limit exceeded")
+		}
+		digest = hash(r)
+		// Replays read durable facts before applying new-write disk admission.
+		replay, found, e := s.storedReceipt(ctx, id, r.RequestID, digest)
+		if e != nil {
+			return out, e
+		}
+		if found {
+			return replay, nil
+		}
 	}
-	if !errors.Is(cacheError, sql.ErrNoRows) {
-		return out, cacheError
+	class := Durable
+	if r.Relaxed {
+		class = Relaxed
 	}
-	if err = s.diskCheck(); err != nil {
-		return out, err
-	}
-	tx, err := s.writer.BeginTx(ctx, nil)
-	if err != nil {
-		return out, err
-	}
-	defer tx.Rollback()
-	// Acquire the WAL writer before any read; no snapshot-upgrade busy loop.
-	if _, err = tx.ExecContext(ctx, "UPDATE storage_meta SET id=id WHERE id=1"); err != nil {
-		return out, err
-	}
-	id := scopeID(r.Scope)
-	var previousDigest string
-	var receiptRaw []byte
 	var expires int64
-	err = tx.QueryRowContext(ctx, "SELECT digest,body,expires FROM receipts WHERE scope=? AND request_id=?", id, r.RequestID).Scan(&previousDigest, &receiptRaw, &expires)
-	if err == nil {
-		if previousDigest != digest {
-			return out, fail("conflict", "request identity reused with different plan")
+	err = s.Write(ctx, class, func(ctx context.Context, tx *sql.Tx) error {
+		var rev, receipts int64
+		err := tx.QueryRowContext(ctx, "SELECT revision,receipts FROM scopes WHERE scope=?", id).Scan(&rev, &receipts)
+		if errors.Is(err, sql.ErrNoRows) {
+			var scopes int
+			if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM scopes WHERE namespace=?", n.ID).Scan(&scopes); err != nil {
+				return err
+			}
+			if scopes >= n.MaxScopes {
+				return fail("resource_exhausted", "namespace scope quota reached")
+			}
+			if _, err = tx.ExecContext(ctx, "INSERT INTO scopes VALUES(?,?,0,0)", id, n.ID); err != nil {
+				return err
+			}
+			rev, receipts, err = 0, 0, nil
 		}
-		if err = json.Unmarshal(receiptRaw, &out); err != nil {
-			return out, err
+		if err != nil {
+			return err
 		}
+		if r.RequestID != "" {
+			var previous string
+			var body []byte
+			err = tx.QueryRowContext(ctx, "SELECT digest,body FROM receipts WHERE scope=? AND request_id=?", id, r.RequestID).Scan(&previous, &body)
+			if err == nil {
+				if previous != digest {
+					return fail("conflict", "request identity reused with different plan")
+				}
+				if err = json.Unmarshal(body, &out); err != nil {
+					return err
+				}
+				return errReplayed
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if receipts >= int64(n.MaxReceipts) {
+				return fail("resource_exhausted", "receipt quota reached; wait for retained receipts to expire")
+			}
+		}
+		if err = s.checkToken(n, r.Expected, rev); err != nil {
+			return err
+		}
+		if rev == math.MaxInt64 {
+			return fail("resource_exhausted", "revision space exhausted")
+		}
+		next := rev + 1
+		out = api.Receipt{RequestID: r.RequestID, Digest: digest, Token: s.token(n, next), Durability: class.String(), Versions: []api.Record{}}
+		out.Versions, err = s.applyMutations(ctx, tx, id, next, prepared)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		out.CommittedAt = now.Format(time.RFC3339Nano)
+		added := int64(0)
+		if r.RequestID != "" {
+			expires = now.Unix() + int64(n.ReceiptTTLSeconds)
+			out.ExpiresAt = now.Add(time.Duration(n.ReceiptTTLSeconds) * time.Second).Format(time.RFC3339Nano)
+			body, err := json.Marshal(out)
+			if err != nil {
+				return err
+			}
+			if _, err = tx.ExecContext(ctx, "INSERT INTO receipts VALUES(?,?,?,?,?)", id, r.RequestID, digest, expires, body); err != nil {
+				return err
+			}
+			added = 1
+		}
+		_, err = tx.ExecContext(ctx, "UPDATE scopes SET revision=?,receipts=receipts+? WHERE scope=?", next, added, id)
+		return err
+	})
+	if errors.Is(err, errReplayed) {
 		return out, nil
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return out, err
-	}
-	var rev int64
-	err = tx.QueryRowContext(ctx, "SELECT revision FROM scopes WHERE scope=?", id).Scan(&rev)
-	if errors.Is(err, sql.ErrNoRows) {
-		rev = 0
-		var scopes int
-		if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM scopes WHERE namespace=?", n.ID).Scan(&scopes); err != nil {
-			return out, err
-		}
-		if scopes >= n.MaxScopes {
-			return out, fail("resource_exhausted", "namespace scope quota reached")
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO scopes VALUES(?,?,0)", id, n.ID); err != nil {
-			return out, err
-		}
-	} else if err != nil {
-		return out, err
-	}
-	if err = s.checkToken(n, r.Expected, rev); err != nil {
-		return out, err
-	}
-	if rev == math.MaxInt64 {
-		return out, fail("resource_exhausted", "revision space exhausted")
-	}
-	next := rev + 1
-	var receiptCount int
-	if err = tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM receipts WHERE scope=?", id).Scan(&receiptCount); err != nil {
-		return out, err
-	}
-	if receiptCount >= n.MaxReceipts {
-		return out, fail("resource_exhausted", "receipt quota reached; owner maintenance required")
-	}
-	out = api.Receipt{RequestID: r.RequestID, Digest: digest, Token: s.token(n, next), Durability: "sqlite-full", Versions: []api.Record{}}
-	out.Versions, err = s.applyMutations(ctx, tx, id, next, prepared)
 	if err != nil {
-		return out, err
-	}
-	now := time.Now().UTC()
-	out.CommittedAt = now.Format(time.RFC3339Nano)
-	out.ExpiresAt = now.Add(time.Duration(n.ReceiptTTLSeconds) * time.Second).Format(time.RFC3339Nano)
-	receiptRaw, err = json.Marshal(out)
-	if err != nil {
-		return out, err
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE scopes SET revision=? WHERE scope=?", next, id); err != nil {
-		return out, err
-	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO receipts VALUES(?,?,?,?,?)", id, r.RequestID, digest, now.Unix()+int64(n.ReceiptTTLSeconds), receiptRaw); err != nil {
-		return out, err
-	}
-	if err = tx.Commit(); err != nil {
 		return api.Receipt{}, err
+	}
+	if expires != 0 && s.maintenance != nil {
+		s.maintenance.armExpiry(expires)
 	}
 	return out, nil
 }
+
+// storedReceipt returns an earlier outcome of the same request intent.
+func (s *Store) storedReceipt(ctx context.Context, scope, requestID, digest string) (out api.Receipt, found bool, err error) {
+	var previous string
+	var body []byte
+	err = s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, "SELECT digest,body FROM receipts WHERE scope=? AND request_id=?", scope, requestID).Scan(&previous, &body)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		found = err == nil
+		return err
+	})
+	if err != nil || !found {
+		return out, false, err
+	}
+	if previous != digest {
+		return out, false, fail("conflict", "request identity reused with different plan")
+	}
+	return out, true, json.Unmarshal(body, &out)
+}
+
 func (s *Store) Receipt(ctx context.Context, r api.ReceiptRequest) (out api.Receipt, err error) {
-	defer func() { err = classify(err) }()
 	if _, err = s.scope(r.Scope); err != nil {
-		return out, err
+		return out, classify(err)
 	}
 	if !identifier(r.RequestID) {
 		return out, fail("invalid_argument", "invalid receipt identity")
 	}
-	ctx, reader, release, err := s.readRows(ctx, r.Scope)
-	if err != nil {
-		return out, err
-	}
-	defer release()
 	var raw []byte
-	err = reader.QueryRowContext(ctx, "SELECT body FROM receipts WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return out, fail("not_found", "receipt not retained; previous outcome may still be unknown")
-	}
+	found := false
+	err = s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, "SELECT body FROM receipts WHERE scope=? AND request_id=?", ScopeID(r.Scope), r.RequestID).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		found = err == nil
+		return err
+	})
 	if err != nil {
 		return out, err
+	}
+	if !found {
+		return out, fail("not_found", "receipt not retained; previous outcome may still be unknown")
 	}
 	err = json.Unmarshal(raw, &out)
 	return out, err

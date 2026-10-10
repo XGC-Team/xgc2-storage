@@ -13,6 +13,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/client"
 	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"github.com/XGC-Team/xgc2-storage/registry"
 	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
@@ -27,7 +28,7 @@ type Config struct {
 	ConfigurationDomains []model.ConfigurationDomainDeclaration
 	// Readers is the number of concurrent read connections (default 4, at most 16).
 	Readers int
-	// WriterQueue bounds the writers admitted at once (default 32). A caller
+	// WriterQueue bounds the writers admitted at once (default 64). A caller
 	// beyond it waits until its own deadline instead of failing.
 	WriterQueue int
 	// CallBudget is the longest time one call may run (default 30 s).
@@ -39,55 +40,53 @@ type Config struct {
 }
 
 type Host struct {
-	store           *engine.Store
-	manifest        api.Manifest
-	databaseID      string
-	callBudget      time.Duration
-	diagnostics     *xrpc.Diagnostics
-	maintenanceStop context.CancelFunc
-	maintenanceDone chan struct{}
-	mu              sync.Mutex
-	servers         []*Server
-	closeOnce       sync.Once
-	closeDone       chan struct{}
-	closeErr        error
-	closed          atomic.Bool
+	store       *engine.Store
+	manifest    api.Manifest
+	databaseID  string
+	callBudget  time.Duration
+	diagnostics *xrpc.Diagnostics
+	mu          sync.Mutex
+	servers     []*Server
+	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
+	closed      atomic.Bool
 }
 
 // Open completes owner admission. ctx bounds startup only. Close owns
 // shutdown, so signal cancellation cannot destroy storage before the embedding
 // application's durable Stop finishes.
-func Open(ctx context.Context, config Config) (_ *Host, resultErr error) {
+func Open(ctx context.Context, config Config) (_ *Host, err error) {
 	if config.Path == "" {
 		return nil, errors.New("storage: database path required")
 	}
 	if len(config.ConfigurationDomains) > 256 {
 		return nil, errors.New("storage: configuration declarations exceed 256 domains")
 	}
-	modules := registry.Compiled()
-	if len(config.ConfigurationDomains) != 0 {
-		modules = registry.ConfigurationDeployment(config.ConfigurationDomains)
-	}
 	startup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	store, err := engine.Open(startup, engine.Config{Path: config.Path, Create: config.Create, Manifest: config.Manifest, Modules: modules,
-		Readers: config.Readers, WriterQueue: config.WriterQueue, MaxCallTime: config.CallBudget, MaxDBBytes: config.MaxDBBytes})
-	if err != nil {
-		return nil, err
-	}
-	stats, err := store.Stats()
-	if err != nil {
-		store.Close()
-		return nil, err
-	}
-	h := &Host{store: store, manifest: config.Manifest, databaseID: stats.DatabaseID, callBudget: config.CallBudget, diagnostics: config.Diagnostics, closeDone: make(chan struct{})}
+	h := &Host{manifest: config.Manifest, callBudget: config.CallBudget, diagnostics: config.Diagnostics, closeDone: make(chan struct{})}
 	if h.callBudget == 0 {
 		h.callBudget = 30 * time.Second
 	}
-	maintenanceCtx, maintenanceStop := context.WithCancel(context.Background())
-	h.maintenanceStop = maintenanceStop
-	h.maintenanceDone = make(chan struct{})
-	go h.maintain(maintenanceCtx)
+	h.store, err = engine.Open(startup, engine.Config{Path: config.Path, Create: config.Create, Manifest: config.Manifest, Modules: registry.Compiled(),
+		Readers: config.Readers, WriterQueue: config.WriterQueue, CallBudget: config.CallBudget, MaxDBBytes: config.MaxDBBytes,
+		OnMaintenanceError: h.maintenanceFailed})
+	if err != nil {
+		return nil, err
+	}
+	stats, err := h.store.Stats()
+	if err != nil {
+		h.store.Close()
+		return nil, err
+	}
+	h.databaseID = stats.DatabaseID
+	if len(config.ConfigurationDomains) != 0 {
+		if err = coredata.DeclareConfigurationDomains(startup, h.store, config.ConfigurationDomains); err != nil {
+			h.store.Close()
+			return nil, err
+		}
+	}
 	return h, nil
 }
 
@@ -101,6 +100,15 @@ func (h *Host) Client(scope api.Scope) (client.ReadSnapshotClient, error) {
 		return nil, err
 	}
 	return client.NewLocal(h.store, scope, h.callBudget)
+}
+
+// Core returns the typed Core data API (configuration, Runs, Sessions,
+// recordings) for one scope whose namespace uses the Core data module.
+func (h *Host) Core(scope api.Scope) (*coredata.Store, error) {
+	if h == nil || h.closed.Load() {
+		return nil, errors.New("storage: owner is closed")
+	}
+	return coredata.New(h.store, scope)
 }
 
 func (h *Host) DatabaseID() string { return h.databaseID }
@@ -137,37 +145,17 @@ func (h *Host) closeResources() {
 		h.closeErr = errors.Join(h.closeErr, s.Close(shutdown))
 		cancel()
 	}
-	if h.maintenanceStop != nil {
-		h.maintenanceStop()
-		<-h.maintenanceDone
-	}
 	h.closeErr = errors.Join(h.closeErr, h.store.Close())
 }
 
-func (h *Host) maintain(ctx context.Context) {
-	defer close(h.maintenanceDone)
-	tick := time.NewTicker(time.Second)
-	defer tick.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-tick.C:
-			budget, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-			_, pruneError := h.store.PruneExpiredReceipts(budget, time.Now(), 256)
-			cancel()
-			// A failed expiry write must not suppress WAL space recovery.
-			budget, cancel = context.WithTimeout(ctx, 500*time.Millisecond)
-			_, checkpointError := h.store.Checkpoint(budget)
-			cancel()
-			if err := errors.Join(pruneError, checkpointError); err != nil && ctx.Err() == nil {
-				category := xrpc.Code(err)
-				var domain *api.Error
-				if errors.As(err, &domain) {
-					category = domain.Code
-				}
-				h.diagnostics.Emit(xrpc.Diagnostic{Time: time.Now(), Level: "warn", Event: "storage.maintenance", Service: api.Service, Category: category})
-			}
-		}
+// maintenanceFailed reports a failed background checkpoint or receipt expiry.
+// The counters in Stats keep the total; the diagnostics sink, when the process
+// has one, gets a bounded record.
+func (h *Host) maintenanceFailed(err error) {
+	category := xrpc.Code(err)
+	var domain *api.Error
+	if errors.As(err, &domain) {
+		category = domain.Code
 	}
+	h.diagnostics.Emit(xrpc.Diagnostic{Time: time.Now(), Level: "warn", Event: "storage.maintenance", Service: api.Service, Category: category})
 }

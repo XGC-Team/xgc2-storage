@@ -80,33 +80,26 @@ func TestConfigurationMultibyteNameIsSeparateFromIdentifier(t *testing.T) {
 	}
 }
 
-func TestConfigurationIndependentDecodedAndActualWireBudgets(t *testing.T) {
-	budget := model.ConfigurationBudget{PayloadBytes: 10 << 20, ManifestBytes: 1 << 20, ManifestNodes: 4096, References: 4096, NodeChanges: 8192, DecodedBytes: 12 << 20, WireBytes: 16 << 20, ReceiptResultBytes: 256 << 10, MainIdentityBytes: 16 << 10}
+func TestConfigurationIndependentDecodedBudgets(t *testing.T) {
+	budget := model.ConfigurationBudget{PayloadBytes: 10 << 20, ManifestBytes: 1 << 20, ManifestNodes: 4096, References: 4096, NodeChanges: 8192, DecodedBytes: 12 << 20, ReceiptResultBytes: 256 << 10, MainIdentityBytes: 16 << 10}
 	if budget.Validate() != nil {
 		t.Fatal("legal independently measured counters rejected")
 	}
-	for _, alter := range []func(*model.ConfigurationBudget){func(b *model.ConfigurationBudget) { b.DecodedBytes++ }, func(b *model.ConfigurationBudget) { b.WireBytes++ }, func(b *model.ConfigurationBudget) { b.PayloadBytes++ }, func(b *model.ConfigurationBudget) { b.ManifestBytes++ }, func(b *model.ConfigurationBudget) { b.ManifestNodes++ }, func(b *model.ConfigurationBudget) { b.References++ }, func(b *model.ConfigurationBudget) { b.NodeChanges++ }, func(b *model.ConfigurationBudget) { b.ReceiptResultBytes++ }, func(b *model.ConfigurationBudget) { b.MainIdentityBytes++ }} {
+	for _, alter := range []func(*model.ConfigurationBudget){func(b *model.ConfigurationBudget) { b.DecodedBytes++ }, func(b *model.ConfigurationBudget) { b.PayloadBytes++ }, func(b *model.ConfigurationBudget) { b.ManifestBytes++ }, func(b *model.ConfigurationBudget) { b.ManifestNodes++ }, func(b *model.ConfigurationBudget) { b.References++ }, func(b *model.ConfigurationBudget) { b.NodeChanges++ }, func(b *model.ConfigurationBudget) { b.ReceiptResultBytes++ }, func(b *model.ConfigurationBudget) { b.MainIdentityBytes++ }} {
 		b := budget
 		alter(&b)
 		if b.Validate() == nil {
 			t.Fatal("independent maximum silently bypassed")
 		}
 	}
-	for _, omit := range []func(*model.ConfigurationBudget){func(b *model.ConfigurationBudget) { b.DecodedBytes = b.PayloadBytes + b.ManifestBytes }, func(b *model.ConfigurationBudget) { b.WireBytes = b.PayloadBytes + b.ManifestBytes }} {
+	for _, omit := range []func(*model.ConfigurationBudget){func(b *model.ConfigurationBudget) { b.DecodedBytes = b.PayloadBytes + b.ManifestBytes }} {
 		b := budget
 		omit(&b)
 		if b.Validate() == nil {
 			t.Fatal("current-main identity omitted from a whole byte counter")
 		}
 	}
-	// A legal decoded value can exceed the wire limit through ordinary JSON
-	// escaping alone. The actual serialization is measured, not estimated.
-	summary := strings.Repeat("<", 3<<20)
-	wire, _ := json.Marshal(model.ConfigurationChange{Summary: summary})
-	if b := (model.ConfigurationBudget{DecodedBytes: int64(len(summary) + 100), WireBytes: int64(len(wire))}); b.Validate() == nil {
-		t.Fatal("HTML expansion bypassed actual wire budget")
-	}
-	clone := model.ConfigurationCloneBudget{Namespaces: 1024, Resources: 4096, References: 16384, ManifestNodes: 65536, NodeChangesAndSummary: 65537, NamespaceDepth: 128, DecodedBytes: 12 << 20, WireBytes: 16 << 20}
+	clone := model.ConfigurationCloneBudget{Namespaces: 1024, Resources: 4096, References: 16384, ManifestNodes: 65536, NodeChangesAndSummary: 65537, NamespaceDepth: 128, DecodedBytes: 12 << 20}
 	if clone.Validate() != nil {
 		t.Fatal("bounded clone rejected")
 	}

@@ -9,7 +9,6 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
@@ -300,15 +299,7 @@ func configurationRead(ctx context.Context, tx *sql.Tx, scope string, q model.Co
 	if e != nil {
 		return out, e
 	}
-	result, e := encode(out)
-	if e != nil {
-		return out, e
-	}
-	wire, e := json.Marshal(api.NamedResponse{Result: result})
-	if e != nil {
-		return out, e
-	}
-	budget := model.ConfigurationBudget{PayloadBytes: int64(len(out.Payload)), ManifestBytes: int64(len(out.Manifest)), ManifestNodes: int64(len(manifest.Nodes)), References: int64(len(out.References)), MainIdentityBytes: int64(len(out.CurrentMain.Identity)), DecodedBytes: int64(len(out.Payload) + len(out.Manifest) + len(body) + len(out.CurrentMain.Identity)), WireBytes: int64(len(wire))}
+	budget := model.ConfigurationBudget{PayloadBytes: int64(len(out.Payload)), ManifestBytes: int64(len(out.Manifest)), ManifestNodes: int64(len(manifest.Nodes)), References: int64(len(out.References)), MainIdentityBytes: int64(len(out.CurrentMain.Identity)), DecodedBytes: int64(len(out.Payload) + len(out.Manifest) + len(body) + len(out.CurrentMain.Identity))}
 	if err = budget.Validate(); err != nil {
 		return out, failure("resource_exhausted", err.Error())
 	}

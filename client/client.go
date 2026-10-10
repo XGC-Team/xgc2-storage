@@ -35,13 +35,6 @@ func (c *Client) call(ctx context.Context, id, path, method string, request, res
 		return err
 	}
 	requestMaximum, responseMaximum := api.MaxRequestBytes, api.MaxResponseBytes
-	if _, ok := request.(api.NamedRequest); ok {
-		requestMaximum = api.MaxNamedRequestBytes
-		responseMaximum = api.MaxNamedResponseBytes
-	}
-	if method == "NamedResult" {
-		responseMaximum = api.MaxNamedResponseBytes
-	}
 	if len(raw) > requestMaximum {
 		return &api.Error{Code: "resource_exhausted", Message: "request exceeds storage byte limit"}
 	}
@@ -56,8 +49,6 @@ func (c *Client) call(ctx context.Context, id, path, method string, request, res
 			call.Payload, err = protojson.Marshal(pb.BatchInput(v))
 		case api.ReceiptRequest:
 			call.Payload, err = protojson.Marshal(pb.ReceiptInput(v))
-		case api.NamedRequest:
-			call.Payload, err = protojson.Marshal(pb.NamedInput(v))
 		default:
 			return errors.New("storage: unsupported typed request")
 		}
@@ -92,31 +83,9 @@ func (c *Client) call(ctx context.Context, id, path, method string, request, res
 			}
 			*v = out.API()
 			return checkResponse(v)
-		case *api.NamedResponse:
-			var out pb.NamedResponse
-			if err = protojson.Unmarshal(result.Payload, &out); err != nil {
-				return err
-			}
-			*v = out.API()
-			raw, e := json.Marshal(v)
-			if e != nil {
-				return e
-			}
-			if len(raw) > responseMaximum {
-				return &api.Error{Code: "resource_exhausted", Message: "decoded named result exceeds storage limit"}
-			}
-			return nil
 		}
 	}
 	return json.Unmarshal(result.Payload, response)
-}
-func (c *Client) Named(ctx context.Context, r api.NamedRequest) (out api.NamedResponse, err error) {
-	err = c.call(ctx, r.RequestID, "/v1/named", "Named", r, &out)
-	return
-}
-func (c *Client) NamedResult(ctx context.Context, id string, r api.ReceiptRequest) (out api.NamedResponse, err error) {
-	err = c.call(ctx, id, "/v1/named-result", "NamedResult", r, &out)
-	return
 }
 func checkResponse(v any) error {
 	raw, err := json.Marshal(v)

@@ -65,21 +65,11 @@ func ValidateManifest(m api.Manifest) error {
 		}
 		seen[n.ID] = true
 		mods := map[string]bool{}
-		for _, m := range n.Modules {
-			if !identifier(m.ID) || !identifier(m.Schema) || len(m.Digest) != 64 || mods[m.ID] || len(m.Operations) == 0 || len(m.Operations) > 32 {
-				return fail("invalid_argument", "reviewed named module/schema/digest/operations required")
+		for _, id := range n.Modules {
+			if !identifier(id) || mods[id] {
+				return fail("invalid_argument", "unique data module identifiers required")
 			}
-			mods[m.ID] = true
-			if _, e := hex.DecodeString(m.Digest); e != nil {
-				return fail("invalid_argument", "module digest must be SHA256")
-			}
-			ops := map[string]bool{}
-			for _, o := range m.Operations {
-				if !identifier(o.ID) || ops[o.ID] || o.MaxRequestBytes < 1 || o.MaxRequestBytes > api.MaxNamedRequestBytes || o.MaxResponseBytes < 1 || o.MaxResponseBytes > api.MaxNamedResponseBytes {
-					return fail("invalid_argument", "named operation bounds required")
-				}
-				ops[o.ID] = true
-			}
+			mods[id] = true
 		}
 		cols := map[string]bool{}
 		for _, c := range n.Collections {
@@ -108,7 +98,9 @@ func hash(v any) string {
 	s := sha256.Sum256(b)
 	return hex.EncodeToString(s[:])
 }
-func scopeID(s api.Scope) string { b, _ := json.Marshal(s); return string(b) }
+
+// ScopeID is the canonical identity of a scope inside the database.
+func ScopeID(s api.Scope) string { b, _ := json.Marshal(s); return string(b) }
 func canonicalObject(raw json.RawMessage) (json.RawMessage, map[string]any, error) {
 	d := json.NewDecoder(bytes.NewReader(raw))
 	d.UseNumber()

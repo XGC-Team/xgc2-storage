@@ -1,6 +1,7 @@
 package coredata
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -47,6 +48,10 @@ func execSQL(t *testing.T, db *sql.DB, ctx context.Context, q string, args ...an
 		t.Fatal(err)
 	}
 }
+
+// run decodes one JSON request, applies the matching operation in a single
+// transaction and encodes its result. Like Store.Write it commits only on
+// success, so a failing operation leaves nothing behind.
 func run(t *testing.T, db *sql.DB, ctx context.Context, operation string, request any) (json.RawMessage, error) {
 	t.Helper()
 	raw, err := json.Marshal(request)
@@ -58,13 +63,81 @@ func run(t *testing.T, db *sql.DB, ctx context.Context, operation string, reques
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	result, err := Execute(ctx, tx, testScope, operation, raw)
-	// Intentionally commit even on operation error. Its savepoint must prevent
-	// partial data independently of the required outer-owner rollback.
-	if e := tx.Commit(); e != nil {
-		t.Fatal(e)
+	result, err := apply(ctx, tx, testScope, operation, raw)
+	if err != nil {
+		return nil, err
 	}
-	return result, err
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return result, nil
+}
+
+func decodeInto[T any](raw json.RawMessage, fn func(T) (any, error)) (any, error) {
+	var q T
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.DisallowUnknownFields()
+	if err := d.Decode(&q); err != nil {
+		return nil, failure("invalid_argument", err.Error())
+	}
+	return fn(q)
+}
+
+func apply(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.RawMessage) (json.RawMessage, error) {
+	var result any
+	var err error
+	switch operation {
+	case model.ResourceCreateOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationResourceCreate) (any, error) { return configurationCreate(ctx, tx, scope, q) })
+	case model.ResourceCommitOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationResourceCommit) (any, error) { return configurationCommit(ctx, tx, scope, q) })
+	case model.ResourceSnapshotOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationResourceRead) (any, error) { return configurationRead(ctx, tx, scope, q) })
+	case model.ConfigurationReceiptOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationReceipt) (any, error) { return configurationReceipt(ctx, tx, scope, q) })
+	case model.ConfigurationBranchCreateOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationBranchCreate) (any, error) {
+			return configurationBranchCreate(ctx, tx, scope, q)
+		})
+	case model.ConfigurationBranchArchiveOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationBranchArchive) (any, error) {
+			return configurationBranchArchive(ctx, tx, scope, q)
+		})
+	case model.ConfigurationResourceStateOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationResourceState) (any, error) {
+			return configurationResourceState(ctx, tx, scope, q)
+		})
+	case model.ConfigurationResourceMetadataOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationResourceMetadata) (any, error) {
+			return configurationResourceMetadata(ctx, tx, scope, q)
+		})
+	case model.ConfigurationIncomingOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationIncomingRead) (any, error) {
+			return configurationIncomingRead(ctx, tx, scope, q)
+		})
+	case model.ConfigurationNamespaceCloneOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceClone) (any, error) { return configurationClone(ctx, tx, scope, q) })
+	case model.ConfigurationNamespaceCloneReceiptOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceCloneReceipt) (any, error) {
+			return configurationCloneReceipt(ctx, tx, scope, q)
+		})
+	case model.ConfigurationNamespaceCreateOperation, model.ConfigurationNamespaceUpdateOperation, model.ConfigurationNamespaceStateOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceWrite) (any, error) {
+			return configurationNamespaceWrite(ctx, tx, scope, operation, q)
+		})
+	case model.NamespaceSnapshotOperation:
+		result, err = decodeInto(raw, func(q model.NamespaceRead) (any, error) { return namespaceSnapshot(ctx, tx, scope, q) })
+	case model.ConfigurationNamespacesOperation, model.ConfigurationResourcesOperation, model.ConfigurationBranchesOperation, model.ConfigurationCommitsOperation, model.ConfigurationChangesOperation:
+		result, err = decodeInto(raw, func(q model.ConfigurationCatalogRead) (any, error) {
+			return configurationCatalog(ctx, tx, scope, operation, q)
+		})
+	default:
+		err = failure("invalid_argument", "unregistered operation")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return encode(result)
 }
 func count(t *testing.T, db *sql.DB, ctx context.Context, table string) int {
 	t.Helper()
@@ -162,7 +235,7 @@ func TestRelationalIndexesAndScopeIsolation(t *testing.T) {
 	}
 	defer tx.Rollback()
 	raw, _ := json.Marshal(model.NamespaceRead{Domain: "robot", ID: "source"})
-	if _, err = Execute(ctx, tx, `{"namespace":"core","user":"other","workspace":"station"}`, model.NamespaceSnapshotOperation, raw); errorCode(err) != "not_found" {
+	if _, err = apply(ctx, tx, `{"namespace":"core","user":"other","workspace":"station"}`, model.NamespaceSnapshotOperation, raw); errorCode(err) != "not_found" {
 		t.Fatalf("scope leaked source: %v", err)
 	}
 }

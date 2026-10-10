@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -13,6 +12,8 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 )
 
+// Snapshot reads a consistent set of queries at one scope revision. Inside a
+// read view the first read pins the revision and later reads must see it.
 func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.SnapshotResponse, err error) {
 	defer func() { err = classify(err) }()
 	n, err := s.scope(r.Scope)
@@ -22,33 +23,24 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 	if len(r.Queries) == 0 || len(r.Queries) > api.MaxQueries {
 		return out, fail("invalid_argument", "bounded nonempty query plan required")
 	}
-	if view := snapshotContext(ctx); view != nil {
-		unlock, err := view.borrow(ctx, s, r.Scope)
+	if view := viewOf(ctx); view != nil {
+		unlock, err := view.begin(r.Scope, &r)
 		if err != nil {
 			return out, err
 		}
 		defer unlock()
-		return s.snapshot(ctx, view.tx, n, r)
+		defer func() { view.pin(out, err) }()
 	}
-	ctx, release, err := s.beginCall(ctx, false)
-	if err != nil {
-		return out, err
-	}
-	defer release()
-	tx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-	if err != nil {
-		return out, err
-	}
-	defer tx.Rollback()
-	out, err = s.snapshot(ctx, tx, n, r)
-	if err != nil {
-		return out, err
-	}
-	return out, tx.Commit()
+	err = s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		var e error
+		out, e = s.snapshot(ctx, tx, n, r)
+		return e
+	})
+	return out, err
 }
 
 func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api.SnapshotRequest) (out api.SnapshotResponse, err error) {
-	id := scopeID(r.Scope)
+	id := ScopeID(r.Scope)
 	var rev int64
 	err = tx.QueryRowContext(ctx, "SELECT revision FROM scopes WHERE scope=?", id).Scan(&rev)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -80,13 +72,6 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 			return out, e
 		}
 		out.Results = append(out.Results, result)
-	}
-	raw, e := json.Marshal(out)
-	if e != nil {
-		return out, e
-	}
-	if len(raw) > api.MaxResponseBytes {
-		return api.SnapshotResponse{}, fail("resource_exhausted", fmt.Sprintf("snapshot response %d exceeds byte limit", len(raw)))
 	}
 	return out, nil
 }

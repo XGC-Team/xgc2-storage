@@ -1,8 +1,6 @@
 package model
 
-// Wire identity and limits are shared by the compiled module and consumers.
-// The named request/response envelope belongs to storage/api; this package
-// defines no second envelope or transport client.
+// Identity and limits are shared by the compiled module and its consumers.
 const (
 	Schema = "core-relational-v1"
 	Module = "coredata"

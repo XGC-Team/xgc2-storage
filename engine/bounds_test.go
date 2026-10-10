@@ -52,7 +52,7 @@ func TestEqualityQueryPlanUsesBoundedOrderedIndex(t *testing.T) {
 	if e != nil || len(result.Results[0].Records) != 1 {
 		t.Fatalf("numeric indexed query %v %v", result, e)
 	}
-	rows, e := s.reader.QueryContext(ctx, "EXPLAIN QUERY PLAN SELECT r.key,r.version,r.deleted,r.data FROM lookups l JOIN records r ON r.scope=l.scope AND r.collection=l.collection AND r.key=l.key WHERE l.scope=? AND l.collection=? AND l.index_name=? AND l.index_value=? AND l.key>? ORDER BY l.key LIMIT ?", scopeID(testScope), "state", "unique", `[{"number":"1"}]`, "", 2)
+	rows, e := s.rdb.QueryContext(ctx, "EXPLAIN QUERY PLAN SELECT r.key,r.version,r.deleted,r.data FROM lookups l JOIN records r ON r.scope=l.scope AND r.collection=l.collection AND r.key=l.key WHERE l.scope=? AND l.collection=? AND l.index_name=? AND l.index_value=? AND l.key>? ORDER BY l.key LIMIT ?", ScopeID(testScope), "state", "unique", `[{"number":"1"}]`, "", 2)
 	if e != nil {
 		t.Fatal(e)
 	}

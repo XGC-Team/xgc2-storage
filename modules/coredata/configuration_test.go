@@ -22,7 +22,7 @@ func configurationFixture(t *testing.T) (*sql.DB, context.Context, model.Configu
 		t.Fatal(e)
 	}
 	defer tx.Rollback()
-	if e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: g.SchemaVersion, RegistryDigest: g.RegistryDigest, MainVisibility: true}}); e != nil {
+	if e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: g.SchemaVersion, RegistryDigest: g.RegistryDigest, MainVisibility: true}}); e != nil {
 		t.Fatal(e)
 	}
 	if e = tx.Commit(); e != nil {
@@ -383,7 +383,7 @@ func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: newg.SchemaIdentity, SchemaVersion: 1, RegistryDigest: newg.RegistryDigest, MainVisibility: true}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: newg.SchemaIdentity, SchemaVersion: 1, RegistryDigest: newg.RegistryDigest, MainVisibility: true}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -438,7 +438,7 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: true}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: true}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -473,7 +473,7 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-v2", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-v2", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
 	configurationCode(t, e, "conflict")
 	tx.Rollback()
 }

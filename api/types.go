@@ -11,14 +11,6 @@ const MaxOperations = 256
 const MaxQueries = 64
 const MaxRows = 2048
 
-// Named operations have a reviewed, separate envelope and owner-local bounds.
-// Their typed module payloads are not expanded into ordinary Batch requests.
-const MaxNamedRequestBytes = 16 << 20
-const MaxNamedResponseBytes = 16 << 20
-const MaxNamedStateMutations = 4096
-const MaxNamedReadRows = 65536
-const MaxNamedReadQueries = 24576
-
 // Revisions are canonical decimal strings to preserve precision in every SDK.
 type Scope struct {
 	Namespace string `json:"namespace"`
@@ -71,11 +63,19 @@ type Mutation struct {
 	Delete          bool            `json:"delete,omitempty"`
 	Data            json.RawMessage `json:"data,omitempty"`
 }
+
+// A BatchRequest with a RequestID is idempotent: its receipt is retained so a
+// caller that lost the reply can read the outcome. A request without one (an
+// in-process caller that needs no replay) leaves no receipt.
 type BatchRequest struct {
 	Scope     Scope      `json:"scope"`
 	Expected  Token      `json:"expected"`
-	RequestID string     `json:"request_id"`
+	RequestID string     `json:"request_id,omitempty"`
 	Mutations []Mutation `json:"mutations"`
+	// Relaxed commits with synchronous=NORMAL: it survives a process crash but
+	// may lose the last commits on power loss until the next checkpoint or
+	// durable commit. It is an in-process choice and never read from the wire.
+	Relaxed bool `json:"-"`
 }
 type Receipt struct {
 	RequestID   string   `json:"request_id"`
@@ -98,6 +98,8 @@ type Error struct {
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
 // Manifest is a reviewed deployment input, never a caller supplied RPC schema.
+// It may change between releases: added collections, new limits and changed
+// indexes take effect when the owner opens the database.
 type Manifest struct {
 	Format     string      `json:"format"`
 	Namespaces []Namespace `json:"namespaces"`
@@ -110,37 +112,16 @@ type Namespace struct {
 	MaxReceipts       int          `json:"max_receipts"`
 	ReceiptTTLSeconds int          `json:"receipt_ttl_seconds"`
 	Collections       []Collection `json:"collections"`
-	Modules           []Module     `json:"modules,omitempty"`
-}
-type Module struct {
-	ID         string           `json:"id"`
-	Schema     string           `json:"schema"`
-	Digest     string           `json:"digest"`
-	Operations []NamedOperation `json:"operations"`
-}
-type NamedOperation struct {
-	ID               string `json:"id"`
-	ReadOnly         bool   `json:"read_only"`
-	MaxRequestBytes  int    `json:"max_request_bytes"`
-	MaxResponseBytes int    `json:"max_response_bytes"`
-}
-type NamedRequest struct {
-	Scope      Scope           `json:"scope"`
-	DatabaseID string          `json:"database_id"`
-	Schema     string          `json:"schema"`
-	Module     string          `json:"module"`
-	Operation  string          `json:"operation"`
-	RequestID  string          `json:"request_id"`
-	Payload    json.RawMessage `json:"payload"`
-}
-type NamedResponse struct {
-	Receipt *Receipt        `json:"receipt,omitempty"`
-	Result  json.RawMessage `json:"result"`
+	// Modules names the compiled data modules (typed relational data such as
+	// Core configuration) whose tables this namespace may use.
+	Modules []string `json:"modules,omitempty"`
 }
 type Collection struct {
 	ID             string `json:"id"`
 	MaxRecordBytes int    `json:"max_record_bytes"`
-	// Includes tombstones, so delete/recreate cannot evade capacity or CAS.
+	// MaxRecords and MaxBytes bound the live records. Deleted records leave a
+	// tombstone that keeps CAS versions; at most MaxRecords tombstones are
+	// retained, the oldest dropped first.
 	MaxRecords int     `json:"max_records"`
 	MaxBytes   int64   `json:"max_bytes"`
 	Indexes    []Index `json:"indexes,omitempty"`

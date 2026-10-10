@@ -12,7 +12,6 @@ import (
 
 	"github.com/XGC-Team/xgc2-storage/api"
 	pb "github.com/XGC-Team/xgc2-storage/protocol"
-	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
 	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 	"github.com/XGC-Team/xgc2-xrpc/go/grpcx"
@@ -30,8 +29,8 @@ type Limits struct {
 	MaxInFlight int
 	// StreamsPerConnection bounds native gRPC streams per connection (default 1).
 	StreamsPerConnection uint32
-	// MaxRequestBytes and MaxResponseBytes bound one message. The default is the
-	// largest request and response the registered operations declare.
+	// MaxRequestBytes and MaxResponseBytes bound one message (default 4 MiB,
+	// the document profile's request and response bound).
 	MaxRequestBytes  int
 	MaxResponseBytes int
 }
@@ -71,12 +70,11 @@ func (h *Host) Serve(ctx context.Context, config ServeConfig) (_ *Server, result
 		return nil, err
 	}
 	limits := config.Limits
-	requestBytes, responseBytes := registry.TransportBounds(h.manifest)
 	if limits.MaxRequestBytes == 0 {
-		limits.MaxRequestBytes = requestBytes
+		limits.MaxRequestBytes = api.MaxRequestBytes
 	}
 	if limits.MaxResponseBytes == 0 {
-		limits.MaxResponseBytes = responseBytes
+		limits.MaxResponseBytes = api.MaxResponseBytes
 	}
 	if limits.MaxConnections == 0 {
 		limits.MaxConnections = 4

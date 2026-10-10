@@ -162,8 +162,9 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 		if _, err := remote.Batch(ctx, advance); err != nil {
 			return err
 		}
-		after, err := local.Snapshot(view, "view-after", query)
-		if err != nil || after.Token != saved.Token || string(after.Results[0].Records[0].Data) != string(request.Mutations[0].Data) {
+		// The view holds no reader, so the write above is visible to the next
+		// read; the view must fail instead of mixing revisions.
+		if after, err := local.Snapshot(view, "view-after", query); xrpc.Code(err) != "conflict" {
 			t.Fatalf("local read view mixed revisions: %+v %v", after, err)
 		}
 		return nil

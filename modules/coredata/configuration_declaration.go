@@ -8,17 +8,24 @@ import (
 	"errors"
 	"sort"
 
+	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-// DeclareConfigurationDomains is an explicit owner-held deployment transaction
-// seam. No Named request calls it, no schema/adoption fallback exists, and this
-// function opens no connection. Existing fixed capabilities cannot be changed.
-func DeclareConfigurationDomains(ctx context.Context, tx *sql.Tx, domains []model.ConfigurationDomainDeclaration) error {
-	if tx == nil || len(domains) == 0 || len(domains) > 256 {
+// DeclareConfigurationDomains applies the owner's deployment facts in one
+// durable transaction. It is the only way a domain enters the catalog; no data
+// call adopts one. Existing fixed capabilities cannot be changed.
+func DeclareConfigurationDomains(ctx context.Context, db *engine.Store, domains []model.ConfigurationDomainDeclaration) error {
+	if len(domains) == 0 || len(domains) > 256 {
 		return failure("invalid_argument", "bounded explicit domain declarations required")
 	}
-	return atomicData(ctx, tx, func() error {
+	return db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		return declareDomains(ctx, tx, domains)
+	})
+}
+
+func declareDomains(ctx context.Context, tx *sql.Tx, domains []model.ConfigurationDomainDeclaration) error {
+	{
 		seen := map[string]bool{}
 		for _, d := range domains {
 			if !textKey(d.Key) || !textKey(d.SchemaIdentity) || d.SchemaVersion < 1 || !sha256Hex(d.RegistryDigest) || len(d.Capabilities) > 64 || seen[d.Key] {
@@ -60,7 +67,7 @@ func DeclareConfigurationDomains(ctx context.Context, tx *sql.Tx, domains []mode
 			return failure("resource_exhausted", "domain declaration count exceeded")
 		}
 		return nil
-	})
+	}
 }
 
 func configurationDomain(ctx context.Context, tx *sql.Tx, d model.ConfigurationDomainGuard) (model.ConfigurationDomainDeclaration, error) {

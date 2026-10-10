@@ -106,7 +106,7 @@ func TestFaultWALReaderPinnedCheckpointRecovery(t *testing.T) {
 		t.Fatalf("reader-pinned checkpoint waited or lost Busy result: %+v elapsed=%s err=%v", pinned, elapsed, err)
 	}
 	underPressure, err := s.Stats()
-	if err != nil || underPressure.WALBytes < 1<<20 || underPressure.WriterAdmitted != 0 || underPressure.ReadersActive != 0 {
+	if err != nil || underPressure.WALBytes < 1<<20 || underPressure.WritersQueued != 0 || underPressure.ReadersActive != 0 {
 		t.Fatalf("reader-pinned checkpoint changed pressure or leaked admission: %+v %v", underPressure, err)
 	}
 	replay, err := s.Batch(deadline(t), large)
@@ -140,7 +140,7 @@ func TestFaultWALReaderPinnedCheckpointRecovery(t *testing.T) {
 		t.Fatalf("released reader did not recover the unchanged write request: %+v %v", recovered, err)
 	}
 	final, err := s.Stats()
-	if err != nil || final.WriterAdmitted != 0 || final.ReadersActive != 0 {
+	if err != nil || final.WritersQueued != 0 || final.ReadersActive != 0 {
 		t.Fatalf("reader recovery leaked engine admission: %+v %v", final, err)
 	}
 	if err = s.Integrity(deadline(t)); err != nil {

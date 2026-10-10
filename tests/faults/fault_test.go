@@ -30,7 +30,6 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/client"
 	"github.com/XGC-Team/xgc2-storage/engine"
-	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
 	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 	"github.com/XGC-Team/xgc2-xrpc/go/grpcx"
@@ -86,7 +85,7 @@ func deadline(t *testing.T) context.Context {
 func open(t *testing.T, path string, create bool, adjust func(*engine.Config)) *engine.Store {
 	t.Helper()
 	config := engine.Config{Path: path, Create: create, Manifest: manifest(), Readers: 2,
-		WriterQueue: 4, MaxCallTime: 5 * time.Second, MaxDBBytes: 16 << 20, MaxWALBytes: 8 << 20}
+		WriterQueue: 4, CallBudget: 5 * time.Second, MaxDBBytes: 16 << 20, MaxWALBytes: 8 << 20}
 	if adjust != nil {
 		adjust(&config)
 	}
@@ -280,7 +279,7 @@ func startProfileManifest(t *testing.T, dir string, create bool, held string, m 
 			var refs []xrpc.ServiceRef
 			if json.Unmarshal(raw, &refs) == nil && len(refs) == 1 {
 				d.ref = refs[0]
-				requestBytes, responseBytes := registry.TransportBounds(m)
+				requestBytes, responseBytes := api.MaxRequestBytes, api.MaxResponseBytes
 				if d.ref.Profile == xrpc.HTTP {
 					d.transport, err = httpx.New(httpx.Config{LocalTargetID: d.ref.TargetID, Service: d.ref,
 						MaxRequestBytes: int64(requestBytes), MaxResponseBytes: int64(responseBytes),
@@ -502,7 +501,7 @@ func TestFaultDiskFullAtomicRollbackAndRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	stats, err := s.Stats()
-	if err != nil || stats.WriterAdmitted != 0 || stats.ReadersActive != 0 || stats.DatabaseBytes > 1<<20 {
+	if err != nil || stats.WritersQueued != 0 || stats.ReadersActive != 0 || stats.DatabaseBytes > 1<<20 {
 		t.Fatalf("disk-full leaked resources or page limit: %+v %v", stats, err)
 	}
 	if err = s.Close(); err != nil {
@@ -752,16 +751,6 @@ func TestFaultBackupNewBusinessRestoreAndNegativeControls(t *testing.T) {
 	if err = restored.Close(); err != nil {
 		t.Fatal(err)
 	}
-	wrong := manifest()
-	wrong.Namespaces[0].Schema = "different.v1"
-	beforeWrong := fileHash(t, backup)
-	if candidate, err := engine.Open(deadline(t), engine.Config{Path: backup, Manifest: wrong}); err == nil {
-		candidate.Close()
-		t.Fatal("wrong-schema backup candidate accepted")
-	}
-	if fileHash(t, backup) != beforeWrong {
-		t.Fatal("wrong manifest changed the backup")
-	}
 	corruptPath := filepath.Join(privateDir(t), "corrupt.db")
 	raw, err := os.ReadFile(backup)
 	if err != nil {
@@ -777,8 +766,8 @@ func TestFaultBackupNewBusinessRestoreAndNegativeControls(t *testing.T) {
 	}
 	evidence(t, map[string]any{"backup": backupReceipt, "backup_file_sha256": digest, "business_collections": 6,
 		"receipt_and_index_restored": true, "tombstone_and_aba_restored": true, "later_source_commit_excluded": true,
-		"wrong_manifest_rejected": true, "corrupt_candidate_rejected": true,
-		"activation_cli_tested": false, "legacy_schema_import_tested": false})
+		"corrupt_candidate_rejected": true,
+		"activation_cli_tested":      false, "legacy_schema_import_tested": false})
 }
 
 func TestFaultReadonlyStartupNoMutation(t *testing.T) {

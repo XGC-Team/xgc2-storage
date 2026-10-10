@@ -3,277 +3,203 @@ package engine
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
-type Stats struct {
-	DatabaseID     string `json:"database_id"`
-	SQLiteVersion  string `json:"sqlite_version"`
-	DatabaseBytes  int64  `json:"database_bytes"`
-	WALBytes       int64  `json:"wal_bytes"`
-	SHMBytes       int64  `json:"shm_bytes"`
-	FreeBytes      uint64 `json:"free_bytes"`
-	WriterAdmitted int    `json:"writer_admitted"`
-	WriterCapacity int    `json:"writer_capacity"`
-	ReadersActive  int    `json:"readers_active"`
-	ReaderCapacity int    `json:"reader_capacity"`
-	Calls          uint64 `json:"calls"`
-	Conflicts      uint64 `json:"conflicts"`
-	Overloads      uint64 `json:"overloads"`
-	QueueWaitNS    uint64 `json:"queue_wait_ns"`
-	SQLTimeNS      uint64 `json:"sql_time_ns"`
+const (
+	workCheckpoint uint32 = 1 << iota
+	workExpire
+)
+
+// maintenance runs the owner's background work. It is event driven: a commit
+// arms a checkpoint, a stored receipt arms its own expiry, and an idle
+// database wakes nothing. A checkpoint also makes relaxed commits durable.
+type maintenance struct {
+	store *Store
+	kick  chan struct{}
+	work  atomic.Uint32
+	stop  context.CancelFunc
+	done  chan struct{}
+	once  sync.Once
+
+	mu              sync.Mutex
+	checkpointTimer *time.Timer
+	expiryTimer     *time.Timer
+	expiryAt        int64 // Unix second the expiry timer is armed for; 0 when none
 }
 
-func (s *Store) Stats() (Stats, error) {
-	s.lifecycle.RLock()
-	defer s.lifecycle.RUnlock()
-	if s.closed.Load() {
-		return Stats{}, fail("unavailable", "store closed")
+func (s *Store) startMaintenance(ctx context.Context) {
+	runCtx, stop := context.WithCancel(context.Background())
+	m := &maintenance{store: s, kick: make(chan struct{}, 1), stop: stop, done: make(chan struct{})}
+	s.maintenance = m
+	if at, ok := s.nextExpiry(ctx); ok {
+		m.armExpiry(at)
 	}
-	out := Stats{DatabaseID: s.dbid, SQLiteVersion: s.engine, WriterAdmitted: len(s.writers), WriterCapacity: cap(s.writers), ReadersActive: len(s.reads), ReaderCapacity: cap(s.reads), Calls: s.calls.Load(), Conflicts: s.conflicts.Load(), Overloads: s.overloads.Load(), QueueWaitNS: s.waitNS.Load(), SQLTimeNS: s.sqlNS.Load()}
-	for suffix, target := range map[string]*int64{"": &out.DatabaseBytes, "-wal": &out.WALBytes, "-shm": &out.SHMBytes} {
-		var st unix.Stat_t
-		if e := unix.Fstatat(s.owner.parent, s.owner.name+suffix, &st, unix.AT_SYMLINK_NOFOLLOW); e == nil {
-			*target = st.Size
-		}
-	}
-	var fs unix.Statfs_t
-	if e := unix.Fstatfs(s.owner.parent, &fs); e != nil {
-		return out, e
-	}
-	out.FreeBytes = fs.Bavail * uint64(fs.Bsize)
-	return out, nil
+	go m.run(runCtx)
 }
 
-type CheckpointResult struct {
-	Busy              int `json:"busy"`
-	LogPages          int `json:"log_pages"`
-	CheckpointedPages int `json:"checkpointed_pages"`
-}
-
-func (s *Store) Checkpoint(ctx context.Context) (out CheckpointResult, err error) {
-	defer func() { err = classify(err) }()
-	ctx, release, err := s.beginCall(ctx, true)
-	if err != nil {
-		return out, err
-	}
-	defer release()
-	err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
-	if err != nil {
+func (s *Store) stopMaintenance() {
+	m := s.maintenance
+	if m == nil {
 		return
 	}
-	// PASSIVE backfills frames but leaves the allocated WAL file in place. At
-	// the physical admission watermark, that file would otherwise prevent the
-	// next writer from resetting it. Attempt one non-waiting reset under this
-	// same owner admission and deadline; a pinned reader leaves Busy set and
-	// preserves pressure until a later maintenance call can reclaim the file.
-	var st unix.Stat_t
-	if e := unix.Fstatat(s.owner.parent, s.owner.name+"-wal", &st, unix.AT_SYMLINK_NOFOLLOW); e != nil {
-		if e != unix.ENOENT {
-			err = e
+	m.once.Do(func() {
+		m.stop()
+		m.mu.Lock()
+		for _, t := range []*time.Timer{m.checkpointTimer, m.expiryTimer} {
+			if t != nil {
+				t.Stop()
+			}
 		}
-		return
-	} else if st.Size >= s.config.MaxWALBytes {
-		err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
-	}
-	return
+		m.mu.Unlock()
+		<-m.done
+	})
 }
+
+func (m *maintenance) run(ctx context.Context) {
+	defer close(m.done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.kick:
+		}
+		work := m.work.Swap(0)
+		if work&workCheckpoint != 0 {
+			m.report(ctx, errors.Join(m.checkpoint(ctx)))
+		}
+		if work&workExpire != 0 {
+			m.report(ctx, m.expire(ctx))
+		}
+	}
+}
+
+func (m *maintenance) request(work uint32) {
+	m.work.Or(work)
+	select {
+	case m.kick <- struct{}{}:
+	default:
+	}
+}
+
+func (m *maintenance) report(ctx context.Context, err error) {
+	if err == nil || ctx.Err() != nil {
+		return
+	}
+	m.store.maintenanceErrs.Add(1)
+	if m.store.config.OnMaintenanceError != nil {
+		m.store.config.OnMaintenanceError(err)
+	}
+}
+
+// afterCommit decides whether the WAL needs attention. A WAL over the
+// threshold is checkpointed at once; otherwise one checkpoint is scheduled a
+// fixed delay after the first commit that follows the previous one.
+func (m *maintenance) afterCommit() {
+	if m.store.walSize() >= m.store.config.CheckpointBytes {
+		m.request(workCheckpoint)
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.checkpointTimer == nil {
+		m.checkpointTimer = time.AfterFunc(m.store.config.CheckpointDelay, func() {
+			m.mu.Lock()
+			m.checkpointTimer = nil
+			m.mu.Unlock()
+			m.request(workCheckpoint)
+		})
+	}
+}
+
+func (m *maintenance) checkpoint(ctx context.Context) error {
+	_, err := m.store.Checkpoint(ctx)
+	return err
+}
+
+// armExpiry schedules the next receipt pruning at the given expiry time. A
+// later time never replaces an earlier one that is already armed.
+func (m *maintenance) armExpiry(at int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.expiryAt != 0 && at >= m.expiryAt {
+		return
+	}
+	if m.expiryTimer != nil {
+		m.expiryTimer.Stop()
+	}
+	m.expiryAt = at
+	// A receipt is expired once its time is strictly in the past.
+	m.expiryTimer = time.AfterFunc(max(time.Until(time.Unix(at+1, 0)), 0), func() { m.request(workExpire) })
+}
+
+func (m *maintenance) expire(ctx context.Context) error {
+	m.mu.Lock()
+	m.expiryAt = 0
+	m.mu.Unlock()
+	for ctx.Err() == nil {
+		n, err := m.store.PruneExpiredReceipts(ctx, time.Now(), 256)
+		if err != nil {
+			return err
+		}
+		if n < 256 {
+			break
+		}
+	}
+	if at, ok := m.store.nextExpiry(ctx); ok {
+		m.armExpiry(at)
+	}
+	return nil
+}
+
+// nextExpiry reports the earliest receipt expiry, if any receipt exists.
+func (s *Store) nextExpiry(ctx context.Context) (int64, bool) {
+	var at sql.NullInt64
+	if err := s.rdb.QueryRowContext(ctx, "SELECT min(expires) FROM receipts").Scan(&at); err != nil || !at.Valid {
+		return 0, false
+	}
+	return at.Int64, true
+}
+
+// PruneExpiredReceipts deletes at most limit receipts that expired before the
+// given time and releases their quota counters. It is relaxed: losing a prune
+// to a power failure only repeats it.
 func (s *Store) PruneExpiredReceipts(ctx context.Context, before time.Time, limit int) (deleted int64, err error) {
 	defer func() { err = classify(err) }()
 	if limit < 1 || limit > 1000 || before.After(time.Now()) {
 		return 0, fail("invalid_argument", "bounded past-expiry maintenance required")
 	}
-	ctx, release, err := s.beginCall(ctx, true)
-	if err != nil {
-		return 0, err
-	}
-	defer release()
-	result, err := s.writer.ExecContext(ctx, "DELETE FROM receipts WHERE rowid IN (SELECT rowid FROM receipts WHERE expires<? ORDER BY expires LIMIT ?)", before.Unix(), limit)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected()
-}
-func (s *Store) Integrity(ctx context.Context) error {
-	ctx, release, e := s.beginCall(ctx, false)
-	if e != nil {
-		return classify(e)
-	}
-	defer release()
-	var result string
-	if e = s.reader.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); e != nil {
-		return classify(e)
-	}
-	if result != "ok" {
-		return fail("corrupt", result)
-	}
-	return nil
-}
-
-type BackupReceipt struct {
-	DatabaseID   string `json:"database_id"`
-	ManifestHash string `json:"manifest_hash"`
-	Bytes        int64  `json:"bytes"`
-	CreatedAt    string `json:"created_at"`
-}
-
-// Backup is an explicit administrative grant, never an ordinary data RPC.
-// The destination is no-overwrite and in an owned private directory.
-func (s *Store) Backup(ctx context.Context, destination string) (receipt BackupReceipt, err error) {
-	defer func() { err = classify(err) }()
-	if !filepath.IsAbs(destination) || filepath.Clean(destination) != destination || filepath.Ext(destination) != ".db" || strings.ContainsAny(destination, "\x00?#") {
-		return receipt, fail("invalid_argument", "canonical backup .db grant required")
-	}
-	ctx, release, err := s.beginCall(ctx, true)
-	if err != nil {
-		return receipt, err
-	}
-	defer release()
-	parent, e := openPrivateDirectory(filepath.Dir(destination))
-	if e != nil {
-		return receipt, e
-	}
-	defer unix.Close(parent)
-	if e = unix.Flock(parent, unix.LOCK_EX|unix.LOCK_NB); e != nil {
-		return receipt, fail("conflict", "backup directory is already owned")
-	}
-	defer unix.Flock(parent, unix.LOCK_UN)
-	// Duplicate the descriptor so os.File cannot close the grant's original fd.
-	dup, e := unix.Dup(parent)
-	if e != nil {
-		return receipt, e
-	}
-	dir := os.NewFile(uintptr(dup), fmt.Sprintf("/proc/self/fd/%d", parent))
-	defer dir.Close()
-	entries, e := dir.ReadDir(129)
-	if e != nil && e != io.EOF {
-		return receipt, e
-	}
-	if len(entries) >= 128 {
-		return receipt, fail("resource_exhausted", "backup directory count limit reached")
-	}
-	var total int64
-	for _, entry := range entries {
-		info, e := entry.Info()
-		if e != nil {
-			return receipt, e
-		}
-		if !info.Mode().IsRegular() {
-			return receipt, fail("permission_denied", "backup directory must contain regular outputs only")
-		}
-		total += info.Size()
-	}
-	if total >= 2*s.config.MaxDBBytes {
-		return receipt, fail("resource_exhausted", "backup directory byte limit reached")
-	}
-	if err = s.diskCheck(); err != nil {
-		return receipt, err
-	}
-	var pageCount, pageSize int64
-	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
-		return receipt, err
-	}
-	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
-		return receipt, err
-	}
-	var destinationFS unix.Statfs_t
-	if err = unix.Fstatfs(parent, &destinationFS); err != nil {
-		return receipt, err
-	}
-	if destinationFS.Bavail*uint64(destinationFS.Bsize) < uint64(pageCount*pageSize+s.config.MinFreeBytes) {
-		return receipt, fail("resource_exhausted", "backup destination free-space budget exhausted")
-	}
-	temp, e := os.CreateTemp(fmt.Sprintf("/proc/self/fd/%d", parent), ".storage-backup-*.db")
-	if e != nil {
-		return receipt, e
-	}
-	name := filepath.Base(temp.Name())
-	temp.Close()
-	unix.Unlinkat(parent, name, 0)
-	defer unix.Unlinkat(parent, name, 0)
-	tempPath := fmt.Sprintf("/proc/self/fd/%d/%s", parent, name)
-	if _, err = s.writer.ExecContext(ctx, "VACUUM INTO ?", tempPath); err != nil {
-		return receipt, err
-	}
-	fd, e := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if e != nil {
-		return receipt, e
-	}
-	defer unix.Close(fd)
-	var st unix.Stat_t
-	if e = unix.Fstat(fd, &st); e != nil {
-		return receipt, e
-	}
-	if st.Size > s.config.MaxDBBytes || total+st.Size > 2*s.config.MaxDBBytes {
-		return receipt, fail("resource_exhausted", "backup byte budget exceeded")
-	}
-	if e = unix.Fchmod(fd, 0600); e != nil {
-		return receipt, e
-	}
-	if e = unix.Fsync(fd); e != nil {
-		return receipt, e
-	}
-	candidate, e := sql.Open("sqlite", tempPath+"?mode=ro&immutable=1")
-	if e != nil {
-		return receipt, e
-	}
-	defer candidate.Close()
-	var result, id, digest string
-	if e = candidate.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result); e != nil || result != "ok" {
-		return receipt, fail("corrupt", "backup integrity check failed")
-	}
-	if e = candidate.QueryRowContext(ctx, "SELECT database_id,manifest_hash FROM storage_meta WHERE id=1").Scan(&id, &digest); e != nil || id != s.dbid || digest != hash(s.config.Manifest) {
-		return receipt, fail("failed_precondition", "backup identity mismatch")
-	}
-	if e = unix.Linkat(parent, name, parent, filepath.Base(destination), 0); e != nil {
-		return receipt, e
-	}
-	if e = unix.Unlinkat(parent, name, 0); e != nil {
-		return receipt, e
-	}
-	if e = unix.Fsync(parent); e != nil {
-		return receipt, e
-	}
-	receipt = BackupReceipt{DatabaseID: s.dbid, ManifestHash: digest, Bytes: st.Size, CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
-	return receipt, nil
-}
-func openPrivateDirectory(path string) (int, error) {
-	fd, e := unix.Open("/", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if e != nil {
-		return -1, e
-	}
-	for _, part := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
-		if part == "" {
-			continue
-		}
-		next, err := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		unix.Close(fd)
+	err = s.write(ctx, Relaxed, false, func(ctx context.Context, tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, "DELETE FROM receipts WHERE rowid IN (SELECT rowid FROM receipts WHERE expires<? ORDER BY expires LIMIT ?) RETURNING scope", before.Unix(), limit)
 		if err != nil {
-			return -1, err
+			return err
 		}
-		fd = next
+		perScope := map[string]int64{}
+		for rows.Next() {
+			var scope string
+			if err = rows.Scan(&scope); err != nil {
+				rows.Close()
+				return err
+			}
+			perScope[scope]++
+			deleted++
+		}
+		if err = errors.Join(rows.Err(), rows.Close()); err != nil {
+			return err
+		}
+		for scope, n := range perScope {
+			if _, err = tx.ExecContext(ctx, "UPDATE scopes SET receipts=max(receipts-?,0) WHERE scope=?", n, scope); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
-	var st unix.Stat_t
-	if e = unix.Fstat(fd, &st); e != nil || st.Uid != uint32(os.Geteuid()) || st.Mode&07777 != 0700 {
-		unix.Close(fd)
-		return -1, fail("permission_denied", "owned private directory required")
-	}
-	return fd, nil
-}
-
-// EncodeStats is useful for an explicit operator diagnostic, not DB access.
-func (s *Store) EncodeStats() ([]byte, error) {
-	stats, e := s.Stats()
-	if e != nil {
-		return nil, e
-	}
-	return json.Marshal(stats)
+	s.receiptsPruned.Add(uint64(deleted))
+	return deleted, nil
 }

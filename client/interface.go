@@ -13,13 +13,12 @@ type Interface interface {
 	Snapshot(context.Context, string, api.SnapshotRequest) (api.SnapshotResponse, error)
 	Batch(context.Context, api.BatchRequest) (api.Receipt, error)
 	Receipt(context.Context, string, api.ReceiptRequest) (api.Receipt, error)
-	Named(context.Context, api.NamedRequest) (api.NamedResponse, error)
-	NamedResult(context.Context, string, api.ReceiptRequest) (api.NamedResponse, error)
 }
 
-// ReadSnapshotClient is a local-only capability. Its callback borrows one
-// storage-owned read view; no transaction handle crosses the data port.
-// The remote Client deliberately does not implement this interface.
+// ReadSnapshotClient is a local-only capability. Its callback borrows a read
+// view that fences every read to one revision without holding a reader, so the
+// consumer may compute between reads. A write in between makes the next read
+// fail with a conflict. The remote Client deliberately does not implement it.
 type ReadSnapshotClient interface {
 	Interface
 	WithReadSnapshot(context.Context, func(context.Context) error) error
