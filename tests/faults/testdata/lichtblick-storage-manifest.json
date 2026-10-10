@@ -1,0 +1,14 @@
+{
+  "format": "storage-v1",
+  "namespaces": [{
+    "id": "lichtblick", "owner": "xgc2-lichtblick", "schema": "lichtblick.persistence.v1",
+    "max_scopes": 256, "max_receipts": 4096, "receipt_ttl_seconds": 604800,
+    "collections": [{
+      "id": "documents", "max_record_bytes": 2097152, "max_records": 4096,
+      "max_bytes": 134217728,
+      "indexes": [{ "id": "family", "fields": ["family"], "unique": false }],
+      "retention": "Saved user configuration/state/metadata is retained until explicit user deletion; tombstones preserve CAS, assets require explicit maintenance.",
+      "recovery": "Initialize the current schema explicitly through deployment. Restore saved current-schema user/workspace data through a consistent storage-v1 snapshot; commit layout and selected pointer in one CAS batch; resolve uncertain commits by durable receipt. No previous database, browser or datastore format is imported or read."
+    }]
+  }]
+}

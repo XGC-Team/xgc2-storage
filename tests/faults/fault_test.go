@@ -44,6 +44,9 @@ const grant = "fault-validation-only-0123456789abcdef"
 
 var scope = api.Scope{Namespace: "business", User: "test-user", Workspace: "test-workspace"}
 
+// daemonScope is the scope the daemon's owner grant admits.
+var daemonScope = scope
+
 func manifest() api.Manifest {
 	var collections []api.Collection
 	for _, id := range []string{"state", "events", "product_receipts", "layouts", "preferences", "configuration"} {
@@ -195,7 +198,7 @@ func configFiles(t *testing.T, dir string) {
 func configFilesFor(t *testing.T, dir string, m api.Manifest) {
 	t.Helper()
 	for name, value := range map[string]any{"manifest.json": m,
-		"grants.json": []server.Grant{{Token: grant, Namespace: scope.Namespace, User: scope.User, Workspace: scope.Workspace}}} {
+		"grants.json": []server.Grant{{Token: grant, Namespace: daemonScope.Namespace, User: daemonScope.User, Workspace: daemonScope.Workspace}}} {
 		raw, err := json.Marshal(value)
 		if err != nil {
 			t.Fatal(err)
@@ -898,6 +901,14 @@ func TestFaultChild(t *testing.T) {
 		if err := syscall.Exec(binary, append([]string{binary}, daemonArgs(dir, false)...), os.Environ()); err != nil {
 			t.Fatal(err)
 		}
+		return
+	}
+	if mode == "commits" {
+		commitsChild(t, dir)
+		return
+	}
+	if mode == "core" {
+		coreChild(t, dir)
 		return
 	}
 	if mode != "held" {
