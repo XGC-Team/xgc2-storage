@@ -3,6 +3,8 @@ package coredata
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -19,7 +21,7 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 	if len(r.State) == 0 && len(r.RunQueue) == 0 && len(r.Events) == 0 && r.Command == nil && r.Completion == nil {
 		return out, failure("invalid_argument", "nonempty execution data action required")
 	}
-	if len(r.RunQueue) > model.MaxExecutionStateMutations || len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
+	if len(r.RunQueue) > model.MaxExecutionStateMutations || len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.LifecycleGuards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
 		return out, failure("resource_exhausted", "execution data action count limit exceeded")
 	}
 	if err = checkSize(r); err != nil {
@@ -76,8 +78,11 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 			return out, readErr
 		}
 		if version != guard.Version {
-			return out, failure("conflict", "execution decision source changed")
+			return out, failure("conflict", fmt.Sprintf("execution decision source changed: collection=%s key=%s", guard.Collection, guard.Key))
 		}
+	}
+	if err = checkExecutionLifecycle(ctx, tx, scope, r.LifecycleGuards); err != nil {
+		return out, err
 	}
 	if err = checkCommandAbsence(ctx, tx, scope, r.CommandAbsenceGuards); err != nil {
 		return out, err
@@ -131,6 +136,48 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 	}
 	out.Events, err = appendExecutionEvents(ctx, tx, scope, r.Events)
 	return out, err
+}
+
+func checkExecutionLifecycle(ctx context.Context, tx *sql.Tx, scope string, guards []model.ExecutionLifecycleGuard) error {
+	type lifecycle struct {
+		status  sql.NullString
+		attempt sql.NullString
+	}
+	current := make(map[string]lifecycle, len(guards))
+	for _, guard := range guards {
+		if (guard.Collection != model.RunsCollection && guard.Collection != model.InvocationsCollection) || !textKey(guard.Key) || len(guard.Statuses) == 0 || len(guard.Statuses) > 10 || guard.ActiveAttemptID != "" && (guard.Collection != model.InvocationsCollection || !textKey(guard.ActiveAttemptID)) {
+			return failure("invalid_argument", "exact execution lifecycle predicate required")
+		}
+		statuses := make(map[string]bool, len(guard.Statuses))
+		for _, status := range guard.Statuses {
+			if !textKey(status) || statuses[status] {
+				return failure("invalid_argument", "unique nonempty lifecycle statuses required")
+			}
+			statuses[status] = true
+		}
+		key := guard.Collection + "\x00" + guard.Key
+		state, ok := current[key]
+		if !ok {
+			// The finite action and exact validated PK bound this owner-private
+			// read. A lifecycle decision does not need the record version/body.
+			var deleted bool
+			err := tx.QueryRowContext(ctx, "SELECT deleted,json_extract(data,'$.status'),json_extract(data,'$.activeAttemptId') FROM records WHERE scope=? AND collection=? AND key=?", scope, guard.Collection, guard.Key).Scan(&deleted, &state.status, &state.attempt)
+			if errors.Is(err, sql.ErrNoRows) {
+				return failure("conflict", fmt.Sprintf("execution lifecycle source missing: collection=%s key=%s", guard.Collection, guard.Key))
+			}
+			if err != nil {
+				return err
+			}
+			if deleted {
+				return failure("conflict", fmt.Sprintf("execution lifecycle source deleted: collection=%s key=%s", guard.Collection, guard.Key))
+			}
+			current[key] = state
+		}
+		if !state.status.Valid || !statuses[state.status.String] || guard.ActiveAttemptID != "" && (!state.attempt.Valid || state.attempt.String != guard.ActiveAttemptID) {
+			return failure("conflict", fmt.Sprintf("execution lifecycle changed: collection=%s key=%s", guard.Collection, guard.Key))
+		}
+	}
+	return nil
 }
 
 func executionGuardVersion(raw string) bool {

@@ -483,3 +483,67 @@ func TestEngineExecutionReadGuardsDoNotRereadHistoricBodies(t *testing.T) {
 		noExecutionReceipt(t, f, id)
 	}
 }
+
+func TestEngineExecutionLifecycleGuardsIgnoreMetadataAndFenceEligibility(t *testing.T) {
+	f := newExecutionFixture(t, "", 32)
+	committedExecution(t, f, "lifecycle-sources", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "runs", Key: "parent", ExpectedVersion: "0", Data: json.RawMessage(`{"name":"parent","status":"running","updatedAt":"old"}`)},
+		{Collection: "invocations", Key: "producer", ExpectedVersion: "0", Data: json.RawMessage(`{"name":"producer","status":"running","activeAttemptId":"attempt-1","lease":"old"}`)},
+	}})
+	guards := []model.ExecutionLifecycleGuard{
+		{Collection: "runs", Key: "parent", Statuses: []string{"running", "waiting"}},
+		{Collection: "invocations", Key: "producer", Statuses: []string{"running", "waiting"}, ActiveAttemptID: "attempt-1"},
+		// Nested preparations may carry the same source predicate again.
+		{Collection: "runs", Key: "parent", Statuses: []string{"running", "waiting"}},
+	}
+	_, progress := committedExecution(t, f, "lifecycle-metadata-progress", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "runs", Key: "parent", ExpectedVersion: "1", Data: json.RawMessage(`{"name":"parent","status":"waiting","updatedAt":"new","revision":100}`)},
+		{Collection: "invocations", Key: "producer", ExpectedVersion: "1", Data: json.RawMessage(`{"name":"producer","status":"waiting","activeAttemptId":"attempt-1","lease":"renewed","revision":100}`)},
+	}})
+	committedExecution(t, f, "lifecycle-eligible", model.ExecutionCommit{LifecycleGuards: guards,
+		State: []api.Mutation{{Collection: "tasks", Key: "accepted", ExpectedVersion: "0", Data: recordData("accepted")}},
+	})
+	versions := map[string]string{}
+	for _, record := range progress.State {
+		versions[record.Collection] = record.Version
+	}
+	reject := func(id string, guard []model.ExecutionLifecycleGuard, expected string) {
+		t.Helper()
+		before := executionCursor(t, f)
+		_, err := f.named(id, model.ExecutionCommitOperation, model.ExecutionCommit{LifecycleGuards: guard,
+			Command: commandFor(id), Events: []model.ExecutionEventInput{eventFor(id)},
+			State: []api.Mutation{{Collection: "tasks", Key: id, ExpectedVersion: "0", Data: recordData(id)}},
+		})
+		if executionErrorCode(err) != expected {
+			t.Fatalf("%s lifecycle guard: %v", id, err)
+		}
+		noExecutionReceipt(t, f, id)
+		if readCommandFact(t, f, id).Found || executionCursor(t, f) != before {
+			t.Fatal("rejected lifecycle decision left command/event facts")
+		}
+		rows, err := f.store.Snapshot(f.ctx, api.SnapshotRequest{Scope: f.scope, Queries: []api.Query{{Collection: "tasks", Keys: []string{id}}}})
+		if err != nil || !rows.Results[0].Records[0].Missing {
+			t.Fatalf("rejected lifecycle decision wrote state: %+v %v", rows, err)
+		}
+	}
+	committedExecution(t, f, "lifecycle-new-attempt", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "invocations", Key: "producer", ExpectedVersion: versions["invocations"], Data: json.RawMessage(`{"name":"producer","status":"waiting","activeAttemptId":"attempt-2"}`)},
+	}})
+	reject("old-attempt", guards, "conflict")
+	// An optional attempt fence is not invented for callers that only need state.
+	committedExecution(t, f, "lifecycle-state-only", model.ExecutionCommit{
+		LifecycleGuards: []model.ExecutionLifecycleGuard{{Collection: "invocations", Key: "producer", Statuses: []string{"waiting"}}},
+		State:           []api.Mutation{{Collection: "tasks", Key: "state-only", ExpectedVersion: "0", Data: recordData("state-only")}},
+	})
+	_, terminal := committedExecution(t, f, "lifecycle-terminal-parent", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "runs", Key: "parent", ExpectedVersion: versions["runs"], Data: json.RawMessage(`{"name":"parent","status":"failed"}`)},
+	}})
+	reject("terminal-parent", guards[:1], "conflict")
+	reject("missing-source", []model.ExecutionLifecycleGuard{{Collection: "runs", Key: "absent", Statuses: []string{"running"}}}, "conflict")
+	committedExecution(t, f, "lifecycle-delete-parent", model.ExecutionCommit{State: []api.Mutation{
+		{Collection: "runs", Key: "parent", ExpectedVersion: terminal.State[0].Version, Delete: true},
+	}})
+	reject("deleted-source", guards[:1], "conflict")
+	reject("wrong-collection", []model.ExecutionLifecycleGuard{{Collection: "tasks", Key: "accepted", Statuses: []string{"running"}}}, "invalid_argument")
+	reject("empty-predicate", []model.ExecutionLifecycleGuard{{Collection: "runs", Key: "parent"}}, "invalid_argument")
+}

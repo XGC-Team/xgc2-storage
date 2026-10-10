@@ -18,17 +18,27 @@ type CommandAbsenceGuard struct {
 	Statuses []string `json:"statuses"`
 }
 
+// ExecutionLifecycleGuard fences only the live eligibility used by a prepared
+// action. Unrelated lease, timestamp and record revision changes are irrelevant.
+type ExecutionLifecycleGuard struct {
+	Collection      string   `json:"collection"`
+	Key             string   `json:"key"`
+	Statuses        []string `json:"statuses"`
+	ActiveAttemptID string   `json:"active_attempt_id,omitempty"`
+}
+
 type ExecutionCommit struct {
-	RunQueue              []RunQueueMutation       `json:"run_queue,omitempty"`
-	CommandAbsenceGuards  []CommandAbsenceGuard    `json:"command_absence_guards,omitempty"`
-	CommandAcceptedAt     time.Time                `json:"command_accepted_at,omitempty"`
-	ConfigurationPins     []ConfigurationReference `json:"configuration_pins,omitempty"`
-	ConfigurationMainPins []ConfigurationMainPin   `json:"configuration_main_pins,omitempty"`
-	State                 []api.Mutation           `json:"state,omitempty"`
-	Guards                []RecordGuard            `json:"guards,omitempty"`
-	Events                []ExecutionEventInput    `json:"events,omitempty"`
-	Command               *CommandRequest          `json:"command,omitempty"`
-	Completion            *CommandCompletion       `json:"completion,omitempty"`
+	LifecycleGuards       []ExecutionLifecycleGuard `json:"lifecycle_guards,omitempty"`
+	RunQueue              []RunQueueMutation        `json:"run_queue,omitempty"`
+	CommandAbsenceGuards  []CommandAbsenceGuard     `json:"command_absence_guards,omitempty"`
+	CommandAcceptedAt     time.Time                 `json:"command_accepted_at,omitempty"`
+	ConfigurationPins     []ConfigurationReference  `json:"configuration_pins,omitempty"`
+	ConfigurationMainPins []ConfigurationMainPin    `json:"configuration_main_pins,omitempty"`
+	State                 []api.Mutation            `json:"state,omitempty"`
+	Guards                []RecordGuard             `json:"guards,omitempty"`
+	Events                []ExecutionEventInput     `json:"events,omitempty"`
+	Command               *CommandRequest           `json:"command,omitempty"`
+	Completion            *CommandCompletion        `json:"completion,omitempty"`
 }
 
 type CommandRequest struct {
