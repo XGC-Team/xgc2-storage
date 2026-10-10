@@ -21,7 +21,7 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 	if len(r.State) == 0 && len(r.RunQueue) == 0 && len(r.Events) == 0 && r.Command == nil && r.Completion == nil {
 		return out, failure("invalid_argument", "nonempty execution data action required")
 	}
-	if len(r.RunQueue) > model.MaxExecutionStateMutations || len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.LifecycleGuards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
+	if len(r.JobAdmissions) > model.MaxExecutionStateMutations || len(r.RunQueue) > model.MaxExecutionStateMutations || len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.LifecycleGuards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
 		return out, failure("resource_exhausted", "execution data action count limit exceeded")
 	}
 	if err = checkSize(r); err != nil {
@@ -94,6 +94,10 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 		return out, err
 	}
 	state, err := prepareRunQueue(ctx, tx, scope, r.State, r.RunQueue)
+	if err != nil {
+		return out, err
+	}
+	state, err = prepareJobCapacity(ctx, tx, scope, state, r.JobAdmissions)
 	if err != nil {
 		return out, err
 	}

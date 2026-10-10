@@ -28,6 +28,7 @@ type ExecutionLifecycleGuard struct {
 }
 
 type ExecutionCommit struct {
+	JobAdmissions         []JobAdmission            `json:"job_admissions,omitempty"`
 	LifecycleGuards       []ExecutionLifecycleGuard `json:"lifecycle_guards,omitempty"`
 	RunQueue              []RunQueueMutation        `json:"run_queue,omitempty"`
 	CommandAbsenceGuards  []CommandAbsenceGuard     `json:"command_absence_guards,omitempty"`
@@ -39,6 +40,14 @@ type ExecutionCommit struct {
 	Events                []ExecutionEventInput     `json:"events,omitempty"`
 	Command               *CommandRequest           `json:"command,omitempty"`
 	Completion            *CommandCompletion        `json:"completion,omitempty"`
+}
+
+// JobAdmission applies the caller's configured limits when a queued Job enters
+// the running set. Capacity is merged with its actual transition by the owner.
+type JobAdmission struct {
+	RunID        string `json:"run_id"`
+	GlobalLimit  int    `json:"global_limit,omitempty"`
+	PerKindLimit int    `json:"per_kind_limit,omitempty"`
 }
 
 type CommandRequest struct {
