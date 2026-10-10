@@ -8,3 +8,5 @@ __pycache__/
 /tests/faults/evidence/
 /.ci/
 !/modules/coredata/testdata/production/storage.db
+/xgc2-storage
+/storage-admin

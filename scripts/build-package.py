@@ -76,7 +76,7 @@ def main():
         (control / "control").write_text(
             f"Package: xgc2-storage\nVersion: {version}\nArchitecture: {args.architecture}\n"
             "Maintainer: XGC Team\nDepends: ca-certificates\nSection: utils\nPriority: optional\n"
-            "Description: Independent bounded XRPC SQLite owner\n"
+            "Description: Embeddable SQLite owner with an optional XRPC exposure\n"
         )
         receipt = {
             "format": "xgc2-storage-build-v1", "version": version,
