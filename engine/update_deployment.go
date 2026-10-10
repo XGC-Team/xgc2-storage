@@ -9,25 +9,25 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 )
 
-type ModuleUpdateReceipt struct {
+type DeploymentUpdateReceipt struct {
 	DatabaseID      string `json:"database_id"`
 	OldManifestHash string `json:"old_manifest_hash"`
 	ManifestHash    string `json:"manifest_hash"`
 }
 
-// UpdateModules explicitly accepts new implementations of the same deployed
-// module contracts. It requires the offline database owner grant and never
-// initializes modules, deploys declarations, or changes application data.
-func UpdateModules(ctx context.Context, path string, old, next api.Manifest, compiled []DataModule) (out ModuleUpdateReceipt, err error) {
+// UpdateDeployment is an explicit offline owner operation. Existing contracts
+// remain exact; only module implementation digests and newly declared empty
+// collections may change. It neither copies data nor initializes a schema.
+func UpdateDeployment(ctx context.Context, path string, old, next api.Manifest, compiled []DataModule) (out DeploymentUpdateReceipt, err error) {
 	defer func() { err = classify(err) }()
 	for _, manifest := range []api.Manifest{old, next} {
 		if err = ValidateManifest(manifest); err != nil {
 			return out, err
 		}
 	}
-	// Copies keep the exact input identities intact while comparing every field
-	// other than the implementation digests, including module order and bounds.
-	shape := func(manifest api.Manifest) api.Manifest {
+	// Compare the full deployment after removing only the allowed additions.
+	// Existing collection identity, indexes and budgets are never changed.
+	comparable := func(manifest api.Manifest) api.Manifest {
 		raw, _ := json.Marshal(manifest)
 		var copy api.Manifest
 		_ = json.Unmarshal(raw, &copy)
@@ -38,8 +38,31 @@ func UpdateModules(ctx context.Context, path string, old, next api.Manifest, com
 		}
 		return copy
 	}
-	if hash(shape(old)) != hash(shape(next)) {
-		return out, fail("failed_precondition", "module update may only change existing implementation digests")
+	oldShape, nextShape := comparable(old), comparable(next)
+	if len(oldShape.Namespaces) != len(nextShape.Namespaces) {
+		return out, fail("failed_precondition", "deployment update must preserve namespace contracts")
+	}
+	for i := range oldShape.Namespaces {
+		prior, candidate := &oldShape.Namespaces[i], &nextShape.Namespaces[i]
+		if prior.ID != candidate.ID {
+			return out, fail("failed_precondition", "deployment update must preserve namespace identity")
+		}
+		declared := make(map[string]api.Collection, len(candidate.Collections))
+		for _, collection := range candidate.Collections {
+			declared[collection.ID] = collection
+		}
+		retained := make([]api.Collection, 0, len(prior.Collections))
+		for _, collection := range prior.Collections {
+			current, ok := declared[collection.ID]
+			if !ok || hash(current) != hash(collection) {
+				return out, fail("failed_precondition", "deployment update cannot alter or remove an existing collection")
+			}
+			retained = append(retained, current)
+		}
+		candidate.Collections = retained
+	}
+	if hash(oldShape) != hash(nextShape) {
+		return out, fail("failed_precondition", "deployment update may only add collections or change compiled implementation digests")
 	}
 	registered := map[string]api.Module{}
 	for _, module := range compiled {
@@ -98,7 +121,7 @@ func UpdateModules(ctx context.Context, path string, old, next api.Manifest, com
 	if changed, e := result.RowsAffected(); e != nil {
 		return out, e
 	} else if changed != 1 {
-		return out, fail("conflict", "deployed manifest changed during module update")
+		return out, fail("conflict", "deployed manifest changed during owner update")
 	}
 	err = tx.Commit()
 	return out, err

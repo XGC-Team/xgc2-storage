@@ -62,12 +62,11 @@ build/xgc2-storage --db "$XGC_STORAGE_DATABASE_GRANT" \
 or listener. Deployment composition can combine these with the client product's
 compiled namespaces and domain declarations.
 
-For an implementation-only module update, stop the owner and explicitly run
-`xgc2-storage-admin update-modules --db "$XGC_STORAGE_DATABASE_GRANT" --old-manifest "$XGC_STORAGE_OLD_MANIFEST" --manifest "$XGC_STORAGE_MANIFEST"`.
-The old manifest must match the database exactly. The new manifest may change
-only existing module digests and must match the installed compiled modules;
-schemas, operations, budgets, collections and all other deployment facts stay
-identical. The owner lock and one metadata CAS preserve database identity, data
+For an explicit deployment update, stop the owner and explicitly run
+`xgc2-storage-admin update-deployment --db "$XGC_STORAGE_DATABASE_GRANT" --old-manifest "$XGC_STORAGE_OLD_MANIFEST" --manifest "$XGC_STORAGE_MANIFEST"`.
+The old manifest must match the database exactly. The new manifest may change existing module digests and add new empty collections.
+It must match the installed compiled modules; existing namespaces, schemas,
+operations, collection budgets and indexes remain identical. The owner lock and one metadata CAS preserve database identity, data
 and receipts. This command never runs module initialization or deployment.
 Ordinary startup still rejects every manifest mismatch.
 

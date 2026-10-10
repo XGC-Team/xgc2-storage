@@ -23,11 +23,11 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("storage-admin: check | stats | checkpoint | backup | prune-receipts | update-modules")
+		return errors.New("storage-admin: check | stats | checkpoint | backup | prune-receipts | update-deployment")
 	}
 	operation := os.Args[1]
 	switch operation {
-	case "check", "stats", "checkpoint", "backup", "prune-receipts", "update-modules":
+	case "check", "stats", "checkpoint", "backup", "prune-receipts", "update-deployment":
 	default:
 		return errors.New("storage-admin: unknown operation")
 	}
@@ -37,8 +37,8 @@ func run() error {
 	var maxDBBytes int64
 	flags.StringVar(&path, "db", "", "explicit offline database grant")
 	flags.Int64Var(&maxDBBytes, "max-db-bytes", 1<<30, "finite owner database capacity in bytes")
-	flags.StringVar(&manifest, "manifest", "", "exact deployed manifest or update-modules target")
-	flags.StringVar(&oldManifest, "old-manifest", "", "exact old manifest required by update-modules")
+	flags.StringVar(&manifest, "manifest", "", "exact deployed manifest or update-deployment target")
+	flags.StringVar(&oldManifest, "old-manifest", "", "exact old manifest required by update-deployment")
 	flags.StringVar(&destination, "destination", "", "absent backup destination in private managed directory")
 	flags.IntVar(&limit, "limit", 256, "bounded expired receipt cleanup count (1..1000)")
 	if e := flags.Parse(os.Args[2:]); e != nil {
@@ -50,8 +50,8 @@ func run() error {
 	if flags.NArg() != 0 {
 		return errors.New("storage-admin: unexpected positional arguments")
 	}
-	if (operation == "update-modules") != (oldManifest != "") {
-		return errors.New("storage-admin: --old-manifest is required only by update-modules")
+	if (operation == "update-deployment") != (oldManifest != "") {
+		return errors.New("storage-admin: --old-manifest is required only by update-deployment")
 	}
 	if operation == "backup" && (!filepath.IsAbs(destination) || filepath.Clean(destination) != destination || filepath.Ext(destination) != ".db" || strings.ContainsAny(destination, "\x00?#")) {
 		return errors.New("storage-admin: canonical absolute backup .db destination required")
@@ -70,7 +70,7 @@ func run() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if operation == "update-modules" {
+	if operation == "update-deployment" {
 		f, e := os.Open(oldManifest)
 		if e != nil {
 			return e
@@ -80,7 +80,7 @@ func run() error {
 		if e != nil {
 			return e
 		}
-		result, e := engine.UpdateModules(ctx, path, old, m, registry.Compiled())
+		result, e := engine.UpdateDeployment(ctx, path, old, m, registry.Compiled())
 		if e != nil {
 			return e
 		}

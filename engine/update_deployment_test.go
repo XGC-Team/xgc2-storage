@@ -12,7 +12,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 )
 
-func TestUpdateModulesPreservesDataAndRequiresExactContracts(t *testing.T) {
+func TestUpdateDeploymentPreservesDataAndRequiresExactContracts(t *testing.T) {
 	ctx := budget(t)
 	oldSpec := api.Module{ID: "fixture", Schema: "fixture.v1", Digest: hash("old implementation"), Operations: []api.NamedOperation{{ID: "put", MaxRequestBytes: 1024, MaxResponseBytes: 1024}}}
 	oldModule := DataModule{Spec: oldSpec, Initialize: func(ctx context.Context, tx *sql.Tx) error {
@@ -34,6 +34,9 @@ func TestUpdateModulesPreservesDataAndRequiresExactContracts(t *testing.T) {
 	}
 	next := clone(old)
 	next.Namespaces[0].Modules[0].Digest = hash("new implementation")
+	added := next.Namespaces[0].Collections[0]
+	added.ID = "new_owner_facts"
+	next.Namespaces[0].Collections = append(next.Namespaces[0].Collections, added)
 	newModule := oldModule
 	newModule.Spec = next.Namespaces[0].Modules[0]
 	dir := t.TempDir()
@@ -56,7 +59,7 @@ func TestUpdateModulesPreservesDataAndRequiresExactContracts(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := snapshot(t, s, ctx, "saved")
-	if _, err = UpdateModules(ctx, cfg.Path, old, next, []DataModule{newModule}); code(err) != "conflict" {
+	if _, err = UpdateDeployment(ctx, cfg.Path, old, next, []DataModule{newModule}); code(err) != "conflict" {
 		t.Fatalf("active owner not protected: %v", err)
 	}
 	if err = s.Close(); err != nil {
@@ -73,27 +76,28 @@ func TestUpdateModulesPreservesDataAndRequiresExactContracts(t *testing.T) {
 		func(m *api.Manifest) { m.Namespaces[0].Modules[0].Schema = "fixture.v2" },
 		func(m *api.Manifest) { m.Namespaces[0].Modules[0].Operations[0].ReadOnly = true },
 		func(m *api.Manifest) { m.Namespaces[0].Collections[0].MaxRecords++ },
+		func(m *api.Manifest) { m.Namespaces[0].Collections = m.Namespaces[0].Collections[1:] },
 	} {
 		bad := clone(next)
 		change(&bad)
-		if _, e := UpdateModules(ctx, cfg.Path, old, bad, []DataModule{newModule}); code(e) != "failed_precondition" {
+		if _, e := UpdateDeployment(ctx, cfg.Path, old, bad, []DataModule{newModule}); code(e) != "failed_precondition" {
 			t.Fatalf("changed contract accepted: %v", e)
 		}
 	}
 	bad := clone(next)
 	bad.Namespaces[0].Modules[0].Digest = hash("not compiled")
-	if _, e := UpdateModules(ctx, cfg.Path, old, bad, []DataModule{newModule}); code(e) != "failed_precondition" {
+	if _, e := UpdateDeployment(ctx, cfg.Path, old, bad, []DataModule{newModule}); code(e) != "failed_precondition" {
 		t.Fatalf("uncompiled digest accepted: %v", e)
 	}
 	wrongOld := clone(old)
 	wrongOld.Namespaces[0].Modules[0].Digest = hash("not deployed")
-	if _, e := UpdateModules(ctx, cfg.Path, wrongOld, next, []DataModule{newModule}); code(e) != "conflict" {
+	if _, e := UpdateDeployment(ctx, cfg.Path, wrongOld, next, []DataModule{newModule}); code(e) != "conflict" {
 		t.Fatalf("wrong old identity accepted: %v", e)
 	}
 	updateModule := newModule
 	updateModule.Initialize = func(context.Context, *sql.Tx) error { t.Fatal("update initialized module"); return nil }
 	updateModule.Deploy = func(context.Context, *sql.Tx) error { t.Fatal("update deployed module"); return nil }
-	updated, err := UpdateModules(ctx, cfg.Path, old, next, []DataModule{updateModule})
+	updated, err := UpdateDeployment(ctx, cfg.Path, old, next, []DataModule{updateModule})
 	if err != nil || updated.DatabaseID != before.Token.DatabaseID || updated.OldManifestHash != hash(old) || updated.ManifestHash != hash(next) {
 		t.Fatalf("update identity: %+v %v", updated, err)
 	}
@@ -119,4 +123,12 @@ func TestUpdateModulesPreservesDataAndRequiresExactContracts(t *testing.T) {
 	if err = s.reader.QueryRowContext(ctx, "SELECT value FROM module_data").Scan(&value); err != nil || value != "durable" {
 		t.Fatalf("module data changed: %q %v", value, err)
 	}
+	fresh, err := s.Snapshot(ctx, api.SnapshotRequest{Scope: testScope, Queries: []api.Query{{Collection: "new_owner_facts", Keys: []string{"first"}}}})
+	if err != nil || len(fresh.Results) != 1 || len(fresh.Results[0].Records) != 1 || !fresh.Results[0].Records[0].Missing {
+		t.Fatalf("new collection read: %+v %v", fresh, err)
+	}
+	if _, err = s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: fresh.Token, RequestID: "new-owner-first", Mutations: []api.Mutation{mutation("new_owner_facts", "first", "0", `{"name":"fresh"}`)}}); err != nil {
+		t.Fatal(err)
+	}
+
 }
