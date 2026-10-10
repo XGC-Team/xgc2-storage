@@ -25,8 +25,6 @@ import (
 const Schema = model.Schema
 const MaxRequestBytes = model.MaxRequestBytes
 const MaxResponseBytes = model.MaxResponseBytes
-const MaxMembers = model.MaxGroupMembers
-const MaxParameterBytes = model.MaxGroupParameterBytes
 const MaxCloneNamespaces = 1024
 const MaxCloneResources = 4096
 const MaxReferences = 16384
@@ -39,30 +37,18 @@ var SchemaSQL string
 // Digest the compiled data-module source, including DDL, without including
 // tests or deployment files. Engine registration rejects a differing module.
 //
-//go:embed model/workflow_records.go model/workflow_relations.go execution_reads.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go execution_run_queue.go execution_job_capacity.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go configuration_execution.go model/configuration_execution.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
+//go:embed module.go namespace.go schema.sql model/types.go model/digest.go model/contract.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
 var moduleSource embed.FS
 
 func Spec() api.Module {
 	h := sha256.New()
-	for _, path := range []string{"model/workflow_records.go", "model/workflow_relations.go", "execution_reads.go", "module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "execution_run_queue.go", "execution_job_capacity.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "configuration_metadata.go", "model/configuration_metadata.go", "configuration_execution.go", "model/configuration_execution.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go", "configuration_source.go", "configuration_clone.go", "model/configuration_clone.go", "configuration_incoming.go", "model/configuration_incoming.go"} {
+	for _, path := range []string{"module.go", "namespace.go", "schema.sql", "model/types.go", "model/digest.go", "model/contract.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "configuration_metadata.go", "model/configuration_metadata.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go", "configuration_source.go", "configuration_clone.go", "model/configuration_clone.go", "configuration_incoming.go", "model/configuration_incoming.go"} {
 		b, _ := moduleSource.ReadFile(path)
 		h.Write([]byte(path + "\x00"))
 		h.Write(b)
 	}
 	return api.Module{ID: model.Module, Schema: Schema, Digest: hex.EncodeToString(h.Sum(nil)), Operations: []api.NamedOperation{
-		{ID: model.GroupPrepareOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.GroupSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.GroupMemberSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.NamespaceCloneOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.NamespaceGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.NamespaceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommandListOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionJobEventPageOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommandGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionEventCursorOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionEventReadOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.SessionWorkflowLogSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationBranchCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationBranchArchiveOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
 		{ID: model.ConfigurationResourceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
@@ -89,14 +75,7 @@ func Spec() api.Module {
 // creation transaction. Existing databases are verified by the engine; no
 // compatibility detection, migration, aliases or IF NOT EXISTS are used here.
 func Initialize(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx, SchemaSQL); err != nil {
-		return err
-	}
-	identity, err := randomIdentity()
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO core_execution_identity VALUES(1,?)", identity)
+	_, err := tx.ExecContext(ctx, SchemaSQL)
 	return err
 }
 
@@ -107,6 +86,15 @@ func textKey(s string) bool {
 func positiveRevision(s string) bool {
 	v, err := strconv.ParseInt(s, 10, 64)
 	return err == nil && v > 0 && strconv.FormatInt(v, 10) == s
+}
+
+// sha256Hex reports whether value is a canonical lowercase SHA-256 digest.
+func sha256Hex(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 func object(raw json.RawMessage) bool {
 	return len(raw) > 0 && json.Valid(raw) && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{"))
@@ -164,70 +152,10 @@ func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.
 		var err error
 		var result any
 		switch operation {
-		case model.GroupPrepareOperation:
-			var r model.GroupPrepare
-			if err = decode(raw, &r); err == nil {
-				result, err = prepareGroup(ctx, tx, scope, r)
-			}
-		case model.GroupSnapshotOperation:
-			var r model.GroupRead
-			if err = decode(raw, &r); err == nil {
-				result, err = groupSnapshot(ctx, tx, scope, r)
-			}
-		case model.GroupMemberSnapshotOperation:
-			var r model.GroupMemberRead
-			if err = decode(raw, &r); err == nil {
-				result, err = groupMemberSnapshot(ctx, tx, scope, r)
-			}
-		case model.NamespaceCloneOperation:
-			var r model.NamespaceClone
-			if err = decode(raw, &r); err == nil {
-				result, err = cloneNamespace(ctx, tx, scope, r)
-			}
 		case model.NamespaceSnapshotOperation:
 			var r model.NamespaceRead
 			if err = decode(raw, &r); err == nil {
 				result, err = namespaceSnapshot(ctx, tx, scope, r)
-			}
-		case model.NamespaceGetOperation:
-			var r model.NamespaceRead
-			if err = decode(raw, &r); err == nil {
-				result, err = namespaceGet(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommitOperation:
-			var r model.ExecutionCommit
-			if err = decode(raw, &r); err == nil {
-				result, err = commitExecution(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommandListOperation:
-			var r model.CommandListRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionCommands(ctx, tx, scope, r)
-			}
-		case model.ExecutionJobEventPageOperation:
-			var r model.JobEventPageRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionEventPage(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommandGetOperation:
-			var r model.CommandRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readCommand(ctx, tx, scope, r)
-			}
-		case model.ExecutionEventCursorOperation:
-			var r struct{}
-			if err = decode(raw, &r); err == nil {
-				result, err = eventCursor(ctx, tx, scope)
-			}
-		case model.ExecutionEventReadOperation:
-			var r model.EventRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionEvents(ctx, tx, scope, r)
-			}
-		case model.SessionWorkflowLogSnapshotOperation:
-			var r model.SessionWorkflowLogRead
-			if err = decode(raw, &r); err == nil {
-				result, err = sessionWorkflowLogSnapshot(ctx, tx, scope, r)
 			}
 		case model.ConfigurationBranchCreateOperation:
 			var r model.ConfigurationBranchCreate

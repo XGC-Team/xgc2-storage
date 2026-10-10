@@ -8,7 +8,7 @@ import (
 
 func configurationSource(ctx context.Context, tx *sql.Tx, scope, domain string, p model.ConfigurationSourcePin) (model.ConfigurationResourceSnapshot, error) {
 	var zero model.ConfigurationResourceSnapshot
-	if !positiveRevision(p.ExpectedResourceRevision) || !canonicalSessionPin(p.ContentDigest) {
+	if !positiveRevision(p.ExpectedResourceRevision) || !sha256Hex(p.ContentDigest) {
 		return zero, failure("invalid_argument", "exact source resource/content pin required")
 	}
 	r, err := configurationResource(ctx, tx, scope, domain, p.ResourceID, false)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -109,7 +110,27 @@ func openConfigurationNamedBranch(t *testing.T, branch string, late bool) *confi
 	return f
 }
 func (f *configNamedFixture) named(op, id string, q any) (api.NamedResponse, error) {
-	return f.store.Named(f.ctx, api.NamedRequest{Scope: f.scope, DatabaseID: f.token.DatabaseID, Schema: coredata.Schema, Module: coredata.Spec().ID, Operation: op, RequestID: id, Payload: sessionWire(q)})
+	return f.store.Named(f.ctx, api.NamedRequest{Scope: f.scope, DatabaseID: f.token.DatabaseID, Schema: coredata.Schema, Module: coredata.Spec().ID, Operation: op, RequestID: id, Payload: wire(q)})
+}
+func wire(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+func errCode(err error) string {
+	var e *api.Error
+	if errors.As(err, &e) {
+		return e.Code
+	}
+	return ""
+}
+func requireCode(t *testing.T, err error, code string) {
+	t.Helper()
+	if got := errCode(err); got != code {
+		t.Fatalf("expected %s, got %v", code, err)
+	}
 }
 func configPrepared(t *testing.T, id, tag string, before []byte) model.PreparedConfigurationSnapshot {
 	t.Helper()
@@ -182,9 +203,9 @@ func TestConfigurationNamedCanonicalBranchSelector(t *testing.T) {
 		t.Fatal("canonical selector did not identify display branch")
 	}
 	_, e = f.named(model.ResourceSnapshotOperation, "display-rejected", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: create.ResourceID, Branch: display})
-	requireSessionCode(t, e, "invalid_argument")
+	requireCode(t, e, "invalid_argument")
 	_, e = f.named(model.ResourceSnapshotOperation, "id-rejected", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: create.ResourceID, Branch: selected.Head.Branch.ID})
-	requireSessionCode(t, e, "not_found")
+	requireCode(t, e, "not_found")
 	noop := configCommit(t, f, selected, "review-noop", "a")
 	r, e = f.named(model.ResourceCommitOperation, "review-noop", noop)
 	result := configResult(t, r, e)
@@ -253,7 +274,7 @@ func TestConfigurationNamedSharedHeadTrackingBranchBlocksRemoval(t *testing.T) {
 	}
 	persisted := state()
 	r, e = f.named(model.ResourceCommitOperation, "remove-x", q)
-	requireSessionCode(t, e, "failed_precondition")
+	requireCode(t, e, "failed_precondition")
 	if r.Receipt != nil || state() != persisted {
 		t.Fatal("inherited live-source rejection left rows, receipts or quota")
 	}
@@ -290,20 +311,20 @@ func TestConfigurationNamedConcurrentProductReceiptAndRestartTTL(t *testing.T) {
 		loser = "loser"
 	}
 	_, e := f.named(model.ResourceSnapshotOperation, "loser-read", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: loser, Branch: "main"})
-	requireSessionCode(t, e, "not_found")
+	requireCode(t, e, "not_found")
 	// A repeated transport identity with changed full bytes is still an outer
 	// conflict, even though the product intent is the same.
 	changed := requests[0]
 	changed.CommitID = "different-allocated-id"
 	_, e = f.named(model.ResourceCreateOperation, "attempt-0", changed)
-	requireSessionCode(t, e, "conflict")
+	requireCode(t, e, "conflict")
 	time.Sleep(2100 * time.Millisecond)
 	n, e := f.store.PruneExpiredReceipts(f.ctx, time.Now(), 100)
 	if e != nil || n != 2 {
 		t.Fatalf("prune=%d %v", n, e)
 	}
 	_, e = f.store.Receipt(f.ctx, api.ReceiptRequest{Scope: f.scope, RequestID: "attempt-0"})
-	requireSessionCode(t, e, "not_found")
+	requireCode(t, e, "not_found")
 	if e = f.store.Close(); e != nil {
 		t.Fatal(e)
 	}
@@ -339,7 +360,7 @@ func TestConfigurationNamedLocalCASBranchesAndVisibilityFence(t *testing.T) {
 	r, e = f.named(model.ResourceCommitOperation, "main-write", q1)
 	first := configResult(t, r, e)
 	_, e = f.named(model.ResourceCommitOperation, "stale-dev", q2)
-	requireSessionCode(t, e, "conflict")
+	requireCode(t, e, "conflict")
 	freshDev := f.read(t, "resource", "dev", "")
 	q2 = configCommit(t, f, freshDev, "dev-write", "c")
 	r, e = f.named(model.ResourceCommitOperation, "fresh-dev", q2)
@@ -378,7 +399,7 @@ func TestConfigurationNamedLocalCASBranchesAndVisibilityFence(t *testing.T) {
 			configResult(t, out[i], e)
 			wins++
 		} else {
-			requireSessionCode(t, e, "conflict")
+			requireCode(t, e, "conflict")
 			receipt, e := f.named(model.ConfigurationReceiptOperation, "loser-receipt", model.ConfigurationReceipt{Domain: f.domain, Key: qs[i].Mutation.Key, IntentDigest: qs[i].Mutation.IntentDigest, Operations: []string{model.ResourceCommitOperation}})
 			if e != nil {
 				t.Fatal(e)
@@ -402,7 +423,7 @@ func TestConfigurationNamedOuterResultFailureRollsBackProduct(t *testing.T) {
 		t.Fatal("late outer result fault succeeded")
 	}
 	_, e = f.store.Receipt(f.ctx, api.ReceiptRequest{Scope: f.scope, RequestID: "late-transport"})
-	requireSessionCode(t, e, "not_found")
+	requireCode(t, e, "not_found")
 	r, e := f.named(model.ConfigurationReceiptOperation, "read-product", model.ConfigurationReceipt{Domain: f.domain, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
 	if e != nil {
 		t.Fatal(e)
@@ -413,7 +434,7 @@ func TestConfigurationNamedOuterResultFailureRollsBackProduct(t *testing.T) {
 		t.Fatal("product survived failed outer commit")
 	}
 	_, e = f.named(model.ResourceSnapshotOperation, "read-resource", model.ConfigurationResourceRead{Domain: f.domain, ResourceID: q.ResourceID, Branch: "main"})
-	requireSessionCode(t, e, "not_found")
+	requireCode(t, e, "not_found")
 	r, e = f.named(model.ResourceCreateOperation, "fresh-attempt", q)
 	out := configResult(t, r, e)
 	if out.Result.Head.Commit.Version != "1" || out.Result.Head.Resource.NextVersion != "2" {
@@ -452,7 +473,7 @@ func TestConfigurationNamedBranchAndArchiveLifecycle(t *testing.T) {
 	guard := model.ConfigurationBranchGuard{ID: branch.Head.Branch.ID, ExpectedRevision: branch.Head.Branch.Revision, CommitID: branch.Head.Commit.ID, ContentDigest: branch.Head.Commit.ContentDigest}
 	archive := model.ConfigurationBranchArchive{Domain: f.domain, Mutation: meta("archive-branch"), ResourceID: "target", Main: main.CurrentMain.Branch, Branch: guard}
 	_, e = f.named(model.ConfigurationBranchArchiveOperation, "branch-blocked", archive)
-	if executionErrorCode(e) != "failed_precondition" {
+	if errCode(e) != "failed_precondition" {
 		t.Fatalf("tracking branch archive: %v", e)
 	}
 	current := f.read(t, "linked", "main", "")
@@ -481,7 +502,7 @@ func TestConfigurationNamedBranchAndArchiveLifecycle(t *testing.T) {
 	state.Archived = false
 	state.Mutation = meta("restore-linked")
 	_, e = f.named(model.ConfigurationResourceStateOperation, "linked-restore-blocked", state)
-	if executionErrorCode(e) != "not_found" {
+	if errCode(e) != "not_found" {
 		t.Fatalf("restore with archived target: %v", e)
 	}
 	targetState.ExpectedRevision = archivedTarget.Result.Head.Resource.Revision

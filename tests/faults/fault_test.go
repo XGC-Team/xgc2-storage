@@ -943,14 +943,6 @@ func TestFaultChild(t *testing.T) {
 	if dir == "" || !filepath.IsAbs(dir) {
 		t.Fatal("private fixture directory required")
 	}
-	if mode == "group-uncommitted" {
-		uncommittedGroupChild(t, dir)
-		return
-	}
-	if mode == "namespace-uncommitted" {
-		uncommittedNamespaceChild(t, dir)
-		return
-	}
 	if mode == "physical-full" {
 		s := open(t, filepath.Join(dir, "fixture.db"), true, func(c *engine.Config) { c.MinFreeBytes = 1 << 20 })
 		seed := request(read(t, s).Token, "physical-source")

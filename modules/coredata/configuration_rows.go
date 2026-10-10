@@ -82,7 +82,7 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	if !branchResource.Valid || branchResource.String != row.ResourceID {
 		return out, failure("data_loss", "immutable snapshot branch belongs to another resource")
 	}
-	if json.Unmarshal(body, &out.Head.Commit) != nil || out.Head.Commit.ID != row.ID || out.Head.Commit.ResourceID != row.ResourceID || out.Head.Commit.BranchID != row.BranchID || out.Head.Commit.Version != row.Version || out.Head.Commit.SourceCommitID != row.SourceCommitID || out.Head.Commit.ContentDigest != row.ContentDigest || !positiveRevision(row.Version) || out.Head.Commit.SchemaVersion < 1 || !canonicalSessionPin(out.Head.Commit.RootDigest) {
+	if json.Unmarshal(body, &out.Head.Commit) != nil || out.Head.Commit.ID != row.ID || out.Head.Commit.ResourceID != row.ResourceID || out.Head.Commit.BranchID != row.BranchID || out.Head.Commit.Version != row.Version || out.Head.Commit.SourceCommitID != row.SourceCommitID || out.Head.Commit.ContentDigest != row.ContentDigest || !positiveRevision(row.Version) || out.Head.Commit.SchemaVersion < 1 || !sha256Hex(out.Head.Commit.RootDigest) {
 		return out, failure("data_loss", "immutable commit metadata disagrees")
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT slot,target_domain,target_resource_id,target_commit_id,body FROM core_references WHERE scope=? AND domain=? AND commit_id=? ORDER BY slot LIMIT 4097", scope, domain, id)
@@ -185,7 +185,7 @@ func configurationCurrentMain(ctx context.Context, tx *sql.Tx, scope, domain str
 			return out, failure("data_loss", "invalid bounded current-main identity projection")
 		}
 	}
-	if commit.ID != r.MainCommitID || commit.ResourceID != r.ID || commit.BranchID != b.ID || commit.SchemaVersion < 1 || !canonicalSessionPin(commit.ContentDigest) {
+	if commit.ID != r.MainCommitID || commit.ResourceID != r.ID || commit.BranchID != b.ID || commit.SchemaVersion < 1 || !sha256Hex(commit.ContentDigest) {
 		return out, failure("data_loss", "current main metadata disagrees")
 	}
 	if identity == nil {
@@ -332,7 +332,7 @@ func configurationNamespaceGuard(ctx context.Context, tx *sql.Tx, scope, domain 
 	return err
 }
 func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationReceipt) (out model.ConfigurationMutationResult, err error) {
-	if !textKey(q.Domain.Key) || !textKey(q.Domain.SchemaIdentity) || q.Domain.SchemaVersion < 1 || !canonicalSessionPin(q.Domain.RegistryDigest) || !textKey(q.Key) || !canonicalSessionPin(q.IntentDigest) || len(q.Operations) < 1 || len(q.Operations) > 2 {
+	if !textKey(q.Domain.Key) || !textKey(q.Domain.SchemaIdentity) || q.Domain.SchemaVersion < 1 || !sha256Hex(q.Domain.RegistryDigest) || !textKey(q.Key) || !sha256Hex(q.IntentDigest) || len(q.Operations) < 1 || len(q.Operations) > 2 {
 		return out, failure("invalid_argument", "product receipt identity/allowed operation required")
 	}
 	for i, op := range q.Operations {

@@ -208,7 +208,7 @@ func TestQueueBoundAndCancellation(t *testing.T) {
 		s.writers <- struct{}{}
 	}
 	_, e = s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "overflow", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}})
-	if code(e) != "resource_exhausted" {
+	if code(e) != "unavailable" {
 		t.Fatalf("overflow %v", e)
 	}
 	for i := 0; i < cap(s.writers); i++ {

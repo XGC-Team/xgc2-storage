@@ -21,7 +21,7 @@ func DeclareConfigurationDomains(ctx context.Context, tx *sql.Tx, domains []mode
 	return atomicData(ctx, tx, func() error {
 		seen := map[string]bool{}
 		for _, d := range domains {
-			if !textKey(d.Key) || !textKey(d.SchemaIdentity) || d.SchemaVersion < 1 || !canonicalSessionPin(d.RegistryDigest) || len(d.Capabilities) > 64 || seen[d.Key] {
+			if !textKey(d.Key) || !textKey(d.SchemaIdentity) || d.SchemaVersion < 1 || !sha256Hex(d.RegistryDigest) || len(d.Capabilities) > 64 || seen[d.Key] {
 				return failure("invalid_argument", "invalid domain declaration")
 			}
 			seen[d.Key] = true
@@ -65,7 +65,7 @@ func DeclareConfigurationDomains(ctx context.Context, tx *sql.Tx, domains []mode
 
 func configurationDomain(ctx context.Context, tx *sql.Tx, d model.ConfigurationDomainGuard) (model.ConfigurationDomainDeclaration, error) {
 	out := model.ConfigurationDomainDeclaration{Key: d.Key}
-	if !textKey(d.Key) || !textKey(d.SchemaIdentity) || d.SchemaVersion < 1 || !canonicalSessionPin(d.RegistryDigest) {
+	if !textKey(d.Key) || !textKey(d.SchemaIdentity) || d.SchemaVersion < 1 || !sha256Hex(d.RegistryDigest) {
 		return out, failure("invalid_argument", "invalid domain guard")
 	}
 	var caps []byte

@@ -85,7 +85,7 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 			}
 			defer tx.Rollback()
 		}
-		out.Result, err = s.executeModule(ctx, tx, id, n, module, operation, 0, r.Payload)
+		out.Result, err = module.Execute(ctx, tx, id, operation.ID, r.Payload)
 		if err != nil {
 			return out, err
 		}
@@ -168,7 +168,7 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 	if count >= n.MaxReceipts {
 		return out, fail("resource_exhausted", "named receipt quota reached")
 	}
-	out.Result, err = s.executeModule(ctx, tx, id, n, module, operation, rev+1, r.Payload)
+	out.Result, err = module.Execute(ctx, tx, id, operation.ID, r.Payload)
 	if err != nil {
 		return out, err
 	}

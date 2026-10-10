@@ -4,10 +4,8 @@ import (
 	"context"
 	"database/sql"
 
-	"errors"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"strconv"
-	"strings"
 )
 
 // The recursive limit stops expansion as well as bounding the output. UNION
@@ -20,21 +18,6 @@ const treeSQL = `WITH RECURSIVE tree(id) AS (
 
 func treeArgs(scope string, r model.NamespaceRead) []any {
 	return []any{scope, r.Domain, r.ID, scope, r.Domain}
-}
-
-// A destination parent need not fit inside a complete subtree snapshot. Return
-// only its metadata and exact revision, without loading descendant payloads.
-func namespaceGet(ctx context.Context, tx *sql.Tx, scope string, r model.NamespaceRead) (out model.NamespaceRow, err error) {
-	if !textKey(r.Domain) || !textKey(r.ID) {
-		return out, failure("invalid_argument", "domain and namespace identity required")
-	}
-	var body []byte
-	err = tx.QueryRowContext(ctx, "SELECT id,coalesce(parent_id,''),name,name_key,revision,body FROM core_namespaces WHERE scope=? AND domain=? AND id=? AND archived=0", scope, r.Domain, r.ID).Scan(&out.ID, &out.ParentID, &out.Name, &out.NameKey, &out.Revision, &body)
-	if errors.Is(err, sql.ErrNoRows) {
-		return out, failure("not_found", "live namespace not found")
-	}
-	out.Body = body
-	return out, err
 }
 
 func readNamespaces(ctx context.Context, tx *sql.Tx, scope string, r model.NamespaceRead) (out []model.NamespaceRow, err error) {
@@ -179,157 +162,4 @@ func namespaceSnapshot(ctx context.Context, tx *sql.Tx, scope string, r model.Na
 		}
 	}
 	return out, nil
-}
-
-func cloneNamespace(ctx context.Context, tx *sql.Tx, scope string, r model.NamespaceClone) (out model.NamespaceCloned, err error) {
-	if err = checkSize(r); err != nil {
-		return out, err
-	}
-	if !textKey(r.Domain) || !textKey(r.SourceID) || !textKey(r.TargetID) || model.ValidateConfigurationName(model.ConfigurationNamespaceName, r.Name) != nil || model.ValidateConfigurationName(model.ConfigurationNamespaceName, r.NameKey) != nil || strings.TrimSpace(r.Name) != r.Name || strings.TrimSpace(r.NameKey) != r.NameKey || strings.ContainsAny(r.Name+r.NameKey, "\r\n") || !positiveRevision(r.ExpectedRevision) || !textKey(r.ChangeID) || !object(r.Change) || len(r.Namespaces) > MaxCloneNamespaces || len(r.Resources) > MaxCloneResources {
-		return out, failure("invalid_argument", "invalid namespace clone identity or bounds")
-	}
-	if r.TargetParentID == "" {
-		if r.ExpectedTargetParentRevision != "0" {
-			return out, failure("invalid_argument", "root target has no parent revision")
-		}
-	} else {
-		if !textKey(r.TargetParentID) || !positiveRevision(r.ExpectedTargetParentRevision) {
-			return out, failure("invalid_argument", "target parent guard required")
-		}
-		var revision string
-		err = tx.QueryRowContext(ctx, "SELECT revision FROM core_namespaces WHERE scope=? AND domain=? AND id=? AND archived=0", scope, r.Domain, r.TargetParentID).Scan(&revision)
-		if errors.Is(err, sql.ErrNoRows) || err == nil && revision != r.ExpectedTargetParentRevision {
-			return out, failure("conflict", "target parent changed")
-		}
-		if err != nil {
-			return out, err
-		}
-	}
-	namespaces, err := readNamespaces(ctx, tx, scope, model.NamespaceRead{r.Domain, r.SourceID})
-	if err != nil {
-		return out, err
-	}
-	resources, err := readResources(ctx, tx, scope, model.NamespaceRead{r.Domain, r.SourceID}, false)
-	if err != nil {
-		return out, err
-	}
-	if len(namespaces) != len(r.Namespaces) || len(resources) != len(r.Resources) {
-		return out, failure("conflict", "clone plan does not cover the current complete subtree")
-	}
-	namespacePlans := map[string]model.NamespaceCopy{}
-	targets := map[string]bool{}
-	for _, p := range r.Namespaces {
-		if !textKey(p.SourceID) || !textKey(p.TargetID) || !positiveRevision(p.ExpectedRevision) || !object(p.Body) || namespacePlans[p.SourceID].SourceID != "" || targets[p.TargetID] {
-			return out, failure("invalid_argument", "invalid namespace mapping")
-		}
-		namespacePlans[p.SourceID] = p
-		targets[p.TargetID] = true
-	}
-	for _, n := range namespaces {
-		p, ok := namespacePlans[n.ID]
-		if !ok || p.ExpectedRevision != n.Revision || n.ID == r.SourceID && (n.Revision != r.ExpectedRevision || p.TargetID != r.TargetID) {
-			return out, failure("conflict", "source namespace changed or mapping incomplete")
-		}
-	}
-	resourcePlans := map[string]model.ResourceCopy{}
-	contentDigests := map[string]string{}
-	references := 0
-	for _, p := range r.Resources {
-		if !textKey(p.SourceID) || !textKey(p.TargetID) || !textKey(p.TargetBranchID) || !textKey(p.TargetCommitID) || !positiveRevision(p.ExpectedRevision) || !positiveRevision(p.ExpectedBranchRevision) || !object(p.Body) || !object(p.BranchBody) || !object(p.CommitBody) || !object(p.Payload) || !object(p.Manifest) || resourcePlans[p.SourceID].SourceID != "" {
-			return out, failure("invalid_argument", "invalid resource clone data")
-		}
-		for _, id := range []string{p.TargetID, p.TargetBranchID, p.TargetCommitID} {
-			if targets[id] {
-				return out, failure("invalid_argument", "duplicate target identity")
-			}
-			targets[id] = true
-		}
-		slots := map[string]bool{}
-		for _, f := range p.References {
-			if !textKey(f.Slot) || !textKey(f.TargetDomain) || !textKey(f.TargetResourceID) || f.TargetCommitID != "" && !textKey(f.TargetCommitID) || !object(f.Body) || slots[f.Slot] {
-				return out, failure("invalid_argument", "invalid reference data")
-			}
-			slots[f.Slot] = true
-		}
-		pin, e := model.SnapshotDigest(p.Payload, p.Manifest, p.References)
-		if e != nil {
-			return out, failure("invalid_argument", e.Error())
-		}
-		contentDigests[p.SourceID] = pin
-		references += len(p.References)
-		resourcePlans[p.SourceID] = p
-	}
-	if references > MaxReferences {
-		return out, failure("resource_exhausted", "clone reference count exceeded")
-	}
-	for _, v := range resources {
-		p, ok := resourcePlans[v.ID]
-		if !ok || p.ExpectedRevision != v.Revision || p.ExpectedBranchRevision != v.BranchRevision || p.SourceCommitID != v.CommitID || p.SourceContentDigest != v.ContentDigest {
-			return out, failure("conflict", "source current main snapshot changed")
-		}
-	}
-	encoded, _ := encode(r)
-	rowCount := len(namespaces) + 3*len(resources) + references + 1
-	if err = reserve(ctx, tx, scope, int64(rowCount), int64(len(encoded)+1024*rowCount)); err != nil {
-		return out, err
-	}
-	// Insert in dependency order, without recursion on the Go stack. The
-	// original read set was fully materialized before any target becomes visible.
-	children := map[string][]model.NamespaceRow{}
-	var root model.NamespaceRow
-	for _, n := range namespaces {
-		if n.ID == r.SourceID {
-			root = n
-		} else {
-			children[n.ParentID] = append(children[n.ParentID], n)
-		}
-	}
-	queue := []model.NamespaceRow{root}
-	visited := map[string]bool{}
-	for i := 0; i < len(queue); i++ {
-		n := queue[i]
-		if n.ID == "" || visited[n.ID] {
-			return out, failure("failed_precondition", "source namespace cycle")
-		}
-		visited[n.ID] = true
-		p := namespacePlans[n.ID]
-		parent, name, nameKey := r.TargetParentID, r.Name, r.NameKey
-		if n.ID != r.SourceID {
-			parent = namespacePlans[n.ParentID].TargetID
-			name, nameKey = n.Name, n.NameKey
-		}
-		var parentValue any
-		if parent != "" {
-			parentValue = parent
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO core_namespaces VALUES(?,?,?,?,?,?,1,0,?)", scope, r.Domain, p.TargetID, parentValue, name, nameKey, []byte(p.Body)); err != nil {
-			return out, err
-		}
-		queue = append(queue, children[n.ID]...)
-	}
-	if len(visited) != len(namespaces) {
-		return out, failure("failed_precondition", "source namespace topology is incomplete")
-	}
-	for _, v := range resources {
-		p := resourcePlans[v.ID]
-		if _, err = tx.ExecContext(ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,1,?,0,?,?,?)", scope, r.Domain, p.TargetID, namespacePlans[v.NamespaceID].TargetID, v.Name, v.NameKey, p.TargetCommitID, v.ID, v.CommitID, []byte(p.Body)); err != nil {
-			return out, err
-		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO core_branches VALUES(?,?,?,?, 'main',?,1,?)", scope, r.Domain, p.TargetBranchID, p.TargetID, p.TargetCommitID, []byte(p.BranchBody)); err != nil {
-			return out, err
-		}
-		contentDigest := contentDigests[v.ID]
-		if _, err = tx.ExecContext(ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,1,?,?,?,?,?)", scope, r.Domain, p.TargetCommitID, p.TargetID, p.TargetBranchID, v.CommitID, contentDigest, []byte(p.Payload), []byte(p.Manifest), []byte(p.CommitBody)); err != nil {
-			return out, err
-		}
-		for _, f := range p.References {
-			if _, err = tx.ExecContext(ctx, "INSERT INTO core_references VALUES(?,?,?,?,?,?,?,?)", scope, r.Domain, p.TargetCommitID, f.Slot, f.TargetDomain, f.TargetResourceID, f.TargetCommitID, []byte(f.Body)); err != nil {
-				return out, err
-			}
-		}
-	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO core_changes VALUES(?,?,?,?,?)", scope, r.ChangeID, r.Domain, r.TargetID, []byte(r.Change)); err != nil {
-		return out, err
-	}
-	return model.NamespaceCloned{r.TargetID, len(namespaces), len(resources)}, nil
 }
