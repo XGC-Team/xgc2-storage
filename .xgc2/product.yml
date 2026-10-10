@@ -1,7 +1,7 @@
 schema: xgc2.product.v1
 id: xgc2-storage
 name: XGC2 Storage
-version: 0.1.0-11
+version: 0.1.0-12
 kind: toolchain-apt
 summary: Independent bounded SQLite owner with XRPC data transactions and durable receipts.
 apt:
@@ -33,6 +33,6 @@ release:
   requires: []
   dependency_policy: {}
   apt_versions:
-    focal: 0.1.0-11~focal
-    jammy: 0.1.0-11~jammy
-    noble: 0.1.0-11~noble
+    focal: 0.1.0-12~focal
+    jammy: 0.1.0-12~jammy
+    noble: 0.1.0-12~noble

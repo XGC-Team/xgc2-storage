@@ -78,10 +78,23 @@ func prepareMutations(ctx context.Context, n api.Namespace, mutations []api.Muta
 func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next int64, prepared preparedMutations) ([]api.Record, error) {
 	var err error
 	versions := make([]api.Record, 0, len(prepared.mutations))
-	// Remove all old indexes first, permitting valid swaps in an atomic batch.
-	for _, m := range prepared.mutations {
+	type previousRecord struct {
+		version, bytes int64
+	}
+	type lookupChange struct {
+		index, tuple string
+		unique       any
+	}
+	previous := make([]previousRecord, len(prepared.mutations))
+	insertions := make([][]lookupChange, len(prepared.mutations))
+	// Remove changed old indexes before any insert, permitting atomic swaps.
+	// Unchanged tuples need no index writes or history-wide lookup scans.
+	for i, m := range prepared.mutations {
+		c := prepared.columns[i]
 		var v int64
-		err = tx.QueryRowContext(ctx, "SELECT version FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v)
+		var deleted bool
+		var oldData []byte
+		err = tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v, &deleted, &oldData)
 		if errors.Is(err, sql.ErrNoRows) {
 			v = 0
 		} else if err != nil {
@@ -91,9 +104,45 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 			s.conflicts.Add(1)
 			return nil, fail("conflict", "record version changed")
 		}
+		previous[i].version = v
 		if v > 0 {
-			if _, err = tx.ExecContext(ctx, "DELETE FROM lookups WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key); err != nil {
+			previous[i].bytes = int64(len(oldData) + len(m.Key))
+		}
+		hadIndexes := v > 0 && !deleted
+		var oldDocument map[string]any
+		if hadIndexes && len(c.Indexes) > 0 {
+			_, oldDocument, err = canonicalObject(oldData)
+			if err != nil {
 				return nil, err
+			}
+		}
+		for _, idx := range c.Indexes {
+			var oldTuple string
+			if hadIndexes {
+				oldTuple, _, err = indexTuple(oldDocument, idx)
+				if err != nil {
+					return nil, err
+				}
+			}
+			change := lookupChange{index: idx.ID}
+			if !m.Delete {
+				var nullable bool
+				change.tuple, nullable, err = indexTuple(prepared.documents[i], idx)
+				if err != nil {
+					return nil, err
+				}
+				if hadIndexes && oldTuple == change.tuple {
+					continue
+				}
+				if idx.Unique && !nullable {
+					change.unique = change.tuple
+				}
+				insertions[i] = append(insertions[i], change)
+			}
+			if hadIndexes {
+				if _, err = tx.ExecContext(ctx, "DELETE FROM lookups WHERE scope=? AND collection=? AND index_name=? AND index_value=? AND key=?", id, c.ID, idx.ID, oldTuple, m.Key); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -113,14 +162,10 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 				return nil, err
 			}
 		}
-		var oldBytes int64
-		err = tx.QueryRowContext(ctx, "SELECT length(data)+length(CAST(key AS BLOB)) FROM records WHERE scope=? AND collection=? AND key=?", id, c.ID, m.Key).Scan(&oldBytes)
-		if errors.Is(err, sql.ErrNoRows) {
+		if previous[i].version == 0 {
 			values.count++
-		} else if err != nil {
-			return nil, err
 		}
-		values.bytes += int64(len(m.Data)+len(m.Key)) - oldBytes
+		values.bytes += int64(len(m.Data)+len(m.Key)) - previous[i].bytes
 	}
 	for idCollection, values := range usage {
 		if values.count > int64(values.collection.MaxRecords) || values.bytes > values.collection.MaxBytes {
@@ -139,19 +184,9 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		if _, err = tx.ExecContext(ctx, "INSERT INTO records VALUES(?,?,?,?,?,?) ON CONFLICT(scope,collection,key) DO UPDATE SET version=excluded.version,deleted=excluded.deleted,data=excluded.data", id, c.ID, m.Key, next, deleted, []byte(m.Data)); err != nil {
 			return nil, err
 		}
-		if !m.Delete {
-			for _, idx := range c.Indexes {
-				tuple, nullable, e := indexTuple(prepared.documents[i], idx)
-				if e != nil {
-					return nil, e
-				}
-				var unique any
-				if idx.Unique && !nullable {
-					unique = tuple
-				}
-				if _, err = tx.ExecContext(ctx, "INSERT INTO lookups VALUES(?,?,?,?,?,?)", id, c.ID, idx.ID, tuple, m.Key, unique); err != nil {
-					return nil, err
-				}
+		for _, change := range insertions[i] {
+			if _, err = tx.ExecContext(ctx, "INSERT INTO lookups VALUES(?,?,?,?,?,?)", id, c.ID, change.index, change.tuple, m.Key, change.unique); err != nil {
+				return nil, err
 			}
 		}
 		versions = append(versions, api.Record{Collection: m.Collection, Key: m.Key, Version: strconv.FormatInt(next, 10), Deleted: m.Delete})
