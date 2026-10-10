@@ -20,6 +20,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
+	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 )
 
 func main() {
@@ -121,13 +122,17 @@ func run() error {
 			return errors.New("storage: one bounded domain declaration array required")
 		}
 	}
-	policy, e := host.ResolvePolicy(os.Environ(), m)
+	diagnostics, e := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: os.Stderr, MaxQueuedRecords: 128, MaxRecordBytes: 4096})
 	if e != nil {
 		return e
 	}
-	owner, e := host.Open(ctx, host.Config{Path: path, Create: create, Manifest: m,
-		ConfigurationDomains: domains, Grants: grants, HTTPSocket: socket, GRPCSocket: grpcSocket,
-		TargetID: target, Policy: policy, MaxDBBytes: maxDBBytes})
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = diagnostics.Close(shutdown)
+	}()
+	owner, e := host.Open(ctx, host.Config{Path: path, Create: create, Manifest: m, ConfigurationDomains: domains,
+		MaxDBBytes: maxDBBytes, Diagnostics: diagnostics})
 	if e != nil {
 		return e
 	}
@@ -136,17 +141,21 @@ func run() error {
 		defer cancel()
 		_ = owner.Close(shutdown)
 	}()
+	exposure, e := owner.Serve(ctx, host.ServeConfig{TargetID: target, HTTPSocket: socket, GRPCSocket: grpcSocket, Grants: grants})
+	if e != nil {
+		return e
+	}
 	if identityOut != "" {
 		if e = publishPrivateJSON(identityOut, map[string]string{"database_id": owner.DatabaseID()}); e != nil {
 			return e
 		}
 	}
-	if e = publishPrivateJSON(refOut, owner.References()); e != nil {
+	if e = publishPrivateJSON(refOut, exposure.References()); e != nil {
 		return e
 	}
 	select {
 	case <-ctx.Done():
-	case <-owner.Done():
+	case <-exposure.Done():
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -269,6 +269,13 @@ func (s *Store) scope(scope api.Scope) (api.Namespace, error) {
 	}
 	return n, nil
 }
+
+// CheckScope reports whether scope names a registered namespace and a valid
+// user and workspace.
+func (s *Store) CheckScope(scope api.Scope) error {
+	_, err := s.scope(scope)
+	return err
+}
 func collection(n api.Namespace, id string) (api.Collection, error) {
 	for _, c := range n.Collections {
 		if c.ID == id {

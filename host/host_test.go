@@ -40,6 +40,48 @@ func TestDescriptionReturnsActualHTTPReference(t *testing.T) {
 	}
 }
 
+func testManifest() api.Manifest {
+	return api.Manifest{Format: "storage-v1", Namespaces: []api.Namespace{{ID: "docs", Owner: "tests", Schema: "docs.v1",
+		MaxScopes: 2, MaxReceipts: 16, ReceiptTTLSeconds: 3600,
+		Collections: []api.Collection{{ID: "documents", MaxRecordBytes: 4096, MaxRecords: 100, MaxBytes: 1 << 20, Retention: "tests", Recovery: "backup"}}}}}
+}
+
+func TestEmbeddedOpenNeedsNoListener(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	dir, err := os.MkdirTemp("", "storage-host-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	scope := api.Scope{Namespace: "docs", User: "user", Workspace: "workspace"}
+	owner, err := Open(ctx, Config{Path: filepath.Join(dir, "embedded.db"), Create: true, Manifest: testManifest()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close(ctx)
+	local, err := owner.Client(scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, err := local.Snapshot(ctx, "read", api.SnapshotRequest{Scope: scope, Queries: []api.Query{{Collection: "documents", Keys: []string{"layout"}}}})
+	if err != nil || read.Token.DatabaseID != owner.DatabaseID() {
+		t.Fatalf("embedded owner identity: %+v %v", read, err)
+	}
+	if _, err = owner.Client(api.Scope{Namespace: "undeclared", User: "user", Workspace: "workspace"}); err == nil {
+		t.Fatal("embedded owner granted an undeclared namespace")
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if filepath.Ext(entry.Name()) == ".sock" || entry.Name() == "bootstrap.json" || entry.Name() == "refs.json" {
+			t.Fatalf("embedded mode created %s", entry.Name())
+		}
+	}
+}
+
 func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -48,23 +90,20 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(dir)
-	manifest := api.Manifest{Format: "storage-v1", Namespaces: []api.Namespace{{ID: "docs", Owner: "tests", Schema: "docs.v1",
-		MaxScopes: 2, MaxReceipts: 16, ReceiptTTLSeconds: 3600,
-		Collections: []api.Collection{{ID: "documents", MaxRecordBytes: 4096, MaxRecords: 100, MaxBytes: 1 << 20, Retention: "tests", Recovery: "backup"}}}}}
-	policy, err := ResolvePolicy(nil, manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
 	token := "0123456789abcdef0123456789abcdef"
 	scope := api.Scope{Namespace: "docs", User: "user", Workspace: "workspace"}
-	config := Config{Path: filepath.Join(dir, "fixture.db"), Create: true, Manifest: manifest,
-		Grants:     []server.Grant{{Token: token, Namespace: scope.Namespace, User: scope.User, Workspace: scope.Workspace}},
-		HTTPSocket: filepath.Join(dir, "rpc.sock"), TargetID: "fixture", Policy: policy}
+	config := Config{Path: filepath.Join(dir, "fixture.db"), Create: true, Manifest: testManifest()}
+	serve := ServeConfig{TargetID: "fixture", HTTPSocket: filepath.Join(dir, "rpc.sock"),
+		Grants: []server.Grant{{Token: token, Namespace: scope.Namespace, User: scope.User, Workspace: scope.Workspace}}}
 	owner, err := Open(ctx, config)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer owner.Close(ctx)
+	exposure, err := owner.Serve(ctx, serve)
+	if err != nil {
+		t.Fatal(err)
+	}
 	local, err := owner.Client(scope)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +119,7 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ref := owner.References()[0]
+	ref := exposure.References()[0]
 	transport, err := httpx.New(httpx.Config{LocalTargetID: "fixture", Service: ref,
 		MaxRequestBytes: api.MaxRequestBytes, MaxResponseBytes: api.MaxResponseBytes})
 	if err != nil {
@@ -102,21 +141,14 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 	}
 	forbidden := scope
 	forbidden.User = "other"
-	if _, err = owner.Client(forbidden); err == nil {
-		t.Fatal("local owner granted undeclared scope")
-	}
 	if _, err = local.Snapshot(ctx, "forbidden", api.SnapshotRequest{Scope: forbidden}); err == nil {
 		t.Fatal("local data port crossed its fixed scope")
-	}
-	viewClient, ok := local.(client.ReadSnapshotClient)
-	if !ok {
-		t.Fatal("local owner has no typed read view")
 	}
 	if _, ok := any(remote).(client.ReadSnapshotClient); ok {
 		t.Fatal("remote client advertised a local transaction")
 	}
 	var borrowed context.Context
-	err = viewClient.WithReadSnapshot(ctx, func(view context.Context) error {
+	err = local.WithReadSnapshot(ctx, func(view context.Context) error {
 		borrowed = view
 		query := api.SnapshotRequest{Scope: scope, At: &saved.Token, Queries: []api.Query{{Collection: "documents", Keys: []string{"layout"}}}}
 		if _, err := local.Snapshot(view, "view-before", query); err != nil {
@@ -152,7 +184,11 @@ func TestLocalAndExternalClientsShareOwnerReceiptAndIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restarted.Close(ctx)
-	if restarted.DatabaseID() != owner.DatabaseID() || restarted.References()[0].InstanceID == ref.InstanceID {
+	reexposure, err := restarted.Serve(ctx, serve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.DatabaseID() != owner.DatabaseID() || reexposure.References()[0].InstanceID == ref.InstanceID {
 		t.Fatal("restart changed database identity or reused process incarnation")
 	}
 	if _, err = remote.Snapshot(ctx, "old-incarnation", api.SnapshotRequest{Scope: scope,

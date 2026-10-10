@@ -49,7 +49,7 @@ type local struct {
 // NewLocal borrows the same owner used by the XRPC servers. Calls are ordinary
 // typed function calls with a fixed scope and finite lifetime; no wire codec,
 // loopback transport or second storage implementation is involved.
-func NewLocal(store Backend, scope api.Scope, budget time.Duration) (Interface, error) {
+func NewLocal(store Backend, scope api.Scope, budget time.Duration) (ReadSnapshotClient, error) {
 	if store == nil || scope.Namespace == "" || scope.User == "" || scope.Workspace == "" || budget <= 0 {
 		return nil, errors.New("storage: local owner, explicit scope and finite call budget required")
 	}
