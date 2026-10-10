@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -9,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
 )
@@ -149,32 +147,5 @@ func TestRestoredDatabaseActualPageByteBudget(t *testing.T) {
 				t.Fatalf("physical page budget escaped: %v %v", st, err)
 			}
 		})
-	}
-}
-func BenchmarkAtomicDocumentCommit(b *testing.B) {
-	dir, e := os.MkdirTemp("", "storage-bench-")
-	if e != nil {
-		b.Fatal(e)
-	}
-	defer os.RemoveAll(dir)
-	m := manifest()
-	m.Namespaces[0].MaxReceipts = 1000000
-	finite, c := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer c()
-	s, e := Open(finite, Config{Path: filepath.Join(dir, "bench.db"), Create: true, Manifest: m})
-	if e != nil {
-		b.Fatal(e)
-	}
-	defer s.Close()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		read, e := s.Snapshot(finite, api.SnapshotRequest{Scope: testScope, Queries: []api.Query{{Collection: "state", Keys: []string{"a"}}}})
-		if e != nil {
-			b.Fatal(e)
-		}
-		_, e = s.Batch(finite, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: fmt.Sprintf("commit-%d", i), Mutations: []api.Mutation{mutation("state", "a", read.Results[0].Records[0].Version, `{"name":"state","value":1}`)}})
-		if e != nil {
-			b.Fatal(e)
-		}
 	}
 }
