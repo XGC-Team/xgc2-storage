@@ -130,7 +130,7 @@ func TestFaultBackupNonemptyDirectoryAndCountRace(t *testing.T) {
 				t.Fatal("backup changed preexisting regular output")
 			}
 		}
-		stats, err := s.Stats()
+		stats, err := idleStats(t, s)
 		if err != nil || stats.WritersQueued != 0 || stats.ReadersActive != 0 {
 			t.Fatalf("backup count race leaked admission: %+v %v", stats, err)
 		}

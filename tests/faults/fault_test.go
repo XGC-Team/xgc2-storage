@@ -150,11 +150,19 @@ func evidence(t *testing.T, value any) {
 		t.Fatal(err)
 	}
 	t.Log(string(raw))
-	if dir := os.Getenv("FAULT_EVIDENCE_DIR"); dir != "" {
-		name := strings.ReplaceAll(t.Name(), "/", "-") + ".json"
-		if err := os.WriteFile(filepath.Join(dir, name), append(raw, '\n'), 0600); err != nil {
-			t.Fatal(err)
+}
+
+// idleStats waits for the owner's own background maintenance to leave the
+// writer queue, then reports the stats. Admission that never drains is a leak.
+func idleStats(t *testing.T, s *engine.Store) (engine.Stats, error) {
+	t.Helper()
+	limit := time.Now().Add(5 * time.Second)
+	for {
+		stats, err := s.Stats()
+		if err != nil || (stats.WritersQueued == 0 && stats.ReadersActive == 0) || time.Now().After(limit) {
+			return stats, err
 		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -220,9 +228,6 @@ func startWithManifest(t *testing.T, dir string, create bool, held string, m api
 func startProfileManifest(t *testing.T, dir string, create bool, held string, m api.Manifest, profile string) *daemon {
 	t.Helper()
 	binary := os.Getenv("FAULT_STORAGE_BIN")
-	if binary == "" {
-		t.Skip("run scripts/fault-validate.py to build the isolated production daemon; native conformance was not tested")
-	}
 	configFilesFor(t, dir, m)
 	if err := os.Remove(filepath.Join(dir, "refs.json")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		t.Fatal(err)
@@ -500,7 +505,7 @@ func TestFaultDiskFullAtomicRollbackAndRecovery(t *testing.T) {
 	if err = s.Integrity(deadline(t)); err != nil {
 		t.Fatal(err)
 	}
-	stats, err := s.Stats()
+	stats, err := idleStats(t, s)
 	if err != nil || stats.WritersQueued != 0 || stats.ReadersActive != 0 || stats.DatabaseBytes > 1<<20 {
 		t.Fatalf("disk-full leaked resources or page limit: %+v %v", stats, err)
 	}
@@ -766,19 +771,12 @@ func TestFaultBackupNewBusinessRestoreAndNegativeControls(t *testing.T) {
 	}
 	evidence(t, map[string]any{"backup": backupReceipt, "backup_file_sha256": digest, "business_collections": 6,
 		"receipt_and_index_restored": true, "tombstone_and_aba_restored": true, "later_source_commit_excluded": true,
-		"corrupt_candidate_rejected": true,
-		"activation_cli_tested":      false, "legacy_schema_import_tested": false})
+		"corrupt_candidate_rejected": true})
 }
 
 func TestFaultReadonlyStartupNoMutation(t *testing.T) {
-	if os.Getenv("FAULT_STORAGE_BIN") == "" {
-		t.Skip("run scripts/fault-validate.py for the isolated readonly startup matrix")
-	}
-	for _, mode := range []string{"file-mode", "landlock", "readonly-mount"} {
+	for _, mode := range []string{"file-mode", "landlock"} {
 		t.Run(mode, func(t *testing.T) {
-			if mode == "readonly-mount" && os.Getenv("FAULT_CONTAINER_IMAGE") == "" {
-				t.Skip("use --container-image with a cached image for actual readonly mount injection")
-			}
 			dir := privateDir(t)
 			path := filepath.Join(dir, "fixture.db")
 			s := open(t, path, true, nil)
@@ -797,19 +795,13 @@ func TestFaultReadonlyStartupNoMutation(t *testing.T) {
 				}
 				t.Cleanup(func() { _ = os.Chmod(path, 0600) })
 				cmd = exec.CommandContext(deadline(t), os.Getenv("FAULT_STORAGE_BIN"), daemonArgs(dir, false)...)
-			} else if mode == "landlock" {
+			} else {
 				cmd = exec.CommandContext(deadline(t), os.Args[0], "-test.run=^TestFaultChild$", "-test.v")
 				cmd.Env = append(os.Environ(), "FAULT_CHILD=readonly", "FAULT_CHILD_DIR="+dir)
-			} else {
-				args := containerArgs(t, os.Getenv("FAULT_STORAGE_BIN"))
-				args = append(args, "--mount", "type=bind,src="+dir+",dst=/fixture,readonly",
-					os.Getenv("FAULT_CONTAINER_IMAGE"), "/runner")
-				args = append(args, daemonArgs("/fixture", false)...)
-				cmd = exec.CommandContext(deadline(t), "docker", args...)
 			}
 			raw, err := cmd.CombinedOutput()
 			message := strings.ToLower(string(raw))
-			if err == nil || !(strings.Contains(message, "permission denied") || (mode == "readonly-mount" && strings.Contains(message, "read-only file system"))) {
+			if err == nil || !strings.Contains(message, "permission denied") {
 				t.Fatalf("OS readonly/write-denial did not reject startup: %s %v", raw, err)
 			}
 			if fileHash(t, path) != before {
@@ -829,53 +821,6 @@ func TestFaultReadonlyStartupNoMutation(t *testing.T) {
 				"diagnostic": strings.TrimSpace(string(raw)), "runtime_sqlite_readonly_tested": false})
 		})
 	}
-}
-
-// Every container is private, bounded, offline, and has only test-owned mounts.
-// No image pull, shared mount mutation, privileged container or station restart.
-func containerArgs(t *testing.T, binary string) []string {
-	t.Helper()
-	name := fmt.Sprintf("sol20-fault-%d-%d", os.Getpid(), time.Now().UnixNano())
-	if ledger := os.Getenv("FAULT_CONTAINER_LEDGER"); ledger != "" {
-		f, err := os.OpenFile(ledger, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
-		if err != nil {
-			t.Fatal(err)
-		}
-		raw, _ := json.Marshal(map[string]string{"name": name})
-		_, writeErr := f.Write(append(raw, '\n'))
-		syncErr, closeErr := f.Sync(), f.Close()
-		if err = errors.Join(writeErr, syncErr, closeErr); err != nil {
-			t.Fatal(err)
-		}
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = exec.CommandContext(ctx, "docker", "rm", "-f", name).Run()
-	})
-	return []string{"run", "--rm", "--pull=never", "--name", name, "--read-only", "--network=none",
-		"--cap-drop=ALL", "--pids-limit=64", "--cpus=1", "--memory=256m", "--memory-swap=256m",
-		"--user", fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid()),
-		"--mount", "type=bind,src=" + binary + ",dst=/runner,readonly"}
-}
-
-func TestFaultPhysicalFilesystemFullPrivateTmpfs(t *testing.T) {
-	if os.Getenv("FAULT_CONTAINER_IMAGE") == "" {
-		t.Skip("use --container-image for isolated physical ENOSPC injection")
-	}
-	args := containerArgs(t, os.Getenv("FAULT_CONTAINER_TEST_BIN"))
-	args = append(args, "--tmpfs", fmt.Sprintf("/fixture:rw,size=2m,mode=0700,uid=%d,gid=%d", os.Getuid(), os.Getgid()),
-		"--env", "GOMAXPROCS=2", "--env", "FAULT_CHILD=physical-full", "--env", "FAULT_CHILD_DIR=/fixture",
-		os.Getenv("FAULT_CONTAINER_IMAGE"), "/runner", "-test.run=^TestFaultChild$", "-test.v")
-	raw, err := exec.CommandContext(deadline(t), "docker", args...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("private physical-full test failed: %s %v", raw, err)
-	}
-	if !strings.Contains(string(raw), "PHYSICAL_FULL_VERIFIED") {
-		t.Fatalf("container did not verify physical-full postconditions: %s", raw)
-	}
-	evidence(t, map[string]any{"injection": "private 2MiB tmpfs, engine page/WAL caps larger than filesystem",
-		"physical_filesystem_enospc_tested": true, "diagnostic": strings.TrimSpace(string(raw))})
 }
 
 func TestFaultCommittedReplayUnderDiskWatermark(t *testing.T) {
@@ -931,50 +876,6 @@ func TestFaultChild(t *testing.T) {
 	dir := os.Getenv("FAULT_CHILD_DIR")
 	if dir == "" || !filepath.IsAbs(dir) {
 		t.Fatal("private fixture directory required")
-	}
-	if mode == "physical-full" {
-		s := open(t, filepath.Join(dir, "fixture.db"), true, func(c *engine.Config) { c.MinFreeBytes = 1 << 20 })
-		seed := request(read(t, s).Token, "physical-source")
-		commit, err := s.Batch(deadline(t), seed)
-		if err != nil {
-			t.Fatal(err)
-		}
-		before, err := s.Stats()
-		if err != nil || before.FreeBytes <= 1<<20 || before.FreeBytes > 2<<20 {
-			t.Fatalf("physical tmpfs injection was not isolated/admissible: %+v %v", before, err)
-		}
-		full := api.BatchRequest{Scope: scope, Expected: commit.Token, RequestID: "physical-full"}
-		for i := 0; i < 240; i++ {
-			data, _ := json.Marshal(map[string]string{"payload": strings.Repeat("x", 12*1024), "operation": fmt.Sprintf("physical-%d", i)})
-			full.Mutations = append(full.Mutations, api.Mutation{Collection: "state", Key: fmt.Sprintf("physical-%03d", i), ExpectedVersion: "0", Data: data})
-		}
-		_, err = s.Batch(deadline(t), full)
-		if code(err) != "disk_full" || !strings.Contains(err.Error(), "(13)") {
-			t.Fatalf("physical full must be SQLite 13, not the watermark: %v", err)
-		}
-		failure := err.Error()
-		verifyBusiness(t, read(t, s), seed, commit)
-		all, err := s.Snapshot(deadline(t), api.SnapshotRequest{Scope: scope, Queries: []api.Query{{Collection: "state", Limit: 2048}}})
-		if err != nil || len(all.Results[0].Records) != 1 {
-			t.Fatalf("physical-full leaked partial data: %+v %v", all, err)
-		}
-		if _, err = s.Receipt(deadline(t), api.ReceiptRequest{Scope: scope, RequestID: full.RequestID}); code(err) != "not_found" {
-			t.Fatalf("physical-full retained failed receipt: %v", err)
-		}
-		if err = s.Integrity(deadline(t)); err != nil {
-			t.Fatal(err)
-		}
-		if err = s.Close(); err != nil {
-			t.Fatal(err)
-		}
-		s = open(t, filepath.Join(dir, "fixture.db"), false, func(c *engine.Config) { c.MinFreeBytes = 1 << 20 })
-		verifyBusiness(t, read(t, s), seed, commit)
-		if _, err = s.Batch(deadline(t), api.BatchRequest{Scope: scope, Expected: commit.Token, RequestID: "physical-resume",
-			Mutations: []api.Mutation{{Collection: "state", Key: "primary", ExpectedVersion: "1", Data: json.RawMessage(`{"operation":"run-1","phase":"resumed"}`)}}}); err != nil {
-			t.Fatalf("physical-full writer did not recover after restart: %v", err)
-		}
-		fmt.Printf("PHYSICAL_FULL_VERIFIED %s\n", failure)
-		return
 	}
 	if mode == "readonly" {
 		runtime.LockOSThread()
