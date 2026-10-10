@@ -27,7 +27,7 @@ type executionFixture struct {
 	databaseID string
 }
 
-func newExecutionFixture(t *testing.T, fault string, maxRecords int) *executionFixture {
+func newExecutionFixture(t *testing.T, fault string, maxRecords int, collections ...api.Collection) *executionFixture {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	t.Cleanup(cancel)
@@ -36,6 +36,7 @@ func newExecutionFixture(t *testing.T, fault string, maxRecords int) *executionF
 	for _, id := range []string{"runs", "tasks", "invocations", "definitions"} {
 		n.Collections = append(n.Collections, api.Collection{ID: id, MaxRecordBytes: 32 << 10, MaxRecords: maxRecords, MaxBytes: 32 << 20, Retention: "current facts and recovery; explicit cleanup", Recovery: "storage backup", Indexes: []api.Index{{ID: "name", Fields: []string{"name"}, Unique: true}}})
 	}
+	n.Collections = append(n.Collections, collections...)
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)

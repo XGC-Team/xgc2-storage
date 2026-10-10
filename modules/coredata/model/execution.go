@@ -1,6 +1,7 @@
 package model
 
 import (
+	"errors"
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
@@ -18,6 +19,7 @@ type CommandAbsenceGuard struct {
 }
 
 type ExecutionCommit struct {
+	RunQueue              []RunQueueMutation       `json:"run_queue,omitempty"`
 	CommandAbsenceGuards  []CommandAbsenceGuard    `json:"command_absence_guards,omitempty"`
 	CommandAcceptedAt     time.Time                `json:"command_accepted_at,omitempty"`
 	ConfigurationPins     []ConfigurationReference `json:"configuration_pins,omitempty"`
@@ -140,4 +142,48 @@ type JobEventPageRead struct {
 type JobEventPage struct {
 	Events []ExecutionEvent `json:"events"`
 	Total  int64            `json:"total"`
+}
+
+// RunQueueMutation merges a durable wake or completes an exact scheduler claim
+// inside the existing execution commit. No caller allocates shared queue IDs.
+type RunQueueMutation struct {
+	RunID           string    `json:"runId"`
+	At              time.Time `json:"at"`
+	Complete        bool      `json:"complete,omitempty"`
+	Owner           string    `json:"owner,omitempty"`
+	ClaimToken      string    `json:"claimToken,omitempty"`
+	NextAvailableAt time.Time `json:"nextAvailableAt,omitempty"`
+	Error           string    `json:"error,omitempty"`
+}
+
+type RunReconcileTaskState string
+
+const (
+	RunReconcileTaskReady   RunReconcileTaskState = "ready"
+	RunReconcileTaskClaimed RunReconcileTaskState = "claimed"
+)
+
+func (s RunReconcileTaskState) Validate() error {
+	if s != RunReconcileTaskReady && s != RunReconcileTaskClaimed {
+		return errors.New("orchestration: invalid run reconcile task state")
+	}
+	return nil
+}
+
+type RunReconcileTask struct {
+	RunID             string                `json:"runId"`
+	State             RunReconcileTaskState `json:"state"`
+	AvailableAt       time.Time             `json:"availableAt"`
+	ReadySequence     int64                 `json:"readySequence"`
+	DirtyGeneration   int64                 `json:"dirtyGeneration"`
+	ClaimedGeneration int64                 `json:"claimedGeneration,omitempty"`
+	ClaimOwner        string                `json:"claimOwner,omitempty"`
+	ClaimToken        string                `json:"-"`
+	ClaimExpiresAt    *time.Time            `json:"claimExpiresAt,omitempty"`
+	AttemptCount      int                   `json:"attemptCount"`
+	ConsecutiveErrors int                   `json:"consecutiveErrors"`
+	LastError         string                `json:"lastError,omitempty"`
+	CreatedAt         time.Time             `json:"createdAt"`
+	UpdatedAt         time.Time             `json:"updatedAt"`
+	Revision          int64                 `json:"revision"`
 }

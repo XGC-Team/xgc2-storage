@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
@@ -15,10 +16,10 @@ import (
 // The record algorithm, index codec and deployed class limits belong to engine;
 // command/event facts and the outer durable receipt join that same transaction.
 func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.ExecutionCommit) (out model.ExecutionCommitted, err error) {
-	if len(r.State) == 0 && len(r.Events) == 0 && r.Command == nil && r.Completion == nil {
+	if len(r.State) == 0 && len(r.RunQueue) == 0 && len(r.Events) == 0 && r.Command == nil && r.Completion == nil {
 		return out, failure("invalid_argument", "nonempty execution data action required")
 	}
-	if len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
+	if len(r.RunQueue) > model.MaxExecutionStateMutations || len(r.State) > model.MaxExecutionStateMutations || len(r.Guards) > model.MaxExecutionStateMutations || len(r.Events) > model.MaxExecutionEvents {
 		return out, failure("resource_exhausted", "execution data action count limit exceeded")
 	}
 	if err = checkSize(r); err != nil {
@@ -87,10 +88,45 @@ func commitExecution(ctx context.Context, tx *sql.Tx, scope string, r model.Exec
 	if err = configurationValidateMainPins(ctx, tx, scope, r.ConfigurationMainPins); err != nil {
 		return out, err
 	}
-	if len(r.State) > 0 {
-		out.State, err = engine.ApplyRecords(ctx, tx, scope, r.State)
+	state, err := prepareRunQueue(ctx, tx, scope, r.State, r.RunQueue)
+	if err != nil {
+		return out, err
+	}
+	if len(state) > 0 {
+		out.State, err = engine.ApplyRecords(ctx, tx, scope, state)
 		if err != nil {
 			return out, err
+		}
+	}
+	if len(r.RunQueue) > 0 {
+		keys := make([]string, 0, len(r.RunQueue))
+		seen := map[string]bool{}
+		for _, q := range r.RunQueue {
+			if !seen[q.RunID] {
+				seen[q.RunID] = true
+				keys = append(keys, q.RunID)
+			}
+		}
+		actual, readErr := engine.ReadRecords(ctx, tx, scope, api.Query{Collection: model.RunTasksCollection, Keys: keys})
+		if readErr != nil {
+			return out, readErr
+		}
+		positions := map[string]int{}
+		for i, record := range out.State {
+			if record.Collection == model.RunTasksCollection {
+				positions[record.Key] = i
+			}
+		}
+		for _, record := range actual.Records {
+			record.Collection = actual.Collection
+			if record.Missing || record.Deleted {
+				continue
+			}
+			if i, ok := positions[record.Key]; ok {
+				out.State[i] = record
+			} else {
+				out.State = append(out.State, record)
+			}
 		}
 	}
 	out.Events, err = appendExecutionEvents(ctx, tx, scope, r.Events)
