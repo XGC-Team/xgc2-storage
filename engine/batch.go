@@ -12,6 +12,9 @@ import (
 )
 
 func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt, err error) {
+	if snapshotContext(ctx) != nil {
+		return out, fail("failed_precondition", "mutation cannot use a read snapshot")
+	}
 	r.Mutations = append([]api.Mutation(nil), r.Mutations...)
 	defer func() { err = classify(err) }()
 	n, err := s.scope(r.Scope)
@@ -144,13 +147,13 @@ func (s *Store) Receipt(ctx context.Context, r api.ReceiptRequest) (out api.Rece
 	if !identifier(r.RequestID) {
 		return out, fail("invalid_argument", "invalid receipt identity")
 	}
-	ctx, release, err := s.beginCall(ctx, false)
+	ctx, reader, release, err := s.readRows(ctx, r.Scope)
 	if err != nil {
 		return out, err
 	}
 	defer release()
 	var raw []byte
-	err = s.reader.QueryRowContext(ctx, "SELECT body FROM receipts WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&raw)
+	err = reader.QueryRowContext(ctx, "SELECT body FROM receipts WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, fail("not_found", "receipt not retained; previous outcome may still be unknown")
 	}

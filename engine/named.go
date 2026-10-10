@@ -42,11 +42,18 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 	if len(r.Payload) == 0 || len(r.Payload) > operation.MaxRequestBytes {
 		return out, fail("resource_exhausted", "named request payload byte limit exceeded")
 	}
-	ctx, release, err := s.beginCall(ctx, !operation.ReadOnly)
-	if err != nil {
-		return out, err
+	view := snapshotContext(ctx)
+	if view != nil && !operation.ReadOnly {
+		return out, fail("failed_precondition", "mutation cannot use a read snapshot")
 	}
-	defer release()
+	if view == nil {
+		var release func()
+		ctx, release, err = s.beginCall(ctx, !operation.ReadOnly)
+		if err != nil {
+			return out, err
+		}
+		defer release()
+	}
 	canonical, _, err := canonicalObject(r.Payload)
 	if err != nil {
 		return out, err
@@ -62,11 +69,22 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 	id := scopeID(r.Scope)
 	digest := hash(r)
 	if operation.ReadOnly {
-		tx, e := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-		if e != nil {
-			return out, e
+		var tx *sql.Tx
+		if view != nil {
+			unlock, e := view.borrow(ctx, s, r.Scope)
+			if e != nil {
+				return out, e
+			}
+			defer unlock()
+			tx = view.tx
+		} else {
+			var e error
+			tx, e = s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+			if e != nil {
+				return out, e
+			}
+			defer tx.Rollback()
 		}
-		defer tx.Rollback()
 		out.Result, err = s.executeModule(ctx, tx, id, n, module, operation, 0, r.Payload)
 		if err != nil {
 			return out, err
@@ -78,7 +96,9 @@ func (s *Store) Named(ctx context.Context, r api.NamedRequest) (out api.NamedRes
 		if len(materialized) > operation.MaxResponseBytes {
 			return out, fail("resource_exhausted", "named materialized response exceeded limit")
 		}
-		err = tx.Commit()
+		if view == nil {
+			err = tx.Commit()
+		}
 		return out, err
 	}
 	var cachedDigest string
@@ -192,13 +212,13 @@ func (s *Store) NamedResult(ctx context.Context, r api.ReceiptRequest) (out api.
 	if !identifier(r.RequestID) {
 		return out, fail("invalid_argument", "invalid named receipt identity")
 	}
-	ctx, release, err := s.beginCall(ctx, false)
+	ctx, reader, release, err := s.readRows(ctx, r.Scope)
 	if err != nil {
 		return out, err
 	}
 	defer release()
 	var raw []byte
-	err = s.reader.QueryRowContext(ctx, "SELECT body FROM named_results WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&raw)
+	err = reader.QueryRowContext(ctx, "SELECT body FROM named_results WHERE scope=? AND request_id=?", scopeID(r.Scope), r.RequestID).Scan(&raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, fail("not_found", "named result not retained; outcome may remain unknown")
 	}

@@ -3,32 +3,23 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/host"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
-	pb "github.com/XGC-Team/xgc2-storage/protocol"
 	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
-	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
-	"github.com/XGC-Team/xgc2-xrpc/go/grpcx"
-	"github.com/XGC-Team/xgc2-xrpc/go/httpx"
-	unixlease "github.com/XGC-Team/xgc2-xrpc/go/unix"
-	"google.golang.org/grpc"
 )
 
 func main() {
@@ -107,42 +98,7 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	startup, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	var random [16]byte
-	if _, e = rand.Read(random[:]); e != nil {
-		return e
-	}
-	instance := hex.EncodeToString(random[:])
-	var refs []xrpc.ServiceRef
-	var httpRef xrpc.ServiceRef
-	for _, endpoint := range []struct {
-		address string
-		profile string
-	}{{socket, xrpc.HTTP}, {grpcSocket, xrpc.GRPC}} {
-		if endpoint.address == "" {
-			continue
-		}
-		ref := xrpc.ServiceRef{TargetID: target, Service: api.Service, APIVersion: api.Version, InstanceID: instance, Profile: endpoint.profile, Endpoint: xrpc.Endpoint{Kind: "unix", Address: endpoint.address}}
-		if e = ref.ValidateInternal(); e != nil {
-			return e
-		}
-		refs = append(refs, ref)
-		if endpoint.profile == xrpc.HTTP {
-			httpRef = ref
-		}
-	}
-	requestBytes, responseBytes := registry.TransportBounds(m)
-	policy, e := xrpc.ResolvePolicy(xrpc.PolicyOptions{
-		Environment: os.Environ(), DefaultSource: "storage deployment manifest",
-		Defaults:     map[string]string{"MAX_REQUEST_BYTES": strconv.Itoa(requestBytes), "MAX_RESPONSE_BYTES": strconv.Itoa(responseBytes), "HOST_MAX_CONNECTIONS": "4", "HOST_MAX_IN_FLIGHT": "8", "GRPC_MAX_STREAMS_PER_CONNECTION": "1"},
-		Ceilings:     map[string]int64{"MAX_REQUEST_BYTES": int64(requestBytes), "MAX_RESPONSE_BYTES": int64(responseBytes), "HOST_MAX_CONNECTIONS": 4, "HOST_MAX_IN_FLIGHT": 8, "GRPC_MAX_STREAMS_PER_CONNECTION": 1, "CALL_TIMEOUT_MS": 30000},
-		Capabilities: []string{"host", "http", "rpc", "transport", "grpc", "diagnostics"},
-	})
-	if e != nil {
-		return e
-	}
-	modules := registry.Compiled()
+	var domains []model.ConfigurationDomainDeclaration
 	if configurationDomains != "" {
 		file, err := os.Open(configurationDomains)
 		if err != nil {
@@ -156,7 +112,6 @@ func run() error {
 		if len(raw) == 0 || len(raw) > 256<<10 {
 			return errors.New("storage: configuration declarations exceed 256 KiB or are empty")
 		}
-		var domains []model.ConfigurationDomainDeclaration
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
 		if err := decoder.Decode(&domains); err != nil {
@@ -165,159 +120,39 @@ func run() error {
 		if decoder.Decode(new(any)) != io.EOF || len(domains) == 0 || len(domains) > 256 {
 			return errors.New("storage: one bounded domain declaration array required")
 		}
-		modules = registry.ConfigurationDeployment(domains)
 	}
-	store, e := engine.Open(startup, engine.Config{Path: path, Create: create, Manifest: m, Modules: modules, MaxDBBytes: maxDBBytes})
+	policy, e := host.ResolvePolicy(os.Environ(), m)
 	if e != nil {
 		return e
 	}
-	defer store.Close()
-	diagnostics, e := xrpc.NewDiagnostics(policy, xrpc.DiagnosticOptions{Sink: os.Stderr, MaxQueuedRecords: 128, MaxRecordBytes: 4096})
+	owner, e := host.Open(ctx, host.Config{Path: path, Create: create, Manifest: m,
+		ConfigurationDomains: domains, Grants: grants, HTTPSocket: socket, GRPCSocket: grpcSocket,
+		TargetID: target, Policy: policy, MaxDBBytes: maxDBBytes})
 	if e != nil {
 		return e
 	}
 	defer func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = diagnostics.Close(ctx)
+		_ = owner.Close(shutdown)
 	}()
-	maintenanceCtx, maintenanceStop := context.WithCancel(ctx)
-	maintenanceDone := make(chan struct{})
-	go func() {
-		defer close(maintenanceDone)
-		tick := time.NewTicker(time.Second)
-		defer tick.Stop()
-		for {
-			select {
-			case <-maintenanceCtx.Done():
-				return
-			case <-tick.C:
-				budget, cancel := context.WithTimeout(maintenanceCtx, 500*time.Millisecond)
-				_, pruneError := store.PruneExpiredReceipts(budget, time.Now(), 256)
-				cancel()
-				// A failed expiry write must not suppress WAL space recovery.
-				budget, cancel = context.WithTimeout(maintenanceCtx, 500*time.Millisecond)
-				_, checkpointError := store.Checkpoint(budget)
-				cancel()
-				checkpointError = errors.Join(pruneError, checkpointError)
-				if checkpointError != nil && maintenanceCtx.Err() == nil {
-					category := xrpc.Code(checkpointError)
-					var domain *api.Error
-					if errors.As(checkpointError, &domain) {
-						category = domain.Code
-					}
-					diagnostics.Emit(xrpc.Diagnostic{Time: time.Now(), Level: "warn", Event: "storage.maintenance", Service: api.Service, InstanceID: instance, Category: category})
-				}
-			}
-		}
-	}()
-	defer func() { maintenanceStop(); <-maintenanceDone }()
-	httpOptions, e := (httpx.HostOptions{InstanceID: instance, Service: api.Service, DiscoveryPaths: []string{"/v1/describe"}, Diagnostics: diagnostics}).WithPolicy(policy)
-	if e != nil {
-		return e
-	}
-	grpcOptions, e := (grpcx.HostOptions{InstanceID: instance, Service: api.Service, Diagnostics: diagnostics}).WithPolicy(policy)
-	if e != nil {
-		return e
-	}
-	var httpHost *httpx.Host
-	var grpcHost *grpcx.Host
-	// SDK leases and hosts own all socket lifecycle and transport resources.
-	if socket != "" {
-		lease, e := unixlease.Reserve(startup, socket, unixlease.Options{ExistingPath: unixlease.ReclaimUnreachable})
-		if e != nil {
-			return e
-		}
-		listener, e := lease.Listen()
-		if e != nil {
-			lease.Close()
-			return e
-		}
-		handler, e := server.HTTP(store, grants)
-		if e != nil {
-			lease.Close()
-			return e
-		}
-		httpHost, e = httpx.Serve(listener, lease, withDescription(handler, httpRef), httpOptions)
-		if e != nil {
-			lease.Close()
-			return e
-		}
-		defer func() {
-			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = httpHost.Shutdown(shutdown)
-		}()
-	}
-	if grpcSocket != "" {
-		lease, e := unixlease.Reserve(startup, grpcSocket, unixlease.Options{ExistingPath: unixlease.ReclaimUnreachable})
-		if e != nil {
-			return e
-		}
-		listener, e := lease.Listen()
-		if e != nil {
-			lease.Close()
-			return e
-		}
-		grpcHost, e = grpcx.ServeWithOptions(listener, lease, func(r grpc.ServiceRegistrar) { pb.RegisterStorageServer(r, &server.GRPC{Store: store, Grants: grants}) }, grpcOptions)
-		if e != nil {
-			lease.Close()
-			return e
-		}
-		defer grpcHost.Stop()
-	}
 	if identityOut != "" {
-		stats, err := store.Stats()
-		if err != nil {
-			return err
-		}
-		if e = publishPrivateJSON(identityOut, map[string]string{"database_id": stats.DatabaseID}); e != nil {
+		if e = publishPrivateJSON(identityOut, map[string]string{"database_id": owner.DatabaseID()}); e != nil {
 			return e
 		}
 	}
-	if e = publishPrivateJSON(refOut, refs); e != nil {
+	if e = publishPrivateJSON(refOut, owner.References()); e != nil {
 		return e
-	}
-	var doneHTTP, doneGRPC <-chan struct{}
-	if httpHost != nil {
-		doneHTTP = httpHost.Done()
-	}
-	if grpcHost != nil {
-		doneGRPC = grpcHost.Done()
 	}
 	select {
 	case <-ctx.Done():
-	case <-doneHTTP:
-	case <-doneGRPC:
+	case <-owner.Done():
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var err error
-	if httpHost != nil {
-		err = errors.Join(err, httpHost.Shutdown(shutdown))
-	}
-	if grpcHost != nil {
-		err = errors.Join(err, grpcHost.Shutdown(shutdown))
-	}
-	return err
+	return owner.Close(shutdown)
 }
 
-func withDescription(handler http.Handler, ref xrpc.ServiceRef) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/describe", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.Header().Set("Allow", http.MethodGet)
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(struct {
-			ServiceRef xrpc.ServiceRef `json:"service_ref"`
-		}{ServiceRef: ref})
-	})
-	mux.Handle("/", handler)
-	return mux
-}
 func publishPrivateJSON(path string, value any) error {
 	parent := filepath.Dir(path)
 	st, e := os.Lstat(parent)

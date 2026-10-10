@@ -22,6 +22,14 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 	if len(r.Queries) == 0 || len(r.Queries) > api.MaxQueries {
 		return out, fail("invalid_argument", "bounded nonempty query plan required")
 	}
+	if view := snapshotContext(ctx); view != nil {
+		unlock, err := view.borrow(ctx, s, r.Scope)
+		if err != nil {
+			return out, err
+		}
+		defer unlock()
+		return s.snapshot(ctx, view.tx, n, r)
+	}
 	ctx, release, err := s.beginCall(ctx, false)
 	if err != nil {
 		return out, err
@@ -32,6 +40,14 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 		return out, err
 	}
 	defer tx.Rollback()
+	out, err = s.snapshot(ctx, tx, n, r)
+	if err != nil {
+		return out, err
+	}
+	return out, tx.Commit()
+}
+
+func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api.SnapshotRequest) (out api.SnapshotResponse, err error) {
 	id := scopeID(r.Scope)
 	var rev int64
 	err = tx.QueryRowContext(ctx, "SELECT revision FROM scopes WHERE scope=?", id).Scan(&rev)
@@ -64,9 +80,6 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 			return out, e
 		}
 		out.Results = append(out.Results, result)
-	}
-	if err = tx.Commit(); err != nil {
-		return out, err
 	}
 	raw, e := json.Marshal(out)
 	if e != nil {
