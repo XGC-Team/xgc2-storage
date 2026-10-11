@@ -25,6 +25,7 @@ require (
 )
 
 // Development only: the shared XRPC module comes from the sibling checkout until a
-// release of it is pinned above. scripts/build-package.py refuses to package
-// while a replace directive exists.
+// release of it is pinned above. This code needs its plain limits API (xrpc-go commit
+// 5ee3c17 or newer; NewDiagnostics lost its policy argument there). The pin above
+// predates it. scripts/build-package.py refuses to package while a replace exists.
 replace github.com/XGC-Team/xgc2-xrpc/go => ../xrpc-go/go
