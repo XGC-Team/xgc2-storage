@@ -14,6 +14,10 @@ const (
 	workExpire
 )
 
+// maintenanceRetry is how long failed maintenance waits before it tries again,
+// so that a transient failure does not switch the work off until the next event.
+var maintenanceRetry = 30 * time.Second
+
 // maintenance runs the owner's background work. It is event driven: a commit
 // arms a checkpoint, a stored receipt arms its own expiry, and an idle
 // database wakes nothing. A checkpoint also makes relaxed commits durable.
@@ -68,11 +72,11 @@ func (m *maintenance) run(ctx context.Context) {
 		case <-m.kick:
 		}
 		work := m.work.Swap(0)
-		if work&workCheckpoint != 0 {
-			m.report(ctx, errors.Join(m.checkpoint(ctx)))
+		if work&workCheckpoint != 0 && m.report(ctx, m.checkpoint(ctx)) {
+			m.scheduleCheckpoint(maintenanceRetry)
 		}
-		if work&workExpire != 0 {
-			m.report(ctx, m.expire(ctx))
+		if work&workExpire != 0 && m.report(ctx, m.expire(ctx)) {
+			m.armExpiry(time.Now().Add(maintenanceRetry).Unix())
 		}
 	}
 }
@@ -85,14 +89,17 @@ func (m *maintenance) request(work uint32) {
 	}
 }
 
-func (m *maintenance) report(ctx context.Context, err error) {
+// report counts and delivers a failure and tells whether the work should be
+// retried. A failure while the owner shuts down is expected and ignored.
+func (m *maintenance) report(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
-		return
+		return false
 	}
 	m.store.maintenanceErrs.Add(1)
 	if m.store.config.OnMaintenanceError != nil {
 		m.store.config.OnMaintenanceError(err)
 	}
+	return true
 }
 
 // afterCommit decides whether the WAL needs attention. A WAL over the
@@ -103,10 +110,15 @@ func (m *maintenance) afterCommit() {
 		m.request(workCheckpoint)
 		return
 	}
+	m.scheduleCheckpoint(m.store.config.CheckpointDelay)
+}
+
+// scheduleCheckpoint arms the one checkpoint timer unless it is armed already.
+func (m *maintenance) scheduleCheckpoint(delay time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.checkpointTimer == nil {
-		m.checkpointTimer = time.AfterFunc(m.store.config.CheckpointDelay, func() {
+		m.checkpointTimer = time.AfterFunc(delay, func() {
 			m.mu.Lock()
 			m.checkpointTimer = nil
 			m.mu.Unlock()

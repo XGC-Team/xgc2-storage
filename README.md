@@ -50,7 +50,7 @@ owner holds the database through an exclusive file lock; a second process fails 
 | `WriterQueue` | 64 | writers admitted at once; later callers **wait until their own deadline** rather than fail |
 | `CallBudget` | 30 s | cap on every call; a shorter caller deadline wins and a caller without one gets the budget |
 | `MaxDBBytes` | 1 GiB | finite database capacity (page limit) |
-| `Diagnostics` | none | receives background maintenance failures |
+| `Diagnostics` | none | receives background maintenance failures; the failed step is retried after 30 s |
 
 ### Durability classes
 

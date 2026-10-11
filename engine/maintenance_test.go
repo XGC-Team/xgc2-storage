@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -144,5 +145,58 @@ func TestMaintenanceFailuresAreReportedNotLogged(t *testing.T) {
 	}
 	if stats, _ := s.Stats(); stats.MaintenanceErrors == 0 {
 		t.Fatal("failure not counted")
+	}
+}
+
+func retryAfter(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := maintenanceRetry
+	maintenanceRetry = d
+	t.Cleanup(func() { maintenanceRetry = old })
+}
+
+// Holding the gate stands for a writer that never finishes: maintenance cannot
+// be admitted within the call budget and fails.
+func TestAFailedCheckpointIsRetried(t *testing.T) {
+	retryAfter(t, 100*time.Millisecond)
+	var failures atomic.Int32
+	s, _ := maintained(t, func(c *Config) {
+		c.CheckpointDelay = 300 * time.Millisecond
+		c.CallBudget = 100 * time.Millisecond
+		c.OnMaintenanceError = func(error) { failures.Add(1) }
+	})
+	commitOne(t, s, "a", true)
+	before, _ := s.Stats()
+	s.gate <- struct{}{}
+	waitFor(t, "the failed checkpoint", 3*time.Second, func() bool { return failures.Load() > 0 })
+	<-s.gate
+	waitFor(t, "the retried checkpoint", 3*time.Second, func() bool {
+		stats, _ := s.Stats()
+		return stats.Checkpoints > before.Checkpoints
+	})
+}
+
+func TestAFailedReceiptExpiryIsRetried(t *testing.T) {
+	retryAfter(t, 100*time.Millisecond)
+	var failures atomic.Int32
+	s, _ := maintained(t, func(c *Config) {
+		c.Manifest.Namespaces[0].ReceiptTTLSeconds = 1
+		c.CheckpointDelay = time.Hour
+		c.CallBudget = 100 * time.Millisecond
+		c.OnMaintenanceError = func(error) { failures.Add(1) }
+	})
+	ctx := budget(t)
+	read := snapshot(t, s, ctx, "a")
+	if _, err := s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "first", Mutations: []api.Mutation{mutation("events", "x", "0", `{}`)}}); err != nil {
+		t.Fatal(err)
+	}
+	s.gate <- struct{}{}
+	waitFor(t, "the failed expiry", 6*time.Second, func() bool { return failures.Load() > 0 })
+	<-s.gate
+	waitFor(t, "the retried expiry", 6*time.Second, func() bool {
+		return countRows(t, s, "SELECT count(*) FROM receipts") == 0
+	})
+	if receiptCount(t, s) != 0 {
+		t.Fatal("receipt counter not released")
 	}
 }
