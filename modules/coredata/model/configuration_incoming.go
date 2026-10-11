@@ -1,7 +1,5 @@
 package model
 
-const ConfigurationIncomingOperation = "configuration.references.incoming"
-
 type ConfigurationIncomingRead struct {
 	Domain     ConfigurationDomainGuard `json:"domain"`
 	ResourceID string                   `json:"resource_id"`

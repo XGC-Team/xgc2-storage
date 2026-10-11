@@ -1,14 +1,12 @@
-// Configuration first-group wire contract, frozen with the consumer v5 DTO.
-// This SQL-free package is the only DTO authority. Names do not imply executable
-// registration: coredata.Spec lists only operations implemented by Execute.
+// The configuration types of the Core data API. This SQL-free package is the
+// only authority for the shapes that cross it.
 package model
 
-// First atomic group operation identities. Deployment availability is separate.
+// Resource mutation identities. Plan digests and the durable product receipts
+// record them, so their spelling never changes.
 const (
-	ConfigurationReceiptOperation = "configuration.receipt"
-	ResourceSnapshotOperation     = "resource.snapshot"
-	ResourceCreateOperation       = "resource.create"
-	ResourceCommitOperation       = "resource.commit"
+	ResourceCreateOperation = "resource.create"
+	ResourceCommitOperation = "resource.commit"
 )
 
 type ConfigurationDomainGuard struct {
@@ -240,7 +238,6 @@ type ConfigurationResourceSnapshot struct {
 	References  []ConfigurationReference   `json:"references"`
 }
 
-// Audit lookup is a later operation, not an RPC in this first atomic group.
 // Generic manifests use Configuration's existing NodeDraft JSON field names.
 
 // Identity is a generic projection from the authoritative frozen payload

@@ -1,7 +1,6 @@
 package model
 
 const ConfigurationNamespaceCloneOperation = "configuration.namespace.clone"
-const ConfigurationNamespaceCloneReceiptOperation = "configuration.namespace.clone.receipt"
 
 type ConfigurationNamespaceMapping struct {
 	SourceID         string `json:"source_id"`

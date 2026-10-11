@@ -43,7 +43,7 @@ func TestConfigurationNamespaceCloneAtomicSourceFencesAndReplay(t *testing.T) {
 	if json.Unmarshal(raw, &out) != nil || out.Namespace.ID != "copy-ns" {
 		t.Fatal(string(raw))
 	}
-	read, e := run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: clone.ResourceID, Branch: "main"})
+	read, e := run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: clone.ResourceID, Branch: "main"})
 	if e != nil {
 		t.Fatal(e)
 	}

@@ -19,6 +19,16 @@ import (
 
 const testScope = `{"namespace":"core","user":"operator","workspace":"station"}`
 
+// The tests of the internal functions send JSON requests through run, which
+// routes them by these names.
+const (
+	namespaceSnapshotOperation = "namespace.snapshot"
+	resourceSnapshotOperation  = "resource.snapshot"
+	incomingOperation          = "configuration.references.incoming"
+	receiptOperation           = "configuration.receipt"
+	cloneReceiptOperation      = "configuration.namespace.clone.receipt"
+)
+
 func fixture(t *testing.T) (*sql.DB, context.Context) {
 	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "core.db")+"?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)")
@@ -91,9 +101,9 @@ func apply(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.Ra
 		result, err = decodeInto(raw, func(q model.ConfigurationResourceCreate) (any, error) { return configurationCreate(ctx, tx, scope, q) })
 	case model.ResourceCommitOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationResourceCommit) (any, error) { return configurationCommit(ctx, tx, scope, q) })
-	case model.ResourceSnapshotOperation:
+	case resourceSnapshotOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationResourceRead) (any, error) { return configurationRead(ctx, tx, scope, q) })
-	case model.ConfigurationReceiptOperation:
+	case receiptOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationReceipt) (any, error) { return configurationReceipt(ctx, tx, scope, q) })
 	case model.ConfigurationBranchCreateOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationBranchCreate) (any, error) {
@@ -111,13 +121,13 @@ func apply(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.Ra
 		result, err = decodeInto(raw, func(q model.ConfigurationResourceMetadata) (any, error) {
 			return configurationResourceMetadata(ctx, tx, scope, q)
 		})
-	case model.ConfigurationIncomingOperation:
+	case incomingOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationIncomingRead) (any, error) {
 			return configurationIncomingRead(ctx, tx, scope, q)
 		})
 	case model.ConfigurationNamespaceCloneOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceClone) (any, error) { return configurationClone(ctx, tx, scope, q) })
-	case model.ConfigurationNamespaceCloneReceiptOperation:
+	case cloneReceiptOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceCloneReceipt) (any, error) {
 			return configurationCloneReceipt(ctx, tx, scope, q)
 		})
@@ -125,7 +135,7 @@ func apply(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.Ra
 		result, err = decodeInto(raw, func(q model.ConfigurationNamespaceWrite) (any, error) {
 			return configurationNamespaceWrite(ctx, tx, scope, operation, q)
 		})
-	case model.NamespaceSnapshotOperation:
+	case namespaceSnapshotOperation:
 		result, err = decodeInto(raw, func(q model.NamespaceRead) (any, error) { return namespaceSnapshot(ctx, tx, scope, q) })
 	case model.ConfigurationNamespacesOperation, model.ConfigurationResourcesOperation, model.ConfigurationBranchesOperation, model.ConfigurationCommitsOperation, model.ConfigurationChangesOperation:
 		result, err = decodeInto(raw, func(q model.ConfigurationCatalogRead) (any, error) {
@@ -185,7 +195,7 @@ func seedTree(t *testing.T, db *sql.DB, ctx context.Context) {
 func TestNamespaceSnapshotReturnsCurrentMainTreeAndVerifiesDigests(t *testing.T) {
 	db, ctx := fixture(t)
 	seedTree(t, db, ctx)
-	raw, err := run(t, db, ctx, model.NamespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "source"})
+	raw, err := run(t, db, ctx, namespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "source"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -195,7 +205,7 @@ func TestNamespaceSnapshotReturnsCurrentMainTreeAndVerifiesDigests(t *testing.T)
 	}
 	// A changed frozen payload no longer matches its immutable content digest.
 	execSQL(t, db, ctx, "UPDATE core_snapshots SET payload=? WHERE id='commit-0'", []byte(`{"typed_name":"Tampered"}`))
-	if _, err = run(t, db, ctx, model.NamespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "source"}); errorCode(err) != "failed_precondition" {
+	if _, err = run(t, db, ctx, namespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "source"}); errorCode(err) != "failed_precondition" {
 		t.Fatalf("tampered content accepted: %v", err)
 	}
 }
@@ -235,7 +245,7 @@ func TestRelationalIndexesAndScopeIsolation(t *testing.T) {
 	}
 	defer tx.Rollback()
 	raw, _ := json.Marshal(model.NamespaceRead{Domain: "robot", ID: "source"})
-	if _, err = apply(ctx, tx, `{"namespace":"core","user":"other","workspace":"station"}`, model.NamespaceSnapshotOperation, raw); errorCode(err) != "not_found" {
+	if _, err = apply(ctx, tx, `{"namespace":"core","user":"other","workspace":"station"}`, namespaceSnapshotOperation, raw); errorCode(err) != "not_found" {
 		t.Fatalf("scope leaked source: %v", err)
 	}
 }
@@ -245,7 +255,7 @@ func TestNamespaceSnapshotBoundsTheSubtree(t *testing.T) {
 	seedTree(t, db, ctx)
 	execSQL(t, db, ctx, `WITH RECURSIVE seq(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM seq WHERE i<1024)
  INSERT INTO core_namespaces SELECT ?,'robot','extra-'||i,'other','extra-'||i,'extra-'||i,1,0,'{}' FROM seq`, testScope)
-	if _, err := run(t, db, ctx, model.NamespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "other"}); errorCode(err) != "resource_exhausted" {
+	if _, err := run(t, db, ctx, namespaceSnapshotOperation, model.NamespaceRead{Domain: "robot", ID: "other"}); errorCode(err) != "resource_exhausted" {
 		t.Fatalf("subtree bound=%v", err)
 	}
 }
