@@ -3,7 +3,7 @@ module github.com/XGC-Team/xgc2-storage
 go 1.25.0
 
 require (
-	github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261011013206-d33afa88c426
+	github.com/XGC-Team/xgc2-xrpc/go v0.0.0-20261011052114-ec2953aac4d5
 	golang.org/x/sys v0.42.0
 	golang.org/x/text v0.30.0
 	google.golang.org/grpc v1.77.0
