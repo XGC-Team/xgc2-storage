@@ -396,7 +396,7 @@ func TestBranchAndArchiveLifecycle(t *testing.T) {
 	if archived.Result.Head.Branch.Revision != "2" || archived.Result.Head.Branch.ArchivedAt == "" {
 		t.Fatal("archive did not advance branch")
 	}
-	fork.ID = "review-v2"
+	fork.ID = "review-fork"
 	fork.Mutation = meta("fork-again")
 	second := must(f.core.CreateBranch(f.ctx, fork))
 	if second.Result.Head.Branch.ID == first.Result.Head.Branch.ID {

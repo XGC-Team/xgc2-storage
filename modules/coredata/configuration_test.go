@@ -377,7 +377,7 @@ func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 		t.Fatal("large decimal drift")
 	}
 	newg := g
-	newg.SchemaIdentity = "catalog-v2"
+	newg.SchemaIdentity = "catalog-changed"
 	newg.RegistryDigest = strings.Repeat("b", 64)
 	tx, e := db.BeginTx(ctx, nil)
 	if e != nil {
@@ -473,7 +473,7 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-v2", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-changed", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
 	configurationCode(t, e, "conflict")
 	tx.Rollback()
 }
