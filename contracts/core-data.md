@@ -62,12 +62,18 @@ builds through `EXPLAIN QUERY PLAN`.
 ## Sessions
 
 One Session per target is live (`open` or `stopping`); the database enforces it.
+The record keeps the pinned experiment resource and commit, its name (possibly empty,
+at most 256 UTF-8 bytes without control characters), and the required run mode (a text
+key of at most 64 bytes). A close records an outcome of `stopped` or `failed` and an
+optional error JSON object, bounded like the stop intent at 64 KiB. Live and interrupted
+Sessions have no outcome; Core maps Storage's `interrupted` status to `closed` with
+outcome `interrupted`.
 
 | Function | Class | Behavior |
 | --- | --- | --- |
-| `OpenSession` | Durable | a second live Session on the target is a `conflict`; opening the same Session again returns it with `created=false` |
+| `OpenSession` | Durable | a second live Session on the target is a `conflict`; opening the same Session again returns it with `created=false`; a different target, experiment commit or run mode under that ID is a `conflict` |
 | `RequestStop` | Durable | `open` to `stopping` with the stop intent (a JSON object, immutable: later calls return the Session unchanged) |
-| `CloseSession` | Durable | `open`/`stopping` to `closed`; closing again is a no-op |
+| `CloseSession(ctx, id, model.SessionClose)` | Durable | `open`/`stopping` to `closed` with outcome and error; closing a closed or interrupted Session is a no-op that returns the stored record |
 | `GetSession`, `ListSessions` | read | newest first; filters: target, experiment resource, statuses |
 | `CloseOpenSessions` | Durable | Core's boot step: live Sessions become `interrupted` |
 

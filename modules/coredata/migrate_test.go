@@ -266,6 +266,14 @@ func TestProductionDatabaseMigratesKeepingConfigurationAndDroppingExecutionData(
 	if err != nil || !created || run.Status != model.RunQueued {
 		t.Fatalf("run after migration: %+v %v", run, err)
 	}
+	session, created, err := core.OpenSession(ctx, model.NewSession{ID: "session-after", TargetID: "local", ExperimentResourceID: "res-one", ExperimentCommitID: main.Head.Commit.ID, RunMode: "managed", ExperimentName: "Migrated experiment", At: epoch})
+	if err != nil || !created || session.RunMode != "managed" || session.ExperimentName != "Migrated experiment" {
+		t.Fatalf("session after migration: %+v %v", session, err)
+	}
+	closed, err := core.CloseSession(ctx, session.ID, model.SessionClose{At: epoch.Add(time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"code":"workflow_failed"}`)})
+	if err != nil || closed.Status != model.SessionClosed || closed.Outcome != model.SessionFailed || string(closed.Error) != `{"code":"workflow_failed"}` {
+		t.Fatalf("closed session after migration: %+v %v", closed, err)
+	}
 
 	// Documents survive with their versions, tombstones and rebuilt indexes.
 	lichtblick := api.Scope{Namespace: "lichtblick", User: "operator", Workspace: "station"}

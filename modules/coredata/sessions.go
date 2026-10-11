@@ -6,22 +6,25 @@ import (
 	"errors"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-const sessionColumns = "id,target_id,experiment_resource_id,experiment_commit_id,root_run_id,status,stop_intent_json,opened_at,closed_at,revision"
+const sessionColumns = "id,target_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision"
 
 func scanSession(row scanner) (model.Session, error) {
 	var v model.Session
-	var status string
-	var intent []byte
+	var status, outcome string
+	var intent, errored []byte
 	var opened, closed int64
-	if err := row.Scan(&v.ID, &v.TargetID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RootRunID, &status, &intent, &opened, &closed, &v.Revision); err != nil {
+	if err := row.Scan(&v.ID, &v.TargetID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RunMode, &v.ExperimentName, &v.RootRunID, &status, &intent, &outcome, &errored, &opened, &closed, &v.Revision); err != nil {
 		return v, err
 	}
-	v.Status, v.StopIntent = model.SessionStatus(status), rawOrNil(intent)
+	v.Status, v.Outcome = model.SessionStatus(status), model.SessionOutcome(outcome)
+	v.StopIntent, v.Error = rawOrNil(intent), rawOrNil(errored)
 	v.OpenedAt, v.ClosedAt = instant(opened), instant(closed)
 	return v, nil
 }
@@ -31,7 +34,7 @@ func selectSession(ctx context.Context, tx *sql.Tx, scope, where string, args ..
 }
 
 func sessionBytes(v model.Session) int64 {
-	return int64(rowOverhead + len(v.ID) + len(v.TargetID) + len(v.ExperimentResourceID) + len(v.ExperimentCommitID) + len(v.RootRunID) + len(v.StopIntent))
+	return int64(rowOverhead + len(v.ID) + len(v.TargetID) + len(v.ExperimentResourceID) + len(v.ExperimentCommitID) + len(v.RunMode) + len(v.ExperimentName) + len(v.RootRunID) + len(v.StopIntent) + len(v.Outcome) + len(v.Error))
 }
 
 // liveSessionOfTarget is fixed text so that the plan test can run it as written.
@@ -41,14 +44,20 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 	if !textKey(q.ID) || !textKey(q.TargetID) || !textKey(q.ExperimentResourceID) || !textKey(q.ExperimentCommitID) {
 		return model.Session{}, false, failure("invalid_argument", "session, target, experiment resource and commit identities are required")
 	}
+	if !textKey(q.RunMode) || len(q.RunMode) > 64 {
+		return model.Session{}, false, failure("invalid_argument", "a run mode text key of at most 64 bytes is required")
+	}
+	if len(q.ExperimentName) > 256 || !utf8.ValidString(q.ExperimentName) || strings.IndexFunc(q.ExperimentName, unicode.IsControl) >= 0 {
+		return model.Session{}, false, failure("invalid_argument", "experiment name must be at most 256 UTF-8 bytes without control characters")
+	}
 	if err := optionalKey("root run", q.RootRunID); err != nil {
 		return model.Session{}, false, err
 	}
 	existing, err := selectSession(ctx, tx, scope, "id=?", q.ID)
 	if err == nil {
 		// Opening the same Session again is a replay of the same start.
-		if existing.TargetID != q.TargetID || existing.ExperimentCommitID != q.ExperimentCommitID {
-			return model.Session{}, false, failure("conflict", "session identity already used for another target or experiment commit")
+		if existing.TargetID != q.TargetID || existing.ExperimentCommitID != q.ExperimentCommitID || existing.RunMode != q.RunMode {
+			return model.Session{}, false, failure("conflict", "session identity already used for another target, experiment commit or run mode")
 		}
 		return existing, false, nil
 	}
@@ -63,12 +72,13 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 		return model.Session{}, false, err
 	}
 	v := model.Session{ID: q.ID, TargetID: q.TargetID, ExperimentResourceID: q.ExperimentResourceID, ExperimentCommitID: q.ExperimentCommitID, RootRunID: q.RootRunID,
+		RunMode: q.RunMode, ExperimentName: q.ExperimentName,
 		Status: model.SessionOpen, OpenedAt: nowOr(q.At), Revision: 1}
 	bytes := sessionBytes(v)
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Session{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,x'',?,0,1,?)", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes)
+	_, err = tx.ExecContext(ctx, "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,x'','',x'',?,0,1,?)", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RunMode, v.ExperimentName, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes)
 	return v, true, err
 }
 
@@ -91,12 +101,16 @@ func requestStop(ctx context.Context, tx *sql.Tx, scope, id string, intent []byt
 	return getSession(ctx, tx, scope, id)
 }
 
-func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, at time.Time) (model.Session, error) {
+func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, close model.SessionClose) (model.Session, error) {
 	v, err := getSession(ctx, tx, scope, id)
 	if err != nil || !v.Status.Live() {
 		return v, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET status='closed',closed_at=?,revision=revision+1 WHERE scope=? AND id=? AND status IN ('open','stopping')", nanos(nowOr(at)), scope, id); err != nil {
+	grown := int64(len(close.Outcome) + len(close.Error))
+	if err = charge(ctx, tx, scope, 0, grown); err != nil {
+		return v, err
+	}
+	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET status='closed',outcome=?,error_json=?,closed_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status IN ('open','stopping')", string(close.Outcome), []byte(close.Error), nanos(nowOr(close.At)), grown, scope, id); err != nil {
 		return v, err
 	}
 	return getSession(ctx, tx, scope, id)
@@ -206,10 +220,19 @@ func (s *Store) RequestStop(ctx context.Context, id string, intent []byte) (mode
 	})
 }
 
-// CloseSession durably closes a live Session.
-func (s *Store) CloseSession(ctx context.Context, id string, at time.Time) (model.Session, error) {
+// CloseSession durably closes a live Session with its outcome and optional error.
+// Closing a closed or interrupted Session returns the stored record unchanged.
+func (s *Store) CloseSession(ctx context.Context, id string, close model.SessionClose) (model.Session, error) {
+	if close.Outcome != model.SessionStopped && close.Outcome != model.SessionFailed {
+		return model.Session{}, failure("invalid_argument", "a stopped or failed session outcome is required")
+	}
+	stored, err := jsonField("session error", close.Error, model.MaxStopIntentBytes, false, true)
+	if err != nil {
+		return model.Session{}, err
+	}
+	close.Error = stored
 	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.Session, error) {
-		return closeSession(ctx, tx, scope, id, at)
+		return closeSession(ctx, tx, scope, id, close)
 	})
 }
 

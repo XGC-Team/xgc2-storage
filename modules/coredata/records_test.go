@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -359,17 +360,22 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 func TestSessionLifecycleOneLivePerTarget(t *testing.T) {
 	f := openStore(t)
 	before := stats(t, f)
-	open := model.NewSession{ID: "s1", TargetID: "local", ExperimentResourceID: "exp", ExperimentCommitID: "exp-v1", RootRunID: "root", At: epoch}
+	open := model.NewSession{ID: "s1", TargetID: "local", ExperimentResourceID: "exp", ExperimentCommitID: "exp-v1", RunMode: "managed", ExperimentName: "Test experiment", RootRunID: "root", At: epoch}
 	s1, created, err := f.core.OpenSession(f.ctx, open)
-	if err != nil || !created || s1.Status != model.SessionOpen || s1.Revision != 1 || !s1.OpenedAt.Equal(epoch) || !s1.ClosedAt.IsZero() {
+	if err != nil || !created || s1.Status != model.SessionOpen || s1.Revision != 1 || !s1.OpenedAt.Equal(epoch) || !s1.ClosedAt.IsZero() || s1.RunMode != open.RunMode || s1.ExperimentName != open.ExperimentName || s1.Outcome != "" || s1.Error != nil {
 		t.Fatalf("open: %+v %v", s1, err)
 	}
 	if d, r := commits(t, f, before); d != 1 || r != 0 {
 		t.Fatalf("OpenSession must be one durable commit: durable=%d relaxed=%d", d, r)
 	}
 	again, created, err := f.core.OpenSession(f.ctx, open)
-	if err != nil || created || again.ID != "s1" {
+	if err != nil || created || !reflect.DeepEqual(again, s1) {
 		t.Fatalf("replayed open: %+v %v %v", again, created, err)
+	}
+	renamed := open
+	renamed.ExperimentName = "Renamed experiment"
+	if again, created, err = f.core.OpenSession(f.ctx, renamed); err != nil || created || !reflect.DeepEqual(again, s1) {
+		t.Fatalf("replay changed the recorded experiment name: %+v %v %v", again, created, err)
 	}
 	other := open
 	other.ID = "s2"
@@ -384,6 +390,16 @@ func TestSessionLifecycleOneLivePerTarget(t *testing.T) {
 	mismatch.ExperimentCommitID = "exp-next"
 	if _, _, err = f.core.OpenSession(f.ctx, mismatch); errCode(err) != "conflict" {
 		t.Fatalf("session identity reused for another commit: %v", err)
+	}
+	mismatch = open
+	mismatch.TargetID = "agent-2"
+	if _, _, err = f.core.OpenSession(f.ctx, mismatch); errCode(err) != "conflict" {
+		t.Fatalf("session identity reused for another target: %v", err)
+	}
+	mismatch = open
+	mismatch.RunMode = "manual"
+	if _, _, err = f.core.OpenSession(f.ctx, mismatch); errCode(err) != "conflict" {
+		t.Fatalf("session identity reused for another run mode: %v", err)
 	}
 	// The stop intent is immutable.
 	stopping, err := f.core.RequestStop(f.ctx, "s1", []byte(`{"by":"alice","reason":"done"}`))
@@ -406,12 +422,12 @@ func TestSessionLifecycleOneLivePerTarget(t *testing.T) {
 	if _, _, err = f.core.OpenSession(f.ctx, third); errCode(err) != "conflict" {
 		t.Fatalf("stopping session released its target: %v", err)
 	}
-	closed, err := f.core.CloseSession(f.ctx, "s1", epoch.Add(time.Hour))
-	if err != nil || closed.Status != model.SessionClosed || !closed.ClosedAt.Equal(epoch.Add(time.Hour)) {
+	closed, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(time.Hour), Outcome: model.SessionStopped})
+	if err != nil || closed.Status != model.SessionClosed || closed.Outcome != model.SessionStopped || closed.Error != nil || closed.Revision != 3 || !closed.ClosedAt.Equal(epoch.Add(time.Hour)) {
 		t.Fatalf("close: %+v %v", closed, err)
 	}
-	again2, err := f.core.CloseSession(f.ctx, "s1", epoch.Add(2*time.Hour))
-	if err != nil || !again2.ClosedAt.Equal(closed.ClosedAt) || again2.Revision != closed.Revision {
+	again2, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(2 * time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)})
+	if err != nil || !reflect.DeepEqual(again2, closed) {
 		t.Fatalf("closing twice changed the session: %+v %v", again2, err)
 	}
 	if kept, _ := f.core.RequestStop(f.ctx, "s1", []byte(`{"late":true}`)); kept.Status != model.SessionClosed || string(kept.StopIntent) != `{"by":"alice","reason":"done"}` {
@@ -434,27 +450,225 @@ func TestSessionLifecycleOneLivePerTarget(t *testing.T) {
 	}
 }
 
+func TestOpenSessionValidatesRunModeAndExperimentName(t *testing.T) {
+	f := openStore(t)
+	cases := []struct {
+		name, runMode, experimentName, code string
+	}{
+		{name: "empty name", runMode: "managed"},
+		{name: "mode byte limit", runMode: strings.Repeat("a", 64)},
+		{name: "UTF-8 mode byte limit", runMode: strings.Repeat("\u00e9", 32)},
+		{name: "name byte limit", runMode: "managed", experimentName: strings.Repeat("a", 256)},
+		{name: "UTF-8 name byte limit", runMode: "managed", experimentName: strings.Repeat("\u00e9", 128)},
+		{name: "missing mode", code: "invalid_argument"},
+		{name: "long mode", runMode: strings.Repeat("a", 65), code: "invalid_argument"},
+		{name: "long UTF-8 mode", runMode: strings.Repeat("\u00e9", 33), code: "invalid_argument"},
+		{name: "mode leading space", runMode: " managed", code: "invalid_argument"},
+		{name: "mode trailing space", runMode: "managed ", code: "invalid_argument"},
+		{name: "mode newline", runMode: "managed\nrun", code: "invalid_argument"},
+		{name: "mode NUL", runMode: "managed\x00run", code: "invalid_argument"},
+		{name: "invalid UTF-8 mode", runMode: "\xff", code: "invalid_argument"},
+		{name: "long name", runMode: "managed", experimentName: strings.Repeat("a", 257), code: "invalid_argument"},
+		{name: "long UTF-8 name", runMode: "managed", experimentName: strings.Repeat("\u00e9", 129), code: "invalid_argument"},
+		{name: "invalid UTF-8 name", runMode: "managed", experimentName: "\xff", code: "invalid_argument"},
+		{name: "name newline", runMode: "managed", experimentName: "name\nnext", code: "invalid_argument"},
+		{name: "name tab", runMode: "managed", experimentName: "name\tnext", code: "invalid_argument"},
+		{name: "name NUL", runMode: "managed", experimentName: "name\x00next", code: "invalid_argument"},
+		{name: "name DEL", runMode: "managed", experimentName: "name\x7fnext", code: "invalid_argument"},
+		{name: "name Unicode control", runMode: "managed", experimentName: "name\u0085next", code: "invalid_argument"},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			q := model.NewSession{ID: fmt.Sprintf("session-%d", i), TargetID: fmt.Sprintf("target-%d", i), ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: c.runMode, ExperimentName: c.experimentName}
+			s, created, err := f.core.OpenSession(f.ctx, q)
+			if c.code != "" {
+				if errCode(err) != c.code || created {
+					t.Fatalf("invalid open: %+v %v %v", s, created, err)
+				}
+				return
+			}
+			if err != nil || !created || s.RunMode != q.RunMode || s.ExperimentName != q.ExperimentName {
+				t.Fatalf("valid open: %+v %v %v", s, created, err)
+			}
+			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, s) {
+				t.Fatalf("get changed session fields: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCloseSessionRecordsOutcomeAndSurvivesARestart(t *testing.T) {
+	for name, close := range map[string]model.SessionClose{
+		"stopped":       {Outcome: model.SessionStopped},
+		"failed":        {Outcome: model.SessionFailed, Error: []byte(` { "code": "workflow_failed", "value": 9007199254740993 } `)},
+		"largest error": {Outcome: model.SessionFailed, Error: []byte(`{"x":"` + strings.Repeat("a", model.MaxStopIntentBytes-len(`{"x":""}`)) + `"}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := openStore(t)
+			q := model.NewSession{ID: "s", TargetID: "local", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed", ExperimentName: "Experiment snapshot", RootRunID: "root", At: epoch}
+			must3(f.core.OpenSession(f.ctx, q))
+			close.At = epoch.Add(time.Hour)
+			before := stats(t, f)
+			closed, err := f.core.CloseSession(f.ctx, q.ID, close)
+			if err != nil || closed.Status != model.SessionClosed || closed.Outcome != close.Outcome || string(closed.Error) != string(close.Error) || !closed.ClosedAt.Equal(close.At) || closed.Revision != 2 || closed.RunMode != q.RunMode || closed.ExperimentName != q.ExperimentName {
+				t.Fatalf("close: %+v %v", closed, err)
+			}
+			if d, r := commits(t, f, before); d != 1 || r != 0 {
+				t.Fatalf("CloseSession must be one durable commit: durable=%d relaxed=%d", d, r)
+			}
+			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed) {
+				t.Fatalf("get changed closed session fields: %+v", got)
+			}
+			page := must(f.core.ListSessions(f.ctx, model.SessionFilter{}))
+			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed) {
+				t.Fatalf("list changed closed session fields: %+v", page.Sessions)
+			}
+			f.reopen(t)
+			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed) {
+				t.Fatalf("closed session after restart: %+v", got)
+			}
+			page = must(f.core.ListSessions(f.ctx, model.SessionFilter{}))
+			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed) {
+				t.Fatalf("list after restart: %+v", page.Sessions)
+			}
+			if replay, created, err := f.core.OpenSession(f.ctx, q); err != nil || created || !reflect.DeepEqual(replay, closed) {
+				t.Fatalf("reopening a closed session changed it: %+v %v %v", replay, created, err)
+			}
+		})
+	}
+}
+
+func TestCloseSessionValidatesOutcomeAndError(t *testing.T) {
+	f := openStore(t)
+	opened := must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
+	rows, bytes := usageRows(t, f)
+	for name, close := range map[string]model.SessionClose{
+		"missing outcome":     {},
+		"open outcome":        {Outcome: "open"},
+		"interrupted outcome": {Outcome: "interrupted"},
+		"unknown outcome":     {Outcome: "unknown"},
+		"invalid error JSON":  {Outcome: model.SessionFailed, Error: []byte(`{`)},
+		"error array":         {Outcome: model.SessionFailed, Error: []byte(`[]`)},
+		"error null":          {Outcome: model.SessionFailed, Error: []byte(`null`)},
+		"error string":        {Outcome: model.SessionFailed, Error: []byte(`"error"`)},
+	} {
+		if _, err := f.core.CloseSession(f.ctx, "s", close); errCode(err) != "invalid_argument" {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	oversized := model.SessionClose{Outcome: model.SessionFailed, Error: []byte(`{"x":"` + strings.Repeat("a", model.MaxStopIntentBytes) + `"}`)}
+	if _, err := f.core.CloseSession(f.ctx, "s", oversized); errCode(err) != "resource_exhausted" {
+		t.Fatalf("oversized error: %v", err)
+	}
+	if _, err := f.core.CloseSession(f.ctx, "", model.SessionClose{Outcome: model.SessionStopped}); errCode(err) != "invalid_argument" {
+		t.Fatalf("missing identity: %v", err)
+	}
+	if _, err := f.core.CloseSession(f.ctx, "ghost", model.SessionClose{Outcome: model.SessionStopped}); errCode(err) != "not_found" {
+		t.Fatalf("missing session: %v", err)
+	}
+	if got := must(f.core.GetSession(f.ctx, "s")); !reflect.DeepEqual(got, opened) {
+		t.Fatalf("invalid close changed session: %+v", got)
+	}
+	if r, b := usageRows(t, f); r != rows || b != bytes {
+		t.Fatalf("invalid close changed quota: %d/%d -> %d/%d", rows, bytes, r, b)
+	}
+}
+
+func TestSessionOutcomeConstraints(t *testing.T) {
+	f := openStore(t)
+	opened := must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
+	for name, query := range map[string]string{
+		"closed without outcome":    "UPDATE sessions SET status='closed',closed_at=1 WHERE id='s'",
+		"outcome while open":        "UPDATE sessions SET outcome='stopped' WHERE id='s'",
+		"outcome while stopping":    "UPDATE sessions SET status='stopping',outcome='failed' WHERE id='s'",
+		"outcome while interrupted": "UPDATE sessions SET status='interrupted',closed_at=1,outcome='stopped' WHERE id='s'",
+		"invalid closed outcome":    "UPDATE sessions SET status='closed',closed_at=1,outcome='interrupted' WHERE id='s'",
+	} {
+		if err := f.db.Write(f.ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, query)
+			return err
+		}); err == nil {
+			t.Errorf("%s passed the session constraints", name)
+		}
+	}
+	if got := must(f.core.GetSession(f.ctx, "s")); !reflect.DeepEqual(got, opened) {
+		t.Fatalf("rejected SQL changed session: %+v", got)
+	}
+}
+
+func TestSessionQuotaCountsRunModeNameOutcomeAndError(t *testing.T) {
+	f := openStore(t)
+	rows0, bytes0 := usageRows(t, f)
+	base := model.NewSession{ID: "a", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "r"}
+	must3(f.core.OpenSession(f.ctx, base))
+	rows1, bytes1 := usageRows(t, f)
+	q := base
+	q.ID, q.TargetID, q.RunMode, q.ExperimentName = "b", "t2", "managed", "\u00e9 mission"
+	must3(f.core.OpenSession(f.ctx, q))
+	rows2, bytes2 := usageRows(t, f)
+	wantExtra := int64(len(q.RunMode) - len(base.RunMode) + len(q.ExperimentName))
+	if rows1 != rows0+1 || rows2 != rows1+1 || (bytes2-bytes1)-(bytes1-bytes0) != wantExtra {
+		t.Fatalf("open fields not charged: rows %d/%d/%d bytes %d/%d/%d extra %d", rows0, rows1, rows2, bytes0, bytes1, bytes2, wantExtra)
+	}
+	intent := []byte(`{"by":"operator"}`)
+	must(f.core.RequestStop(f.ctx, q.ID, intent))
+	close := model.SessionClose{At: epoch, Outcome: model.SessionFailed, Error: []byte(`{"code":"workflow_failed"}`)}
+	closed := must(f.core.CloseSession(f.ctx, q.ID, close))
+	rows3, bytes3 := usageRows(t, f)
+	if want := int64(len(intent) + len(close.Outcome) + len(close.Error)); rows3 != rows2 || bytes3-bytes2 != want {
+		t.Fatalf("stop and close fields not charged: rows %d->%d bytes %d->%d want growth %d", rows2, rows3, bytes2, bytes3, want)
+	}
+	var storedBytes int64
+	if err := f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT sum(bytes) FROM sessions WHERE scope=?", engine.ScopeID(f.scope)).Scan(&storedBytes)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if storedBytes != bytes3-bytes0 {
+		t.Fatalf("session row bytes %d differ from charged bytes %d", storedBytes, bytes3-bytes0)
+	}
+	if again := must(f.core.CloseSession(f.ctx, q.ID, model.SessionClose{Outcome: model.SessionStopped, Error: []byte(`{"late":true}`)})); !reflect.DeepEqual(again, closed) {
+		t.Fatalf("close replay changed stored record: %+v", again)
+	}
+	if r, b := usageRows(t, f); r != rows3 || b != bytes3 {
+		t.Fatalf("close replay charged bytes: %d/%d -> %d/%d", rows3, bytes3, r, b)
+	}
+	// Recording an admitted Session's outcome is allowed even at the quota limit.
+	f.exec(t, "UPDATE core_data_usage SET rows=?,bytes=?", coredata.MaxScopeRows, coredata.MaxScopeBytes)
+	must(f.core.CloseSession(f.ctx, base.ID, model.SessionClose{Outcome: model.SessionStopped}))
+	if r, b := usageRows(t, f); r != coredata.MaxScopeRows || b != coredata.MaxScopeBytes+int64(len(model.SessionStopped)) {
+		t.Fatalf("close at full quota: %d/%d", r, b)
+	}
+}
+
 func TestCloseOpenSessionsAtBoot(t *testing.T) {
 	f := openStore(t)
-	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "a", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c"}))
-	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "b", TargetID: "t2", ExperimentResourceID: "e", ExperimentCommitID: "c"}))
-	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "c", TargetID: "t3", ExperimentResourceID: "e", ExperimentCommitID: "c"}))
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "a", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "b", TargetID: "t2", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "c", TargetID: "t3", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
 	must(f.core.RequestStop(f.ctx, "b", []byte(`{}`)))
-	must(f.core.CloseSession(f.ctx, "c", epoch))
+	closed := must(f.core.CloseSession(f.ctx, "c", model.SessionClose{At: epoch, Outcome: model.SessionFailed, Error: []byte(`{"code":"test_failure"}`)}))
 	at := epoch.Add(time.Hour)
 	n, err := f.core.CloseOpenSessions(f.ctx, at)
 	if err != nil || n != 2 {
 		t.Fatalf("interrupted %d: %v", n, err)
 	}
 	for _, id := range []string{"a", "b"} {
-		if s := must(f.core.GetSession(f.ctx, id)); s.Status != model.SessionInterrupted || !s.ClosedAt.Equal(at) {
+		s := must(f.core.GetSession(f.ctx, id))
+		if s.Status != model.SessionInterrupted || !s.ClosedAt.Equal(at) || s.Outcome != "" || s.Error != nil {
 			t.Errorf("%s: %+v", id, s)
 		}
+		if again := must(f.core.CloseSession(f.ctx, id, model.SessionClose{At: at.Add(time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)})); !reflect.DeepEqual(again, s) {
+			t.Errorf("closing an interrupted session changed it: %+v", again)
+		}
 	}
-	if s := must(f.core.GetSession(f.ctx, "c")); s.Status != model.SessionClosed {
+	if s := must(f.core.GetSession(f.ctx, "c")); !reflect.DeepEqual(s, closed) {
 		t.Errorf("a closed session changed: %+v", s)
 	}
-	if _, _, err = f.core.OpenSession(f.ctx, model.NewSession{ID: "d", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c"}); err != nil {
+	if n, err = f.core.CloseOpenSessions(f.ctx, at); err != nil || n != 0 {
+		t.Fatalf("second boot interrupted %d: %v", n, err)
+	}
+	if _, _, err = f.core.OpenSession(f.ctx, model.NewSession{ID: "d", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}); err != nil {
 		t.Fatalf("an interrupted session still holds its target: %v", err)
 	}
 }
@@ -525,7 +739,7 @@ func TestExecutionFactsSurviveARestart(t *testing.T) {
 	run := newRun("run")
 	run.IdempotencyKey = "k"
 	must3(f.core.CreateRun(f.ctx, run))
-	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "local", ExperimentResourceID: "e", ExperimentCommitID: "c", RootRunID: "run"}))
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "local", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed", RootRunID: "run"}))
 	must3(f.core.AddRecording(f.ctx, model.NewRecording{ID: "rec", RunID: "run", Kind: "k", Path: "/p"}))
 	f.reopen(t)
 	if got := must(f.core.GetRun(f.ctx, "run")); got.IdempotencyKey != "k" || got.Status != model.RunQueued {
@@ -568,7 +782,7 @@ func TestLiveQuotaStopsNewRunsButNeverTheOutcomeOfAdmittedOnes(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("refused")); errCode(err) != "resource_exhausted" {
 		t.Fatalf("a full quota admitted a run: %v", err)
 	}
-	if _, _, err := f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c"}); errCode(err) != "resource_exhausted" {
+	if _, _, err := f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}); errCode(err) != "resource_exhausted" {
 		t.Fatalf("a full quota admitted a session: %v", err)
 	}
 	if _, _, err := f.core.AddRecording(f.ctx, model.NewRecording{ID: "r", RunID: "admitted", Kind: "k", Path: "/p"}); errCode(err) != "resource_exhausted" {
@@ -581,7 +795,7 @@ func TestLiveQuotaStopsNewRunsButNeverTheOutcomeOfAdmittedOnes(t *testing.T) {
 	if n, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: time.Now().Add(time.Hour)}); err != nil || n != 1 {
 		t.Fatalf("prune: %d %v", n, err)
 	}
-	if _, _, err := f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c"}); err != nil {
+	if _, _, err := f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}); err != nil {
 		t.Fatalf("freed room not reusable: %v", err)
 	}
 }

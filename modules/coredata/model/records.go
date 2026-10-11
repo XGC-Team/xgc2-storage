@@ -149,6 +149,14 @@ const (
 
 func (s SessionStatus) Live() bool { return s == SessionOpen || s == SessionStopping }
 
+// SessionOutcome records how a Session was closed.
+type SessionOutcome string
+
+const (
+	SessionStopped SessionOutcome = "stopped"
+	SessionFailed  SessionOutcome = "failed"
+)
+
 // Session is the durable record of one experiment session on a target. At most
 // one Session per target is live. StopIntent is set once and never changes.
 type Session struct {
@@ -156,21 +164,37 @@ type Session struct {
 	TargetID             string          `json:"target_id"`
 	ExperimentResourceID string          `json:"experiment_resource_id"`
 	ExperimentCommitID   string          `json:"experiment_commit_id"`
+	RunMode              string          `json:"run_mode"`
+	ExperimentName       string          `json:"experiment_name"`
 	RootRunID            string          `json:"root_run_id,omitempty"`
 	Status               SessionStatus   `json:"status"`
 	StopIntent           json.RawMessage `json:"stop_intent,omitempty"`
+	Outcome              SessionOutcome  `json:"outcome,omitempty"`
+	Error                json.RawMessage `json:"error,omitempty"`
 	OpenedAt             time.Time       `json:"opened_at"`
 	ClosedAt             time.Time       `json:"closed_at,omitzero"`
 	Revision             int64           `json:"revision"`
 }
 
+// NewSession requires a RunMode text key of at most 64 bytes. ExperimentName may
+// be empty and is at most 256 UTF-8 bytes without control characters.
 type NewSession struct {
 	ID                   string
 	TargetID             string
 	ExperimentResourceID string
 	ExperimentCommitID   string
+	RunMode              string
+	ExperimentName       string
 	RootRunID            string
 	At                   time.Time
+}
+
+// SessionClose ends a live Session with a required stopped or failed outcome.
+// Error is an optional JSON object bounded by MaxStopIntentBytes.
+type SessionClose struct {
+	At      time.Time
+	Outcome SessionOutcome
+	Error   json.RawMessage
 }
 
 type SessionFilter struct {
