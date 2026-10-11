@@ -14,12 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/host"
-	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
-	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-storage/server"
+	xrpc "github.com/XGC-Team/xgc2-xrpc/go"
 )
 
 func main() {
@@ -29,9 +27,11 @@ func main() {
 	}
 }
 func run() error {
-	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, identityOut, configurationDomains string
-	var create, printModules bool
+	var path, manifest, grantsFile, socket, grpcSocket, target, refOut, identityOut string
+	var create bool
 	var maxDBBytes int64
+	var readers, writerQueue int
+	var callTimeout time.Duration
 	flag.StringVar(&path, "db", "", "explicit managed database file grant (existing by default)")
 	flag.Int64Var(&maxDBBytes, "max-db-bytes", 1<<30, "finite owner database capacity in bytes")
 	flag.StringVar(&manifest, "manifest", "", "reviewed deployment manifest")
@@ -41,19 +41,13 @@ func run() error {
 	flag.StringVar(&target, "target-id", "", "local target identity")
 	flag.StringVar(&refOut, "ref-out", "", "private runtime file for bound ServiceRef array")
 	flag.StringVar(&identityOut, "identity-out", "", "private runtime file for this owner's actual database identity")
-	flag.StringVar(&configurationDomains, "configuration-domains", "", "explicit Core compiled domain declarations applied by this owner before serving")
+	flag.IntVar(&readers, "readers", 0, "concurrent read connections (default 4, at most 16)")
+	flag.IntVar(&writerQueue, "writer-queue", 0, "writers admitted at once; later callers wait for their deadline (default 64)")
+	flag.DurationVar(&callTimeout, "call-timeout", 0, "longest time one call may run (default 30s)")
 	flag.BoolVar(&create, "create", false, "explicitly initialize absent DB; never replace existing")
-	flag.BoolVar(&printModules, "print-modules", false, "print this storage binary's compiled module declarations without starting")
 	flag.Parse()
 	if flag.NArg() != 0 {
 		return errors.New("storage: unexpected positional arguments")
-	}
-	if printModules {
-		var specs []api.Module
-		for _, module := range registry.Compiled() {
-			specs = append(specs, module.Spec)
-		}
-		return json.NewEncoder(os.Stdout).Encode(specs)
 	}
 	if path == "" || manifest == "" || grantsFile == "" || target == "" || refOut == "" || (socket == "" && grpcSocket == "") {
 		return errors.New("storage: db/manifest/grants/target-id/ref-out and a socket required")
@@ -98,36 +92,17 @@ func run() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	var domains []model.ConfigurationDomainDeclaration
-	if configurationDomains != "" {
-		file, err := os.Open(configurationDomains)
-		if err != nil {
-			return err
-		}
-		raw, err := io.ReadAll(io.LimitReader(file, (256<<10)+1))
-		file.Close()
-		if err != nil {
-			return err
-		}
-		if len(raw) == 0 || len(raw) > 256<<10 {
-			return errors.New("storage: configuration declarations exceed 256 KiB or are empty")
-		}
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&domains); err != nil {
-			return err
-		}
-		if decoder.Decode(new(any)) != io.EOF || len(domains) == 0 || len(domains) > 256 {
-			return errors.New("storage: one bounded domain declaration array required")
-		}
-	}
-	policy, e := host.ResolvePolicy(os.Environ(), m)
+	diagnostics, e := xrpc.NewDiagnostics(xrpc.DiagnosticOptions{Sink: os.Stderr, MaxQueuedRecords: 128, MaxRecordBytes: 4096})
 	if e != nil {
 		return e
 	}
-	owner, e := host.Open(ctx, host.Config{Path: path, Create: create, Manifest: m,
-		ConfigurationDomains: domains, Grants: grants, HTTPSocket: socket, GRPCSocket: grpcSocket,
-		TargetID: target, Policy: policy, MaxDBBytes: maxDBBytes})
+	defer func() {
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = diagnostics.Close(shutdown)
+	}()
+	owner, e := host.Open(ctx, host.Config{Path: path, Create: create, Manifest: m, Readers: readers, WriterQueue: writerQueue,
+		CallBudget: callTimeout, MaxDBBytes: maxDBBytes, Diagnostics: diagnostics})
 	if e != nil {
 		return e
 	}
@@ -136,17 +111,21 @@ func run() error {
 		defer cancel()
 		_ = owner.Close(shutdown)
 	}()
+	exposure, e := owner.Serve(ctx, host.ServeConfig{TargetID: target, HTTPSocket: socket, GRPCSocket: grpcSocket, Grants: grants})
+	if e != nil {
+		return e
+	}
 	if identityOut != "" {
 		if e = publishPrivateJSON(identityOut, map[string]string{"database_id": owner.DatabaseID()}); e != nil {
 			return e
 		}
 	}
-	if e = publishPrivateJSON(refOut, owner.References()); e != nil {
+	if e = publishPrivateJSON(refOut, exposure.References()); e != nil {
 		return e
 	}
 	select {
 	case <-ctx.Done():
-	case <-owner.Done():
+	case <-exposure.Done():
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

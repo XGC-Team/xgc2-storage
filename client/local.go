@@ -15,8 +15,6 @@ type Backend interface {
 	Snapshot(context.Context, api.SnapshotRequest) (api.SnapshotResponse, error)
 	Batch(context.Context, api.BatchRequest) (api.Receipt, error)
 	Receipt(context.Context, api.ReceiptRequest) (api.Receipt, error)
-	Named(context.Context, api.NamedRequest) (api.NamedResponse, error)
-	NamedResult(context.Context, api.ReceiptRequest) (api.NamedResponse, error)
 	WithReadSnapshot(context.Context, api.Scope, func(context.Context) error) error
 }
 
@@ -49,7 +47,7 @@ type local struct {
 // NewLocal borrows the same owner used by the XRPC servers. Calls are ordinary
 // typed function calls with a fixed scope and finite lifetime; no wire codec,
 // loopback transport or second storage implementation is involved.
-func NewLocal(store Backend, scope api.Scope, budget time.Duration) (Interface, error) {
+func NewLocal(store Backend, scope api.Scope, budget time.Duration) (ReadSnapshotClient, error) {
 	if store == nil || scope.Namespace == "" || scope.User == "" || scope.Workspace == "" || budget <= 0 {
 		return nil, errors.New("storage: local owner, explicit scope and finite call budget required")
 	}
@@ -109,26 +107,6 @@ func (c *local) Receipt(ctx context.Context, _ string, r api.ReceiptRequest) (ap
 	}
 	defer cancel()
 	out, err := c.store.Receipt(ctx, r)
-	return out, localError(err)
-}
-
-func (c *local) Named(ctx context.Context, r api.NamedRequest) (api.NamedResponse, error) {
-	ctx, cancel, err := c.call(ctx, r.Scope)
-	if err != nil {
-		return api.NamedResponse{}, err
-	}
-	defer cancel()
-	out, err := c.store.Named(ctx, r)
-	return out, localError(err)
-}
-
-func (c *local) NamedResult(ctx context.Context, _ string, r api.ReceiptRequest) (api.NamedResponse, error) {
-	ctx, cancel, err := c.call(ctx, r.Scope)
-	if err != nil {
-		return api.NamedResponse{}, err
-	}
-	defer cancel()
-	out, err := c.store.NamedResult(ctx, r)
 	return out, localError(err)
 }
 

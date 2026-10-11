@@ -15,7 +15,7 @@ import (
 )
 
 func configurationMutationValid(m model.ConfigurationMutation) error {
-	if !textKey(m.Key) || !canonicalSessionPin(m.IntentDigest) || m.Actor == "" || len(m.Actor) > 255 || !utf8.ValidString(m.Actor) || len(m.Reason) > 4096 || !utf8.ValidString(m.Reason) {
+	if !textKey(m.Key) || !sha256Hex(m.IntentDigest) || m.Actor == "" || len(m.Actor) > 255 || !utf8.ValidString(m.Actor) || len(m.Reason) > 4096 || !utf8.ValidString(m.Reason) {
 		return failure("invalid_argument", "invalid bounded product mutation metadata")
 	}
 	return nil
@@ -114,7 +114,7 @@ func configurationNameFree(ctx context.Context, tx *sql.Tx, scope, domain, names
 	return e
 }
 func configurationGuard(b model.ConfigurationBranch, c model.ConfigurationCommit, g model.ConfigurationBranchGuard) error {
-	if !textKey(g.ID) || !positiveRevision(g.ExpectedRevision) || !textKey(g.CommitID) || !canonicalSessionPin(g.ContentDigest) {
+	if !textKey(g.ID) || !positiveRevision(g.ExpectedRevision) || !textKey(g.CommitID) || !sha256Hex(g.ContentDigest) {
 		return failure("invalid_argument", "exact branch point/content guard required")
 	}
 	if b.ArchivedAt != "" || g.ID != b.ID || g.ExpectedRevision != b.Revision || g.CommitID != b.HeadCommitID || g.CommitID != c.ID || g.ContentDigest != c.ContentDigest {
@@ -268,7 +268,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 		if err != nil {
 			return out, err
 		}
-		if !textKey(q.Main.ID) || !positiveRevision(q.Main.ExpectedRevision) || !textKey(q.Main.CommitID) || !canonicalSessionPin(q.Main.ContentDigest) {
+		if !textKey(q.Main.ID) || !positiveRevision(q.Main.ExpectedRevision) || !textKey(q.Main.CommitID) || !sha256Hex(q.Main.ContentDigest) {
 			return out, failure("invalid_argument", "current main visibility pin required")
 		}
 		if main.Branch != q.Main {

@@ -6,28 +6,6 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 )
 
-func NamedInput(r api.NamedRequest) *NamedRequest {
-	return &NamedRequest{Scope: scope(r.Scope), DatabaseId: r.DatabaseID, Schema: r.Schema, Module: r.Module, Operation: r.Operation, RequestId: r.RequestID, PayloadJson: r.Payload}
-}
-func (r *NamedRequest) API() api.NamedRequest {
-	return api.NamedRequest{Scope: apiScope(r.Scope), DatabaseID: r.DatabaseId, Schema: r.Schema, Module: r.Module, Operation: r.Operation, RequestID: r.RequestId, Payload: r.PayloadJson}
-}
-func NamedOutput(r api.NamedResponse) *NamedResponse {
-	out := &NamedResponse{ResultJson: r.Result}
-	if r.Receipt != nil {
-		out.Receipt = ReceiptOutput(*r.Receipt)
-	}
-	return out
-}
-func (r *NamedResponse) API() api.NamedResponse {
-	out := api.NamedResponse{Result: r.ResultJson}
-	if r.Receipt != nil {
-		receipt := r.Receipt.API()
-		out.Receipt = &receipt
-	}
-	return out
-}
-
 func scope(s api.Scope) *Scope {
 	return &Scope{Namespace: s.Namespace, User: s.User, Workspace: s.Workspace}
 }

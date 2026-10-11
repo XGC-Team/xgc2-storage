@@ -73,13 +73,16 @@ func prepareMutations(ctx context.Context, n api.Namespace, mutations []api.Muta
 	return preparedMutations{mutations: mutations, documents: documents, columns: columns}, nil
 }
 
-// applyMutations is the one record mutation algorithm used by Batch and trusted
-// named modules. Admission, receipt and COMMIT remain with the outer owner.
+// applyMutations is the one record mutation algorithm used by Batch. Admission,
+// receipt and COMMIT remain with the caller. Quotas count live records and
+// bytes, so a delete frees them at once; the tombstone it leaves keeps the CAS
+// version and is itself bounded, oldest dropped first.
 func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next int64, prepared preparedMutations) ([]api.Record, error) {
 	var err error
 	versions := make([]api.Record, 0, len(prepared.mutations))
 	type previousRecord struct {
-		version, bytes int64
+		version, bytes  int64
+		live, tombstone bool
 	}
 	type lookupChange struct {
 		index, tuple string
@@ -104,11 +107,11 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 			s.conflicts.Add(1)
 			return nil, fail("conflict", "record version changed")
 		}
-		previous[i].version = v
-		if v > 0 {
+		previous[i] = previousRecord{version: v, live: v > 0 && !deleted, tombstone: v > 0 && deleted}
+		if previous[i].live {
 			previous[i].bytes = int64(len(oldData) + len(m.Key))
 		}
-		hadIndexes := v > 0 && !deleted
+		hadIndexes := previous[i].live
 		var oldDocument map[string]any
 		if hadIndexes && len(c.Indexes) > 0 {
 			_, oldDocument, err = canonicalObject(oldData)
@@ -147,8 +150,8 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		}
 	}
 	type totals struct {
-		count, bytes int64
-		collection   api.Collection
+		records, bytes, tombstones int64
+		collection                 api.Collection
 	}
 	usage := map[string]*totals{}
 	for i, m := range prepared.mutations {
@@ -157,22 +160,24 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		if values == nil {
 			values = &totals{collection: c}
 			usage[c.ID] = values
-			err = tx.QueryRowContext(ctx, "SELECT records,bytes FROM usage WHERE scope=? AND collection=?", id, c.ID).Scan(&values.count, &values.bytes)
+			err = tx.QueryRowContext(ctx, "SELECT records,bytes,tombstones FROM usage WHERE scope=? AND collection=?", id, c.ID).Scan(&values.records, &values.bytes, &values.tombstones)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
 			}
 		}
-		if previous[i].version == 0 {
-			values.count++
+		p := previous[i]
+		if p.live {
+			values.records--
+			values.bytes -= p.bytes
 		}
-		values.bytes += int64(len(m.Data)+len(m.Key)) - previous[i].bytes
-	}
-	for idCollection, values := range usage {
-		if values.count > int64(values.collection.MaxRecords) || values.bytes > values.collection.MaxBytes {
-			return nil, fail("resource_exhausted", "collection record/byte quota reached")
+		if p.tombstone {
+			values.tombstones--
 		}
-		if _, err = tx.ExecContext(ctx, "INSERT INTO usage VALUES(?,?,?,?) ON CONFLICT(scope,collection) DO UPDATE SET records=excluded.records,bytes=excluded.bytes", id, idCollection, values.count, values.bytes); err != nil {
-			return nil, err
+		if m.Delete {
+			values.tombstones++
+		} else {
+			values.records++
+			values.bytes += int64(len(m.Data) + len(m.Key))
 		}
 	}
 	for i, m := range prepared.mutations {
@@ -191,6 +196,25 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		}
 		versions = append(versions, api.Record{Collection: m.Collection, Key: m.Key, Version: strconv.FormatInt(next, 10), Deleted: m.Delete})
 	}
-
+	for collectionID, values := range usage {
+		if values.records > int64(values.collection.MaxRecords) || values.bytes > values.collection.MaxBytes {
+			return nil, fail("resource_exhausted", "collection record/byte quota reached")
+		}
+		if values.tombstones > int64(values.collection.MaxRecords) {
+			// Older tombstones go first; the ones written by this batch stay.
+			result, e := tx.ExecContext(ctx, "DELETE FROM records WHERE rowid IN (SELECT rowid FROM records WHERE scope=? AND collection=? AND deleted=1 AND version<? ORDER BY version LIMIT ?)", id, collectionID, next, values.tombstones-int64(values.collection.MaxRecords))
+			if e != nil {
+				return nil, e
+			}
+			dropped, e := result.RowsAffected()
+			if e != nil {
+				return nil, e
+			}
+			values.tombstones -= dropped
+		}
+		if _, err = tx.ExecContext(ctx, "INSERT INTO usage VALUES(?,?,?,?,?) ON CONFLICT(scope,collection) DO UPDATE SET records=excluded.records,bytes=excluded.bytes,tombstones=excluded.tombstones", id, collectionID, values.records, values.bytes, values.tombstones); err != nil {
+			return nil, err
+		}
+	}
 	return versions, nil
 }

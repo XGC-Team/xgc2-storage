@@ -68,7 +68,7 @@ func configurationBranchCreate(ctx context.Context, tx *sql.Tx, scope string, q 
 	if err != nil || out.Found {
 		return
 	}
-	if !textKey(q.ResourceID) || !textKey(q.ID) || !textKey(q.FromCommitID) || !canonicalSessionPin(q.FromContentDigest) || !positiveRevision(q.ExpectedResourceRevision) {
+	if !textKey(q.ResourceID) || !textKey(q.ID) || !textKey(q.FromCommitID) || !sha256Hex(q.FromContentDigest) || !positiveRevision(q.ExpectedResourceRevision) {
 		return out, failure("invalid_argument", "exact resource/source pin and allocated branch identity required")
 	}
 	name, key, e := model.NormalizeConfigurationName(model.ConfigurationBranchName, q.Name)

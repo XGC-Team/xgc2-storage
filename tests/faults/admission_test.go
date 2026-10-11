@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/client"
-	"github.com/XGC-Team/xgc2-storage/registry"
 	"github.com/XGC-Team/xgc2-xrpc/go/httpx"
 )
 
@@ -135,9 +135,8 @@ func TestFaultNativeHTTPConnectionAdmissionAndCancellation(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	after := processResources(t, d.cmd.Process.Pid)
-	requestBytes, responseBytes := registry.TransportBounds(manifest())
 	d.transport, err = httpx.New(httpx.Config{LocalTargetID: d.ref.TargetID, Service: d.ref,
-		MaxConnections: 4, MaxInFlight: 16, MaxRequestBytes: int64(requestBytes), MaxResponseBytes: int64(responseBytes)})
+		MaxConnections: 4, MaxInFlight: 16, MaxRequestBytes: api.MaxRequestBytes, MaxResponseBytes: api.MaxResponseBytes})
 	if err != nil {
 		t.Fatal(err)
 	}

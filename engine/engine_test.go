@@ -175,15 +175,23 @@ func TestQuotaOwnershipSchemaAndNumbers(t *testing.T) {
 	if code(e) != "conflict" {
 		t.Fatalf("numeric unique %v", e)
 	}
-	if _, e = s.Batch(context.Background(), api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "no-budget", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}}); code(e) != "invalid_argument" {
-		t.Fatalf("missing deadline %v", e)
+	// A caller without a deadline is bounded by the call budget instead.
+	if _, e = s.Batch(context.Background(), api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "no-deadline", Mutations: []api.Mutation{mutation("state", "c", "0", `{}`)}}); e != nil {
+		t.Fatalf("budgeted call %v", e)
 	}
 	s.Close()
 	c.Create = false
 	c.Manifest.Namespaces[0].Schema = "changed"
-	if _, e = Open(ctx, c); code(e) != "failed_precondition" {
-		t.Fatalf("silent schema change %v", e)
+	changed, e := Open(ctx, c)
+	if e != nil {
+		t.Fatalf("a manifest is configuration, not a stored identity: %v", e)
 	}
+	again := snapshot(t, changed, ctx, "a")
+	if again.Token.Schema != "changed" || changed.checkToken(c.Manifest.Namespaces[0], read.Token, 0) == nil {
+		t.Fatalf("tokens must carry the namespace schema: %+v", again.Token)
+	}
+	changed.Close()
+	c.Manifest.Namespaces[0].Schema = "test.v1"
 	link := filepath.Join(t.TempDir(), "linked.db")
 	if e = os.Symlink(c.Path, link); e != nil {
 		t.Fatal(e)
@@ -192,26 +200,48 @@ func TestQuotaOwnershipSchemaAndNumbers(t *testing.T) {
 		t.Fatal("symlink accepted")
 	}
 }
-func TestQueueBoundAndCancellation(t *testing.T) {
-	s, _, ctx := setup(t)
-	s.gate <- struct{}{}
-	defer func() { <-s.gate }()
+func TestFullWriterQueueWaitsUntilTheDeadline(t *testing.T) {
+	ctx := budget(t)
+	c := Config{Path: filepath.Join(t.TempDir(), "queue.db"), Create: true, Manifest: manifest(), WriterQueue: 2}
+	os.Chmod(filepath.Dir(c.Path), 0700)
+	s, e := Open(ctx, c)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
 	read := snapshot(t, s, ctx, "a")
-	short, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	// Hold the writer and fill the queue: later callers must wait, not fail.
+	s.gate <- struct{}{}
+	for i := 0; i < cap(s.queue); i++ {
+		s.queue <- struct{}{}
+	}
+	short, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, e := s.Batch(short, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "blocked", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}})
-	if code(e) != "deadline_exceeded" || time.Since(start) > time.Second {
-		t.Fatalf("queue deadline %v %v", e, time.Since(start))
+	_, e = s.Batch(short, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "blocked", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}})
+	if code(e) != "deadline_exceeded" || time.Since(start) < 100*time.Millisecond || time.Since(start) > 2*time.Second {
+		t.Fatalf("a full queue must hold the caller until its deadline: %v after %v", e, time.Since(start))
 	}
-	for i := 0; i < cap(s.writers); i++ {
-		s.writers <- struct{}{}
+	if stats, _ := s.Stats(); stats.Timeouts == 0 {
+		t.Fatal("deadline expiry in the queue was not counted")
 	}
-	_, e = s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "overflow", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}})
-	if code(e) != "resource_exhausted" {
-		t.Fatalf("overflow %v", e)
+	// A waiting caller proceeds as soon as room appears.
+	done := make(chan error, 1)
+	go func() {
+		_, err := s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "queued", Mutations: []api.Mutation{mutation("state", "a", "0", `{}`)}})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < cap(s.queue); i++ {
+		<-s.queue
 	}
-	for i := 0; i < cap(s.writers); i++ {
-		<-s.writers
+	<-s.gate
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("queued caller failed after room appeared: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued caller never ran")
 	}
 }

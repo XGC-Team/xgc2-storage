@@ -37,8 +37,8 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 	if out, err = configurationCloneReceipt(ctx, tx, scope, model.ConfigurationNamespaceCloneReceipt{Domain: q.Domain, Mutation: q.Mutation}); err != nil || out.Replayed {
 		return
 	}
-	if err = checkSize(q); err != nil {
-		return
+	if cloneBytes(q) > model.MaxConfigurationDecodedBytes {
+		return out, failure("resource_exhausted", "subtree clone exceeds the decoded plan bound")
 	}
 	if !positiveRevision(q.ExpectedRevision) || len(q.Namespaces) > MaxCloneNamespaces || len(q.Resources) > MaxCloneResources {
 		return out, failure("invalid_argument", "invalid bounded subtree clone")
@@ -144,4 +144,17 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 	}
 	_, err = tx.ExecContext(ctx, "INSERT INTO core_catalog_receipts VALUES(?,?,?,?,?,?)", scope, q.Domain.Key, q.Mutation.Key, q.Mutation.IntentDigest, model.ConfigurationNamespaceCloneOperation, body)
 	return out, err
+}
+
+// cloneBytes is the decoded size of everything the plan asks the transaction to copy.
+func cloneBytes(q model.ConfigurationNamespaceClone) int {
+	total := len(q.Name)
+	for _, r := range q.Resources {
+		total += len(r.Snapshot.Payload) + len(r.Snapshot.Manifest) + len(r.Snapshot.Change.Summary) + len(r.Name) + len(r.NameKey)
+		for _, ref := range r.Snapshot.References {
+			total += len(ref.Slot) + len(ref.TargetResourceID) + len(ref.TargetCommitID) + 64
+		}
+		total += 256 * len(r.Snapshot.Change.Nodes)
+	}
+	return total + 128*len(q.Namespaces)
 }

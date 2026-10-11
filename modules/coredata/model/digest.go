@@ -1,4 +1,3 @@
-// SnapshotDigest pins typed JSON and sorted reference data without any SQL dependency.
 package model
 
 import (
@@ -14,17 +13,10 @@ import (
 func object(raw json.RawMessage) bool {
 	return len(raw) > 0 && json.Valid(raw) && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{"))
 }
-func digest(v any) string {
-	var buffer bytes.Buffer
-	e := json.NewEncoder(&buffer)
-	e.SetEscapeHTML(false)
-	_ = e.Encode(v)
-	h := sha256.Sum256(bytes.TrimSuffix(buffer.Bytes(), []byte("\n")))
-	return hex.EncodeToString(h[:])
-}
 
-// SnapshotDigest lets Core construct exact immutable data pins using this new
-// model. It does not validate a product's typed schema or freeze execution plans.
+// SnapshotDigest is the content digest of a frozen payload, its manifest and its
+// references, from which Core builds exact immutable pins. It does not validate a
+// product's typed schema.
 // Payload and manifest never enter a JSON encoder: their lengths and original
 // bytes go directly to the hash. Only reference control metadata is canonicalized.
 func SnapshotDigest(payload, manifest []byte, references []Reference) (string, error) {

@@ -5,13 +5,10 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/XGC-Team/xgc2-storage/api"
 )
 
-// Every bound applies independently. Payload/manifest bytes are decoded sizes;
-// WireBytes is the actual serialized whole Named request/response, including
-// its envelope and base64/escaping. A finite atomic plan is never split.
+// Every bound applies independently. Payload/manifest bytes are decoded sizes.
+// A finite atomic plan is never split.
 const (
 	MaxConfigurationPayloadBytes       = 10 << 20
 	MaxConfigurationManifestBytes      = 1 << 20
@@ -37,17 +34,6 @@ const (
 	MaxConfigurationSlotRunes          = 64
 	MaxConfigurationSlotBytes          = 256
 )
-
-// These declarations describe the shared wire contract; they do not register
-// an executable module or grant availability. Only coredata.Spec does that.
-func ConfigurationFirstGroupOperations() []api.NamedOperation {
-	return []api.NamedOperation{
-		{ID: ResourceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: ResourceCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: ResourceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: ConfigurationReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-	}
-}
 
 type ConfigurationNameClass string
 
@@ -99,14 +85,13 @@ func ValidateConfigurationDecimal(value string, allowZero bool) error {
 	return nil
 }
 
-// Counters are owner-computed, never supplied as trusted RPC fields. DecodedBytes
+// Counters are owner-computed, never supplied by a caller. DecodedBytes
 // includes the complete plan/snapshot metadata, references, audit, receipt and
-// the current-main identity projection (even when it comes from selected main);
-// WireBytes includes the actual whole envelope. Validation does not measure or
-// authorize a plan on a caller's behalf.
+// the current-main identity projection (even when it comes from selected main).
+// Validation does not measure or authorize a plan on a caller's behalf.
 type ConfigurationBudget struct {
 	PayloadBytes, ManifestBytes, ManifestNodes, References, NodeChanges int64
-	DecodedBytes, WireBytes, ReceiptResultBytes                         int64
+	DecodedBytes, ReceiptResultBytes                                    int64
 	MainIdentityBytes                                                   int64
 }
 
@@ -121,7 +106,6 @@ func (b ConfigurationBudget) Validate() error {
 		{"references", b.References, MaxConfigurationReferences},
 		{"node changes", b.NodeChanges, MaxConfigurationNodeChanges},
 		{"decoded whole bytes", b.DecodedBytes, MaxConfigurationDecodedBytes},
-		{"serialized whole bytes", b.WireBytes, MaxRequestBytes},
 		{"receipt result bytes", b.ReceiptResultBytes, MaxConfigurationReceiptResultBytes},
 		{"current-main identity bytes", b.MainIdentityBytes, MaxConfigurationIdentityBytes},
 	} {
@@ -129,17 +113,17 @@ func (b ConfigurationBudget) Validate() error {
 			return fmt.Errorf("configuration: %s budget exceeded", bound.name)
 		}
 	}
-	if b.DecodedBytes < b.PayloadBytes+b.ManifestBytes+b.MainIdentityBytes || b.WireBytes < b.PayloadBytes+b.ManifestBytes+b.MainIdentityBytes {
+	if b.DecodedBytes < b.PayloadBytes+b.ManifestBytes+b.MainIdentityBytes {
 		return fmt.Errorf("configuration: whole byte counters omit decoded payload/manifest/main identity")
 	}
 	return nil
 }
 
-// Clone has its own complete-closure counts. It still obeys the decoded and
-// actual wire whole-plan bounds; the individual maxima cannot all coexist.
+// Clone has its own complete-closure counts. It still obeys the decoded
+// whole-plan bound; the individual maxima cannot all coexist.
 type ConfigurationCloneBudget struct {
 	Namespaces, Resources, References, ManifestNodes, NodeChangesAndSummary int64
-	NamespaceDepth, DecodedBytes, WireBytes                                 int64
+	NamespaceDepth, DecodedBytes                                            int64
 }
 
 func (b ConfigurationCloneBudget) Validate() error {
@@ -154,7 +138,6 @@ func (b ConfigurationCloneBudget) Validate() error {
 		{"clone node changes and summary", b.NodeChangesAndSummary, MaxConfigurationCloneChanges},
 		{"namespace depth", b.NamespaceDepth, MaxConfigurationNamespaceDepth},
 		{"decoded clone bytes", b.DecodedBytes, MaxConfigurationDecodedBytes},
-		{"serialized clone bytes", b.WireBytes, MaxRequestBytes},
 	} {
 		if bound.value < 0 || bound.value > bound.max {
 			return fmt.Errorf("configuration: %s budget exceeded", bound.name)

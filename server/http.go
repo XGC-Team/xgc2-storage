@@ -83,13 +83,15 @@ func write(w http.ResponseWriter, v any, err error) {
 		w.WriteHeader(500)
 		return
 	}
+	if len(raw) > api.MaxResponseBytes {
+		w.WriteHeader(429)
+		_ = json.NewEncoder(w).Encode(map[string]any{"error": api.Error{Code: "resource_exhausted", Message: "response exceeds the storage byte limit"}})
+		return
+	}
 	_, _ = w.Write(raw)
 }
 func decode(r *http.Request, v any) error {
 	maximum := int64(api.MaxRequestBytes)
-	if _, ok := v.(*api.NamedRequest); ok {
-		maximum = 16 << 20
-	}
 	if r.ContentLength > maximum {
 		return &api.Error{Code: "resource_exhausted", Message: "operation request byte limit exceeded"}
 	}
@@ -176,32 +178,6 @@ func HTTP(store *engine.Store, grants []Grant) (http.Handler, error) {
 				return
 			}
 			out, e := store.Receipt(r.Context(), req)
-			write(w, out, e)
-		case "/v1/named":
-			var req api.NamedRequest
-			if e := decode(r, &req); e != nil {
-				write(w, nil, e)
-				return
-			}
-			if !check(req.Scope) {
-				return
-			}
-			if req.RequestID != r.Header.Get("X-Request-ID") {
-				write(w, nil, &api.Error{Code: "invalid_argument", Message: "body/header identity mismatch"})
-				return
-			}
-			out, e := store.Named(r.Context(), req)
-			write(w, out, e)
-		case "/v1/named-result":
-			var req api.ReceiptRequest
-			if e := decode(r, &req); e != nil {
-				write(w, nil, e)
-				return
-			}
-			if !check(req.Scope) {
-				return
-			}
-			out, e := store.NamedResult(r.Context(), req)
 			write(w, out, e)
 		default:
 			write(w, nil, &api.Error{Code: "not_found", Message: "storage operation not found"})

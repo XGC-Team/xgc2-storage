@@ -1,9 +1,9 @@
 schema: xgc2.product.v1
 id: xgc2-storage
 name: XGC2 Storage
-version: 0.1.0-13
+version: 0.2.0-1
 kind: toolchain-apt
-summary: Independent bounded SQLite owner with XRPC data transactions and durable receipts.
+summary: Embeddable SQLite owner for Core (typed Go API) with an optional XRPC document exposure and daemon.
 apt:
   distribution: focal,jammy,noble
   install:
@@ -17,10 +17,12 @@ usage:
   install: sudo apt install xgc2-storage
   smoke_test: xgc2-storage --help
   notes: >-
-    Deployment grants select database, manifest, owner credentials and sockets.
-    No systemd autostart, database root defaults, legacy imports or Core/ROS dependency.
-    Core and each Agent use separate local instances. Static Go builds embed the
-    shared XRPC implementation; the build receipt records its source identity.
+    Core embeds the library and needs no daemon. The xgc2-storage daemon is the
+    optional XRPC exposure of the same owner (the Lichtblick launcher uses it); its
+    deployment grants select database, manifest, owner credentials and sockets.
+    No systemd autostart, database root defaults or Core/ROS dependency. The Agent
+    uses no Storage. Static Go builds embed the shared XRPC implementation; the
+    build receipt records its source identity.
 ownership:
   paths:
   - /usr/bin/xgc2-storage
@@ -33,6 +35,6 @@ release:
   requires: []
   dependency_policy: {}
   apt_versions:
-    focal: 0.1.0-13~focal
-    jammy: 0.1.0-13~jammy
-    noble: 0.1.0-13~noble
+    focal: 0.2.0-1~focal
+    jammy: 0.2.0-1~jammy
+    noble: 0.2.0-1~noble

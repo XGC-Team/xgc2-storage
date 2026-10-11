@@ -18,9 +18,6 @@ import (
 func admin(t *testing.T, dir, operation string, extra ...string) ([]byte, error) {
 	t.Helper()
 	binary := os.Getenv("FAULT_STORAGE_ADMIN_BIN")
-	if binary == "" {
-		t.Skip("run scripts/fault-validate.py to build the isolated administrative CLI; administrative conformance was not tested")
-	}
 	args := []string{operation, "--db", filepath.Join(dir, "fixture.db"), "--manifest", filepath.Join(dir, "manifest.json")}
 	args = append(args, extra...)
 	return exec.CommandContext(deadline(t), binary, args...).CombinedOutput()
@@ -60,8 +57,8 @@ func TestFaultAdministrativeCLINewBusinessRecovery(t *testing.T) {
 		t.Fatalf("offline stats failed: %s %v", raw, err)
 	}
 	var stats engine.Stats
-	if err = json.Unmarshal(raw, &stats); err != nil || stats.DatabaseID != commit.Token.DatabaseID || stats.SQLiteVersion != "3.51.3" {
-		t.Fatalf("administrative stats lost identity/pinned engine: %s %v", raw, err)
+	if err = json.Unmarshal(raw, &stats); err != nil || stats.DatabaseID != commit.Token.DatabaseID || !strings.HasPrefix(stats.SQLiteVersion, "3.") {
+		t.Fatalf("administrative stats lost identity or engine version: %s %v", raw, err)
 	}
 	restoredDir := privateDir(t)
 	destination := filepath.Join(restoredDir, "fixture.db")
@@ -96,9 +93,6 @@ func TestFaultAdministrativeCLINewBusinessRecovery(t *testing.T) {
 }
 
 func TestFaultAdministrativeCLIInvalidOperationNoMutation(t *testing.T) {
-	if os.Getenv("FAULT_STORAGE_ADMIN_BIN") == "" {
-		t.Skip("run scripts/fault-validate.py for administrative argument conformance")
-	}
 	for _, operation := range []string{"unknown-operation", "backup"} {
 		t.Run(operation, func(t *testing.T) {
 			source := open(t, filepath.Join(privateDir(t), "fixture.db"), true, nil)

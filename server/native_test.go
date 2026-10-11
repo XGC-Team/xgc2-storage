@@ -75,7 +75,7 @@ func TestNativeProfilesPrecisionAuthAndReceipt(t *testing.T) {
 			} else {
 				host, e := grpcx.ServeWithOptions(listener, lease, func(reg grpc.ServiceRegistrar) {
 					pb.RegisterStorageServer(reg, &server.GRPC{Store: store, Grants: grants})
-				}, grpcx.HostOptions{MaxRequestBytes: api.MaxRequestBytes, MaxResponseBytes: api.MaxResponseBytes}, grpcx.BoundService(ref.InstanceID, 30*time.Second, 32)...)
+				}, grpcx.HostOptions{InstanceID: ref.InstanceID, MaxCallTime: 30 * time.Second, MaxInFlight: 32, MaxRequestBytes: api.MaxRequestBytes, MaxResponseBytes: api.MaxResponseBytes})
 				if e != nil {
 					t.Fatal(e)
 				}

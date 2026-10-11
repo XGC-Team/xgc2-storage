@@ -2,14 +2,13 @@ package engine
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,55 +18,130 @@ import (
 	"modernc.org/sqlite"
 )
 
+// Config selects one database and its finite resources. Zero values select the
+// documented defaults.
 type Config struct {
-	Path         string
-	Create       bool
-	Manifest     api.Manifest
-	Readers      int
-	WriterQueue  int
-	MaxCallTime  time.Duration
-	MaxDBBytes   int64
-	MaxWALBytes  int64
+	Path     string
+	Create   bool
+	Manifest api.Manifest
+	// Modules are the compiled data modules that the manifest's namespaces may
+	// name. A module a namespace names is installed or migrated at Open.
+	Modules []Module
+	// Readers is the number of concurrent read connections (default 4, at most 16).
+	Readers int
+	// WriterQueue bounds the writers admitted at once (default 64, at most
+	// 1024). A caller beyond it waits for room until its own deadline.
+	WriterQueue int
+	// CallBudget caps every call (default 30 s, at most 5 min). A shorter
+	// caller deadline wins; a caller without one gets the budget.
+	CallBudget time.Duration
+	// MaxDBBytes is the finite database capacity (default 1 GiB).
+	MaxDBBytes int64
+	// MaxWALBytes is the WAL size above which new writes are refused until a
+	// checkpoint reclaims it (default 64 MiB).
+	MaxWALBytes int64
+	// MinFreeBytes is the free disk space below which new writes are refused
+	// (default 16 MiB).
 	MinFreeBytes int64
-	Modules      []DataModule
+	// CheckpointBytes is the WAL size that requests a checkpoint at once
+	// (default 4 MiB, or a quarter of MaxWALBytes when that is smaller).
+	CheckpointBytes int64
+	// CheckpointDelay is how long committed frames may wait for a checkpoint
+	// after a commit, which also bounds how long a relaxed commit stays
+	// exposed to power loss (default 1 s). Nothing runs while the database is idle.
+	CheckpointDelay time.Duration
+	// NoMigrate refuses an older schema instead of migrating it.
+	NoMigrate bool
+	// OnMaintenanceError receives failures of background maintenance.
+	OnMaintenanceError func(error)
 }
 
-// DataModule is trusted storage-owned compiled code, never received over RPC.
-type DataModule struct {
-	Spec       api.Module
-	Initialize func(context.Context, *sql.Tx) error
-	// Deploy applies explicit owner-supplied deployment facts before RPC starts.
-	// It is compiled code, never an operation supplied by a data caller.
-	Deploy  func(context.Context, *sql.Tx) error
-	Execute func(context.Context, *sql.Tx, string, string, json.RawMessage) (json.RawMessage, error)
+func (c *Config) defaults() error {
+	if c.Readers == 0 {
+		c.Readers = 4
+	}
+	if c.WriterQueue == 0 {
+		c.WriterQueue = 64
+	}
+	if c.CallBudget == 0 {
+		c.CallBudget = 30 * time.Second
+	}
+	if c.MaxDBBytes == 0 {
+		c.MaxDBBytes = 1 << 30
+	}
+	if c.MaxWALBytes == 0 {
+		c.MaxWALBytes = 64 << 20
+	}
+	if c.MinFreeBytes == 0 {
+		c.MinFreeBytes = 16 << 20
+	}
+	if c.CheckpointBytes == 0 {
+		c.CheckpointBytes = min(4<<20, max(c.MaxWALBytes/4, 64<<10))
+	}
+	if c.CheckpointDelay == 0 {
+		c.CheckpointDelay = time.Second
+	}
+	if c.Readers < 1 || c.Readers > 16 || c.WriterQueue < 1 || c.WriterQueue > 1024 || c.CallBudget <= 0 || c.CallBudget > 5*time.Minute ||
+		c.MaxDBBytes < 1<<20 || c.MaxWALBytes < 1<<20 || c.MinFreeBytes < 1<<20 || c.CheckpointBytes < 64<<10 || c.CheckpointBytes > c.MaxWALBytes || c.CheckpointDelay < 10*time.Millisecond {
+		return fail("invalid_argument", "invalid execution/disk limits")
+	}
+	return nil
 }
+
 type Store struct {
-	config                      Config
-	owner                       *owner
-	writer, reader              *sql.DB
-	dbid, engine                string
-	namespaces                  map[string]api.Namespace
-	modules                     map[string]DataModule
-	writers, gate, reads        chan struct{}
-	closed                      atomic.Bool
-	lifecycle                   sync.RWMutex
-	calls, conflicts, overloads atomic.Uint64
-	waitNS, sqlNS               atomic.Uint64
+	config     Config
+	owner      *owner
+	wdb, rdb   *sql.DB
+	writer     *sql.Conn // dedicated writer connection; used only under gate
+	dbid       string
+	engine     string
+	namespaces map[string]api.Namespace
+	modules    map[string]Module
+	// queue admits writers, gate runs one of them, reads admits readers.
+	queue, gate, reads chan struct{}
+	closed             atomic.Bool
+	lifecycle          sync.RWMutex
+	// synchronous is the writer connection's current safety level; gate guards it.
+	synchronous                                  Durability
+	calls, conflicts, timeouts                   atomic.Uint64
+	waitNS, sqlNS                                atomic.Uint64
+	durable, relaxed, fsyncs                     atomic.Uint64
+	checkpoints, receiptsPruned, maintenanceErrs atomic.Uint64
+	maintenance                                  *maintenance
 }
 
-const ddl = `
-CREATE TABLE storage_meta(id INTEGER PRIMARY KEY CHECK(id=1),format TEXT NOT NULL,database_id TEXT NOT NULL,manifest_hash TEXT NOT NULL);
-CREATE TABLE scopes(scope TEXT PRIMARY KEY,namespace TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0));
-CREATE INDEX scopes_namespace ON scopes(namespace);
-CREATE TABLE usage(scope TEXT NOT NULL,collection TEXT NOT NULL,records INTEGER NOT NULL,bytes INTEGER NOT NULL,PRIMARY KEY(scope,collection));
-CREATE TABLE records(scope TEXT NOT NULL,collection TEXT NOT NULL,key TEXT NOT NULL,version INTEGER NOT NULL,deleted INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(scope,collection,key));
-CREATE TABLE lookups(scope TEXT NOT NULL,collection TEXT NOT NULL,index_name TEXT NOT NULL,index_value TEXT NOT NULL,key TEXT NOT NULL,unique_value TEXT,PRIMARY KEY(scope,collection,index_name,index_value,key),UNIQUE(scope,collection,index_name,unique_value));
-CREATE TABLE receipts(scope TEXT NOT NULL,request_id TEXT NOT NULL,digest TEXT NOT NULL,expires INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(scope,request_id));
-CREATE INDEX receipts_expiry ON receipts(expires);
-CREATE TABLE named_results(scope TEXT NOT NULL,request_id TEXT NOT NULL,body BLOB NOT NULL,PRIMARY KEY(scope,request_id),FOREIGN KEY(scope,request_id) REFERENCES receipts(scope,request_id) ON DELETE CASCADE);
-`
+// Durability is the per-transaction commit class of the writer.
+type Durability uint8
+
+const (
+	// Durable commits with synchronous=FULL: the commit is on stable storage
+	// when the call returns.
+	Durable Durability = iota
+	// Relaxed commits with synchronous=NORMAL: it survives a process crash but
+	// may be lost with the last relaxed commits on power loss; it becomes
+	// durable at the next checkpoint or durable commit.
+	Relaxed
+)
+
+func (d Durability) String() string {
+	if d == Relaxed {
+		return "sqlite-normal"
+	}
+	return "sqlite-full"
+}
+
+func (s *Store) writerDSN(o *owner) string {
+	return (&url.URL{Scheme: "file", Path: o.path(), RawQuery: "mode=rw&_txlock=immediate&_pragma=busy_timeout(0)&_pragma=foreign_keys(1)&_pragma=synchronous(FULL)&_pragma=temp_store(2)&_pragma=cache_size(-4096)&_pragma=wal_autocheckpoint(0)&_pragma=journal_size_limit(1048576)"}).String()
+}
+
+func (s *Store) readerDSN(o *owner) string {
+	return (&url.URL{Scheme: "file", Path: o.path(), RawQuery: "mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(0)&_pragma=cache_size(-2048)&_pragma=temp_store(2)"}).String()
+}
 
 func Open(ctx context.Context, c Config) (s *Store, err error) {
+	if err = c.defaults(); err != nil {
+		return nil, err
+	}
 	if err = ValidateManifest(c.Manifest); err != nil {
 		return nil, err
 	}
@@ -79,107 +153,70 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if err = json.Unmarshal(manifestRaw, &c.Manifest); err != nil {
 		return nil, err
 	}
-	if c.Readers == 0 {
-		c.Readers = 4
+	modules := map[string]Module{}
+	for _, m := range c.Modules {
+		if err = m.validate(); err != nil {
+			return nil, err
+		}
+		if _, dup := modules[m.ID]; dup {
+			return nil, fail("invalid_argument", "unique compiled module required")
+		}
+		modules[m.ID] = m
 	}
-	if c.WriterQueue == 0 {
-		c.WriterQueue = 32
-	}
-	if c.MaxCallTime == 0 {
-		c.MaxCallTime = 30 * time.Second
-	}
-	if c.MaxDBBytes == 0 {
-		c.MaxDBBytes = 1 << 30
-	}
-	if c.MaxWALBytes == 0 {
-		c.MaxWALBytes = 64 << 20
-	}
-	if c.MinFreeBytes == 0 {
-		c.MinFreeBytes = 16 << 20
-	}
-	if c.Readers < 1 || c.Readers > 16 || c.WriterQueue < 1 || c.WriterQueue > 256 || c.MaxCallTime <= 0 || c.MaxCallTime > time.Minute || c.MaxDBBytes < 1<<20 || c.MaxWALBytes < 1<<20 || c.MinFreeBytes < 1<<20 {
-		return nil, fail("invalid_argument", "invalid execution/disk limits")
+	namespaces := map[string]api.Namespace{}
+	for _, n := range c.Manifest.Namespaces {
+		namespaces[n.ID] = n
+		for _, id := range n.Modules {
+			if _, ok := modules[id]; !ok {
+				return nil, fail("failed_precondition", "namespace names data module "+id+" that is not compiled into this owner")
+			}
+		}
 	}
 	o, e := acquire(c.Path, c.Create)
 	if e != nil {
 		return nil, e
 	}
-	s = &Store{config: c, owner: o, namespaces: map[string]api.Namespace{}, modules: map[string]DataModule{}, writers: make(chan struct{}, c.WriterQueue+1), gate: make(chan struct{}, 1), reads: make(chan struct{}, c.Readers)}
+	s = &Store{config: c, owner: o, namespaces: namespaces, modules: modules, queue: make(chan struct{}, c.WriterQueue), gate: make(chan struct{}, 1), reads: make(chan struct{}, c.Readers)}
 	opened := s
 	defer func() {
 		if err != nil {
 			opened.Close()
 		}
 	}()
-	for _, n := range c.Manifest.Namespaces {
-		s.namespaces[n.ID] = n
-	}
-	for _, m := range c.Modules {
-		if m.Initialize == nil || m.Execute == nil || s.modules[m.Spec.ID].Execute != nil {
-			return nil, fail("invalid_argument", "unique compiled module initializer/executor required")
-		}
-		s.modules[m.Spec.ID] = m
-	}
-	for _, n := range c.Manifest.Namespaces {
-		for _, registered := range n.Modules {
-			compiled, ok := s.modules[registered.ID]
-			if !ok || hash(compiled.Spec) != hash(registered) {
-				return nil, fail("failed_precondition", "named module differs from compiled schema/operations")
-			}
-		}
-	}
-	dsn := (&url.URL{Scheme: "file", Path: o.path(), RawQuery: "mode=rw&_pragma=busy_timeout(0)&_pragma=foreign_keys(1)"}).String()
-	s.writer, err = sql.Open("sqlite", dsn)
+	s.wdb, err = sql.Open("sqlite", s.writerDSN(o))
 	if err != nil {
 		return nil, err
 	}
-	s.writer.SetMaxOpenConns(1)
-	s.writer.SetMaxIdleConns(1)
+	s.wdb.SetMaxOpenConns(1)
+	s.wdb.SetMaxIdleConns(1)
+	if s.writer, err = s.wdb.Conn(ctx); err != nil {
+		return nil, err
+	}
 	if err = s.writer.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&s.engine); err != nil {
 		return nil, err
 	}
-	if s.engine != "3.51.3" {
-		return nil, fail("failed_precondition", "pinned SQLite 3.51.3 engine required")
+	if !versionAtLeast(s.engine, 3, 51, 3) {
+		return nil, fail("failed_precondition", "SQLite 3.51.3 or newer required (earlier versions can corrupt a WAL database on reset)")
+	}
+	var journal string
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journal); err != nil {
+		return nil, err
+	}
+	if journal != "wal" {
+		return nil, fail("failed_precondition", "WAL unavailable")
 	}
 	if c.Create {
-		tx, e := s.writer.BeginTx(ctx, nil)
-		if e != nil {
-			return nil, e
-		}
-		defer tx.Rollback()
-		if _, err = tx.ExecContext(ctx, ddl); err != nil {
-			return nil, err
-		}
-		initialized := map[string]bool{}
-		for _, n := range c.Manifest.Namespaces {
-			for _, m := range n.Modules {
-				if !initialized[m.ID] {
-					if err = s.modules[m.ID].Initialize(ctx, tx); err != nil {
-						return nil, err
-					}
-					initialized[m.ID] = true
-				}
-			}
-		}
-		var id [16]byte
-		if _, err = rand.Read(id[:]); err != nil {
-			return nil, err
-		}
-		s.dbid = hex.EncodeToString(id[:])
-		if _, err = tx.ExecContext(ctx, "INSERT INTO storage_meta VALUES(1,?,?,?)", "storage-v1", s.dbid, hash(c.Manifest)); err != nil {
-			return nil, err
-		}
-		if err = tx.Commit(); err != nil {
-			return nil, err
-		}
+		err = s.create(ctx)
 	} else {
-		var format, digest string
-		if err = s.writer.QueryRowContext(ctx, "SELECT format,database_id,manifest_hash FROM storage_meta WHERE id=1").Scan(&format, &s.dbid, &digest); err != nil {
-			return nil, fail("failed_precondition", "not a storage-v1 database; explicit new-data rebuild required")
-		}
-		if format != "storage-v1" || digest != hash(c.Manifest) {
-			return nil, fail("failed_precondition", "manifest mismatch; exact deployed schema or explicit new-data rebuild required")
-		}
+		err = s.upgrade(ctx)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// Leave the schema, and any migration, in the main file rather than the WAL.
+	var busy, logPages, checkpointed int
+	if err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logPages, &checkpointed); err != nil {
+		return nil, err
 	}
 	var pageSize, pageCount, pageLimit int64
 	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
@@ -198,70 +235,63 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if pageLimit > requestedPageLimit || pageLimit < pageCount {
 		return nil, fail("failed_precondition", "SQLite did not enforce configured page byte budget")
 	}
-	var journal string
-	if err = s.writer.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&journal); err != nil {
-		return nil, err
-	}
-	if journal != "wal" {
-		return nil, fail("failed_precondition", "WAL unavailable")
-	}
-	for _, statement := range []string{"PRAGMA synchronous=FULL", "PRAGMA temp_store=MEMORY", "PRAGMA cache_size=-4096", "PRAGMA wal_autocheckpoint=256", "PRAGMA journal_size_limit=1048576"} {
-		if _, err = s.writer.ExecContext(ctx, statement); err != nil {
-			return nil, err
-		}
-	}
-	deployed := map[string]bool{}
-	for _, namespace := range c.Manifest.Namespaces {
-		for _, registered := range namespace.Modules {
-			module := s.modules[registered.ID]
-			if deployed[registered.ID] || module.Deploy == nil {
-				continue
-			}
-			deployed[registered.ID] = true
-			tx, e := s.writer.BeginTx(ctx, nil)
-			if e != nil {
-				return nil, e
-			}
-			if e = module.Deploy(ctx, tx); e != nil {
-				tx.Rollback()
-				return nil, e
-			}
-			if e = tx.Commit(); e != nil {
-				return nil, e
-			}
-		}
-	}
-	readDSN := (&url.URL{Scheme: "file", Path: o.path(), RawQuery: "mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(0)&_pragma=cache_size(-2048)&_pragma=temp_store(2)"}).String()
-	s.reader, err = sql.Open("sqlite", readDSN)
+	s.rdb, err = sql.Open("sqlite", s.readerDSN(o))
 	if err != nil {
 		return nil, err
 	}
-	s.reader.SetMaxOpenConns(c.Readers)
-	s.reader.SetMaxIdleConns(c.Readers)
-	if err = s.reader.PingContext(ctx); err != nil {
+	s.rdb.SetMaxOpenConns(c.Readers)
+	s.rdb.SetMaxIdleConns(c.Readers)
+	if err = s.rdb.PingContext(ctx); err != nil {
 		return nil, err
 	}
+	s.startMaintenance(ctx)
 	return s, nil
 }
+
+func versionAtLeast(version string, want ...int) bool {
+	parts := strings.SplitN(version, ".", 4)
+	for i, w := range want {
+		if i >= len(parts) {
+			return false
+		}
+		n, err := strconv.Atoi(parts[i])
+		if err != nil {
+			return false
+		}
+		if n != w {
+			return n > w
+		}
+	}
+	return true
+}
+
+// Close waits for admitted calls, stops maintenance and releases the owner.
 func (s *Store) Close() error {
 	if s == nil {
 		return nil
 	}
+	// Maintenance admits its calls like any other, so it stops before Close
+	// waits for the admitted ones.
+	s.stopMaintenance()
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
 	if s.closed.Swap(true) {
 		return nil
 	}
 	var e error
-	if s.reader != nil {
-		e = errors.Join(e, s.reader.Close())
+	if s.rdb != nil {
+		e = errors.Join(e, s.rdb.Close())
 	}
 	if s.writer != nil {
 		e = errors.Join(e, s.writer.Close())
 	}
+	if s.wdb != nil {
+		e = errors.Join(e, s.wdb.Close())
+	}
 	s.owner.close()
 	return e
 }
+
 func (s *Store) scope(scope api.Scope) (api.Namespace, error) {
 	n, ok := s.namespaces[scope.Namespace]
 	if !ok || !key(scope.User) || !key(scope.Workspace) {
@@ -269,6 +299,28 @@ func (s *Store) scope(scope api.Scope) (api.Namespace, error) {
 	}
 	return n, nil
 }
+
+// CheckScope reports whether scope names a registered namespace and a valid
+// user and workspace.
+func (s *Store) CheckScope(scope api.Scope) error {
+	_, err := s.scope(scope)
+	return err
+}
+
+// HasModule reports whether the scope's namespace uses the named data module.
+func (s *Store) HasModule(scope api.Scope, module string) bool {
+	n, err := s.scope(scope)
+	if err != nil {
+		return false
+	}
+	for _, id := range n.Modules {
+		if id == module {
+			return true
+		}
+	}
+	return false
+}
+
 func collection(n api.Namespace, id string) (api.Collection, error) {
 	for _, c := range n.Collections {
 		if c.ID == id {
@@ -277,60 +329,41 @@ func collection(n api.Namespace, id string) (api.Collection, error) {
 	}
 	return api.Collection{}, fail("invalid_argument", "collection is not registered")
 }
-func (s *Store) beginCall(ctx context.Context, write bool) (context.Context, func(), error) {
-	return s.admitCall(ctx, write, s.config.MaxCallTime)
-}
 
-// admitCall shares lifecycle/capacity admission with the explicit offline owner.
-// A zero internal clamp still requires the caller to supply a finite deadline.
-func (s *Store) admitCall(ctx context.Context, write bool, maximum time.Duration) (context.Context, func(), error) {
+// admit bounds one call by the call budget and admits it as a reader or a
+// writer. A caller that finds the writer queue full waits for room until its
+// own deadline; it is never rejected only because others are ahead of it.
+func (s *Store) admit(ctx context.Context, write bool) (context.Context, func(), error) {
 	s.lifecycle.RLock()
 	if s.closed.Load() {
 		s.lifecycle.RUnlock()
 		return nil, nil, fail("unavailable", "store closed")
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok || time.Until(deadline) <= 0 {
+	ctx, cancel := context.WithTimeout(ctx, s.config.CallBudget)
+	refuse := func(err error) (context.Context, func(), error) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			s.timeouts.Add(1)
+		}
+		cancel()
 		s.lifecycle.RUnlock()
-		return nil, nil, fail("invalid_argument", "finite caller deadline required")
-	}
-	var cancel context.CancelFunc
-	if maximum > 0 {
-		ctx, cancel = context.WithTimeout(ctx, maximum)
-	} else {
-		ctx, cancel = context.WithCancel(ctx)
-	}
-	slot := s.reads
-	if write {
-		slot = s.writers
+		return nil, nil, err
 	}
 	start := time.Now()
+	slot := s.reads
 	if write {
-		select {
-		case slot <- struct{}{}:
-		default:
-			s.overloads.Add(1)
-			cancel()
-			s.lifecycle.RUnlock()
-			return nil, nil, fail("unavailable", "storage execution capacity exhausted")
-		}
-	} else {
-		select {
-		case slot <- struct{}{}:
-		case <-ctx.Done():
-			cancel()
-			s.lifecycle.RUnlock()
-			return nil, nil, ctx.Err()
-		}
+		slot = s.queue
+	}
+	select {
+	case slot <- struct{}{}:
+	case <-ctx.Done():
+		return refuse(ctx.Err())
 	}
 	if write {
 		select {
 		case s.gate <- struct{}{}:
 		case <-ctx.Done():
 			<-slot
-			cancel()
-			s.lifecycle.RUnlock()
-			return nil, nil, ctx.Err()
+			return refuse(ctx.Err())
 		}
 	}
 	s.waitNS.Add(uint64(time.Since(start)))
@@ -346,6 +379,7 @@ func (s *Store) admitCall(ctx context.Context, write bool, maximum time.Duration
 		s.lifecycle.RUnlock()
 	}, nil
 }
+
 func classify(err error) error {
 	if err == nil {
 		return nil
@@ -379,9 +413,11 @@ func classify(err error) error {
 	}
 	return fail("internal", err.Error())
 }
+
 func (s *Store) token(n api.Namespace, rev int64) api.Token {
 	return api.Token{DatabaseID: s.dbid, Schema: n.Schema, Revision: strconv.FormatInt(rev, 10)}
 }
+
 func (s *Store) checkToken(n api.Namespace, t api.Token, rev int64) error {
 	if _, e := revision(t.Revision); e != nil {
 		return e
@@ -392,6 +428,15 @@ func (s *Store) checkToken(n api.Namespace, t api.Token, rev int64) error {
 	}
 	return nil
 }
+
+func (s *Store) walSize() int64 {
+	var st unix.Stat_t
+	if unix.Fstatat(s.owner.parent, s.owner.name+"-wal", &st, unix.AT_SYMLINK_NOFOLLOW) != nil {
+		return 0
+	}
+	return st.Size
+}
+
 func (s *Store) diskCheck() error {
 	var fs unix.Statfs_t
 	if e := unix.Fstatfs(s.owner.parent, &fs); e != nil {
@@ -400,8 +445,7 @@ func (s *Store) diskCheck() error {
 	if fs.Bavail*uint64(fs.Bsize) < uint64(s.config.MinFreeBytes) {
 		return fail("resource_exhausted", "free disk watermark reached")
 	}
-	var st unix.Stat_t
-	if e := unix.Fstatat(s.owner.parent, s.owner.name+"-wal", &st, unix.AT_SYMLINK_NOFOLLOW); e == nil && st.Size >= s.config.MaxWALBytes {
+	if s.walSize() >= s.config.MaxWALBytes {
 		return fail("resource_exhausted", "WAL admission watermark reached")
 	}
 	return nil

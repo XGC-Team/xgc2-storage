@@ -22,7 +22,7 @@ func configurationFixture(t *testing.T) (*sql.DB, context.Context, model.Configu
 		t.Fatal(e)
 	}
 	defer tx.Rollback()
-	if e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: g.SchemaVersion, RegistryDigest: g.RegistryDigest, MainVisibility: true}}); e != nil {
+	if e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: g.SchemaVersion, RegistryDigest: g.RegistryDigest, MainVisibility: true}}); e != nil {
 		t.Fatal(e)
 	}
 	if e = tx.Commit(); e != nil {
@@ -98,7 +98,7 @@ func TestConfigurationAtomicReplayCASAndBytes(t *testing.T) {
 	if first.PlanDigest != wantPlan || first.Result.Head.Resource.NextVersion != "2" {
 		t.Fatal(first)
 	}
-	raw, e := run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
+	raw, e := run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -299,7 +299,7 @@ func TestConfigurationTrackingAndPinnedModeSeparation(t *testing.T) {
 	if e != nil || content != first.Result.Head.Commit.ContentDigest {
 		t.Fatal("logical references changed during resolution/hash", e)
 	}
-	raw, e := run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
+	raw, e := run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -377,22 +377,22 @@ func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 		t.Fatal("large decimal drift")
 	}
 	newg := g
-	newg.SchemaIdentity = "catalog-v2"
+	newg.SchemaIdentity = "catalog-changed"
 	newg.RegistryDigest = strings.Repeat("b", 64)
 	tx, e := db.BeginTx(ctx, nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: newg.SchemaIdentity, SchemaVersion: 1, RegistryDigest: newg.RegistryDigest, MainVisibility: true}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: newg.SchemaIdentity, SchemaVersion: 1, RegistryDigest: newg.RegistryDigest, MainVisibility: true}})
 	if e != nil {
 		t.Fatal(e)
 	}
 	if e = tx.Commit(); e != nil {
 		t.Fatal(e)
 	}
-	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: r.ID, CommitID: q.CommitID})
+	_, e = run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: r.ID, CommitID: q.CommitID})
 	configurationCode(t, e, "conflict")
-	raw, e := run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: newg, ResourceID: r.ID, CommitID: q.CommitID})
+	raw, e := run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: newg, ResourceID: r.ID, CommitID: q.CommitID})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -403,14 +403,14 @@ func TestConfigurationAcceptedCatalogAndCanonicalLargeVersion(t *testing.T) {
 	}
 	_, e = run(t, db, ctx, model.ResourceCreateOperation, q)
 	configurationCode(t, e, "conflict")
-	_, e = run(t, db, ctx, model.ConfigurationReceiptOperation, model.ConfigurationReceipt{Domain: g, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
+	_, e = run(t, db, ctx, receiptOperation, model.ConfigurationReceipt{Domain: g, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
 	configurationCode(t, e, "conflict")
 	q.Domain = newg
 	replay := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
 	if !replay.Replayed || replay.PlanDigest != first.PlanDigest || replay.Result.Head != first.Result.Head {
 		t.Fatal("current admitted catalog did not preserve original historical result/plan")
 	}
-	raw, e = run(t, db, ctx, model.ConfigurationReceiptOperation, model.ConfigurationReceipt{Domain: newg, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
+	raw, e = run(t, db, ctx, receiptOperation, model.ConfigurationReceipt{Domain: newg, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -438,7 +438,7 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: true}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: g.SchemaIdentity, SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: true}})
 	if e != nil {
 		t.Fatal(e)
 	}
@@ -473,7 +473,7 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	e = DeclareConfigurationDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-v2", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
+	e = declareDomains(ctx, tx, []model.ConfigurationDomainDeclaration{{Key: g.Key, SchemaIdentity: "catalog-changed", SchemaVersion: 1, RegistryDigest: g.RegistryDigest, MainVisibility: true, AllowSystemProvisioning: false}})
 	configurationCode(t, e, "conflict")
 	tx.Rollback()
 }
@@ -505,7 +505,7 @@ func TestConfigurationSnapshotBranchAggregateAndExactContentGuard(t *testing.T) 
 	if before != configurationCounts(t, db, ctx) {
 		t.Fatal("foreign snapshot branch owner wrote facts")
 	}
-	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
+	_, e = run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, Branch: "main"})
 	configurationCode(t, e, "data_loss")
 	// Selecting a different immutable commit still validates current-main's
 	// owner while returning only its identity projection.
@@ -516,7 +516,7 @@ func TestConfigurationSnapshotBranchAggregateAndExactContentGuard(t *testing.T) 
 	otherCommit.Version = "2"
 	body, _ = json.Marshal(otherCommit)
 	execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)", testScope, g.Key, otherCommit.ID, otherCommit.ResourceID, otherCommit.BranchID, otherCommit.Version, "", otherCommit.ContentDigest, other.Snapshot.Payload, other.Snapshot.Manifest, body)
-	_, e = run(t, db, ctx, model.ResourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, CommitID: otherCommit.ID})
+	_, e = run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, CommitID: otherCommit.ID})
 	configurationCode(t, e, "data_loss")
 }
 

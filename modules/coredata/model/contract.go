@@ -1,29 +1,10 @@
 package model
 
-// Wire identity and limits are shared by the compiled module and consumers.
-// The named request/response envelope belongs to storage/api; this package
-// defines no second envelope or transport client.
+// Identity and limits are shared by the compiled module and its consumers.
 const (
 	Schema = "core-relational-v1"
 	Module = "coredata"
 
-	GroupPrepareOperation               = "group.prepare"
-	GroupSnapshotOperation              = "group.snapshot"
-	GroupMemberSnapshotOperation        = "group.member.snapshot"
-	NamespaceCloneOperation             = "namespace.clone"
-	NamespaceGetOperation               = "namespace.get"
-	NamespaceSnapshotOperation          = "namespace.snapshot"
-	ExecutionCommitOperation            = "execution.commit"
-	ExecutionCommandGetOperation        = "execution.command.get"
-	ExecutionCommandListOperation       = "execution.commands.read"
-	ExecutionJobEventPageOperation      = "execution.job_events.page"
-	ExecutionEventCursorOperation       = "execution.events.cursor"
-	ExecutionEventReadOperation         = "execution.events.read"
-	SessionWorkflowLogSnapshotOperation = "session.workflow_logs.snapshot"
-
-	MaxRequestBytes        = 16 << 20
-	MaxResponseBytes       = 16 << 20
-	MaxGroupMembers        = 1000
-	MaxGroupParameterBytes = 8 << 20
-	MaxExecutionEvents     = 1000
+	MaxRequestBytes  = 16 << 20
+	MaxResponseBytes = 16 << 20
 )

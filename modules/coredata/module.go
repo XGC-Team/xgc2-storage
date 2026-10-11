@@ -1,5 +1,8 @@
-// Package coredata executes bounded relational data operations inside the
-// storage owner's transaction. It owns no connection, RPC, scheduler or provider.
+// Package coredata is the typed Core data module: configuration resources with
+// branches and immutable commits, and the durable facts of Runs, Sessions and
+// recordings. Every operation is a Go function that runs in one owner
+// transaction. The package owns no connection, RPC, scheduler or provider, and
+// it decides nothing about workflows; Core keeps those decisions.
 package coredata
 
 import (
@@ -7,96 +10,50 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-
-	"embed"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
-	"io"
 	"strconv"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/XGC-Team/xgc2-storage/api"
+	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
 const Schema = model.Schema
-const MaxRequestBytes = model.MaxRequestBytes
 const MaxResponseBytes = model.MaxResponseBytes
-const MaxMembers = model.MaxGroupMembers
-const MaxParameterBytes = model.MaxGroupParameterBytes
 const MaxCloneNamespaces = 1024
 const MaxCloneResources = 4096
 const MaxReferences = 16384
+
+// A scope may hold this many live rows and bytes of Core data. Deleted rows
+// free their share.
 const MaxScopeRows = 1000000
 const MaxScopeBytes = 512 << 20
 
 //go:embed schema.sql
 var SchemaSQL string
 
-// Digest the compiled data-module source, including DDL, without including
-// tests or deployment files. Engine registration rejects a differing module.
+// RecordsSQL creates the Run, Session and recording tables.
 //
-//go:embed model/workflow_records.go model/workflow_relations.go execution_reads.go module.go group.go group_conditions.go namespace.go execution.go execution_commit.go execution_run_queue.go execution_job_capacity.go session.go session_relations.go session_projection.go schema.sql model/types.go model/digest.go model/execution.go model/session.go model/session_records.go model/contract.go model/group_conditions.go model/configuration.go model/configuration_limits.go configuration_declaration.go configuration_rows.go configuration_mutation.go configuration_references.go configuration_catalog.go configuration_namespace.go configuration_state.go model/configuration_state.go configuration_metadata.go model/configuration_metadata.go configuration_execution.go model/configuration_execution.go model/configuration_catalog.go model/configuration_declaration.go model/configuration_digest.go model/configuration_manifest.go configuration_source.go configuration_clone.go model/configuration_clone.go configuration_incoming.go model/configuration_incoming.go
-var moduleSource embed.FS
+//go:embed records.sql
+var RecordsSQL string
 
-func Spec() api.Module {
-	h := sha256.New()
-	for _, path := range []string{"model/workflow_records.go", "model/workflow_relations.go", "execution_reads.go", "module.go", "group.go", "group_conditions.go", "namespace.go", "execution.go", "execution_commit.go", "execution_run_queue.go", "execution_job_capacity.go", "session.go", "session_relations.go", "session_projection.go", "schema.sql", "model/types.go", "model/digest.go", "model/execution.go", "model/session.go", "model/session_records.go", "model/contract.go", "model/group_conditions.go", "model/configuration.go", "model/configuration_limits.go", "configuration_declaration.go", "configuration_rows.go", "configuration_mutation.go", "configuration_references.go", "configuration_catalog.go", "configuration_namespace.go", "configuration_state.go", "model/configuration_state.go", "configuration_metadata.go", "model/configuration_metadata.go", "configuration_execution.go", "model/configuration_execution.go", "model/configuration_catalog.go", "model/configuration_declaration.go", "model/configuration_digest.go", "model/configuration_manifest.go", "configuration_source.go", "configuration_clone.go", "model/configuration_clone.go", "configuration_incoming.go", "model/configuration_incoming.go"} {
-		b, _ := moduleSource.ReadFile(path)
-		h.Write([]byte(path + "\x00"))
-		h.Write(b)
-	}
-	return api.Module{ID: model.Module, Schema: Schema, Digest: hex.EncodeToString(h.Sum(nil)), Operations: []api.NamedOperation{
-		{ID: model.GroupPrepareOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.GroupSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.GroupMemberSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.NamespaceCloneOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.NamespaceGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.NamespaceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommandListOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionJobEventPageOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionCommandGetOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionEventCursorOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ExecutionEventReadOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.SessionWorkflowLogSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationBranchCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationBranchArchiveOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationResourceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationResourceMetadataOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ResourceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ResourceCommitOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ResourceSnapshotOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationIncomingOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespaceCloneOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespaceCloneReceiptOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespaceCreateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespaceUpdateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespaceStateOperation, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationNamespacesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationResourcesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationBranchesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationCommitsOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-		{ID: model.ConfigurationChangesOperation, ReadOnly: true, MaxRequestBytes: MaxRequestBytes, MaxResponseBytes: MaxResponseBytes},
-	}}
+// SchemaVersion is the current schema version of the Core data module. Version
+// 1 is the module that also held the workflow engine's tables.
+const SchemaVersion = 2
+
+// Module registers the Core data module with the storage engine.
+func Module() engine.Module {
+	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize, Legacy: legacy,
+		Migrations: []engine.Migration{{From: 1, Apply: migrate1}}}
 }
 
-// Initialize is only for an explicit new-schema creation, in the owner's
-// creation transaction. Existing databases are verified by the engine; no
-// compatibility detection, migration, aliases or IF NOT EXISTS are used here.
+// Initialize creates the current schema in a database that has none.
 func Initialize(ctx context.Context, tx *sql.Tx) error {
-	if _, err := tx.ExecContext(ctx, SchemaSQL); err != nil {
-		return err
-	}
-	identity, err := randomIdentity()
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO core_execution_identity VALUES(1,?)", identity)
+	_, err := tx.ExecContext(ctx, SchemaSQL+RecordsSQL)
 	return err
 }
 
@@ -107,6 +64,15 @@ func textKey(s string) bool {
 func positiveRevision(s string) bool {
 	v, err := strconv.ParseInt(s, 10, 64)
 	return err == nil && v > 0 && strconv.FormatInt(v, 10) == s
+}
+
+// sha256Hex reports whether value is a canonical lowercase SHA-256 digest.
+func sha256Hex(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 func object(raw json.RawMessage) bool {
 	return len(raw) > 0 && json.Valid(raw) && bytes.HasPrefix(bytes.TrimSpace(raw), []byte("{"))
@@ -125,209 +91,20 @@ func digest(v any) string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:])
 }
-func decode(raw json.RawMessage, into any) error {
-	if len(raw) > MaxRequestBytes {
-		return failure("resource_exhausted", "core data request byte limit exceeded")
-	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.DisallowUnknownFields()
-	if err := d.Decode(into); err != nil {
-		return failure("invalid_argument", "invalid named data request: "+err.Error())
-	}
-	var tail any
-	if err := d.Decode(&tail); err != io.EOF {
-		return failure("invalid_argument", "one JSON request required")
-	}
-	return nil
-}
-func checkSize(v any) error {
-	b, err := encode(v)
-	if err != nil {
-		return failure("invalid_argument", "invalid JSON data")
-	}
-	if len(b) > MaxRequestBytes {
-		return failure("resource_exhausted", "core data request byte limit exceeded")
-	}
-	return nil
+
+// release returns rows and bytes that were deleted to the scope's live total.
+func release(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
+	_, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=max(rows-?,0),bytes=max(bytes-?,0) WHERE scope=?", rows, bytes, scope)
+	return err
 }
 
-// Execute accepts only these deployment-declared operations. scope is the
-// engine's authenticated, canonical scope identity, never an arbitrary path.
-// The owner must hold the writer before calling, commit its receipt in this same
-// transaction, and roll back on any error. Results are provisional until COMMIT.
-func Execute(ctx context.Context, tx *sql.Tx, scope, operation string, raw json.RawMessage) (json.RawMessage, error) {
-	if scope == "" || len(scope) > 2048 || !utf8.ValidString(scope) {
-		return nil, failure("invalid_argument", "authenticated scope required")
-	}
-	var encoded json.RawMessage
-	err := atomicData(ctx, tx, func() error {
-		var err error
-		var result any
-		switch operation {
-		case model.GroupPrepareOperation:
-			var r model.GroupPrepare
-			if err = decode(raw, &r); err == nil {
-				result, err = prepareGroup(ctx, tx, scope, r)
-			}
-		case model.GroupSnapshotOperation:
-			var r model.GroupRead
-			if err = decode(raw, &r); err == nil {
-				result, err = groupSnapshot(ctx, tx, scope, r)
-			}
-		case model.GroupMemberSnapshotOperation:
-			var r model.GroupMemberRead
-			if err = decode(raw, &r); err == nil {
-				result, err = groupMemberSnapshot(ctx, tx, scope, r)
-			}
-		case model.NamespaceCloneOperation:
-			var r model.NamespaceClone
-			if err = decode(raw, &r); err == nil {
-				result, err = cloneNamespace(ctx, tx, scope, r)
-			}
-		case model.NamespaceSnapshotOperation:
-			var r model.NamespaceRead
-			if err = decode(raw, &r); err == nil {
-				result, err = namespaceSnapshot(ctx, tx, scope, r)
-			}
-		case model.NamespaceGetOperation:
-			var r model.NamespaceRead
-			if err = decode(raw, &r); err == nil {
-				result, err = namespaceGet(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommitOperation:
-			var r model.ExecutionCommit
-			if err = decode(raw, &r); err == nil {
-				result, err = commitExecution(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommandListOperation:
-			var r model.CommandListRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionCommands(ctx, tx, scope, r)
-			}
-		case model.ExecutionJobEventPageOperation:
-			var r model.JobEventPageRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionEventPage(ctx, tx, scope, r)
-			}
-		case model.ExecutionCommandGetOperation:
-			var r model.CommandRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readCommand(ctx, tx, scope, r)
-			}
-		case model.ExecutionEventCursorOperation:
-			var r struct{}
-			if err = decode(raw, &r); err == nil {
-				result, err = eventCursor(ctx, tx, scope)
-			}
-		case model.ExecutionEventReadOperation:
-			var r model.EventRead
-			if err = decode(raw, &r); err == nil {
-				result, err = readExecutionEvents(ctx, tx, scope, r)
-			}
-		case model.SessionWorkflowLogSnapshotOperation:
-			var r model.SessionWorkflowLogRead
-			if err = decode(raw, &r); err == nil {
-				result, err = sessionWorkflowLogSnapshot(ctx, tx, scope, r)
-			}
-		case model.ConfigurationBranchCreateOperation:
-			var r model.ConfigurationBranchCreate
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationBranchCreate(ctx, tx, scope, r)
-			}
-		case model.ConfigurationBranchArchiveOperation:
-			var r model.ConfigurationBranchArchive
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationBranchArchive(ctx, tx, scope, r)
-			}
-		case model.ConfigurationResourceStateOperation:
-			var r model.ConfigurationResourceState
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationResourceState(ctx, tx, scope, r)
-			}
-		case model.ConfigurationResourceMetadataOperation:
-			var r model.ConfigurationResourceMetadata
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationResourceMetadata(ctx, tx, scope, r)
-			}
-		case model.ResourceCreateOperation:
-			var r model.ConfigurationResourceCreate
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationCreate(ctx, tx, scope, r)
-			}
-		case model.ResourceCommitOperation:
-			var r model.ConfigurationResourceCommit
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationCommit(ctx, tx, scope, r)
-			}
-		case model.ResourceSnapshotOperation:
-			var r model.ConfigurationResourceRead
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationRead(ctx, tx, scope, r)
-			}
-		case model.ConfigurationIncomingOperation:
-			var r model.ConfigurationIncomingRead
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationIncomingRead(ctx, tx, scope, r)
-			}
-		case model.ConfigurationNamespaceCloneOperation:
-			var r model.ConfigurationNamespaceClone
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationClone(ctx, tx, scope, r)
-			}
-		case model.ConfigurationNamespaceCloneReceiptOperation:
-			var r model.ConfigurationNamespaceCloneReceipt
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationCloneReceipt(ctx, tx, scope, r)
-			}
-		case model.ConfigurationNamespaceCreateOperation, model.ConfigurationNamespaceUpdateOperation, model.ConfigurationNamespaceStateOperation:
-			var r model.ConfigurationNamespaceWrite
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationNamespaceWrite(ctx, tx, scope, operation, r)
-			}
-		case model.ConfigurationNamespacesOperation, model.ConfigurationResourcesOperation, model.ConfigurationBranchesOperation, model.ConfigurationCommitsOperation, model.ConfigurationChangesOperation:
-			var r model.ConfigurationCatalogRead
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationCatalog(ctx, tx, scope, operation, r)
-			}
-		case model.ConfigurationReceiptOperation:
-			var r model.ConfigurationReceipt
-			if err = decode(raw, &r); err == nil {
-				result, err = configurationReceipt(ctx, tx, scope, r)
-			}
-		default:
-			err = failure("invalid_argument", "unregistered core data operation")
-		}
-		if err != nil {
-			return err
-		}
-		encoded, err = encode(result)
-		if err == nil && len(encoded) > MaxResponseBytes {
-			return failure("resource_exhausted", "core data response byte limit exceeded")
-		}
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-	return encoded, nil
-}
-
-func atomicData(ctx context.Context, tx *sql.Tx, work func() error) error {
-	if tx == nil {
-		return failure("invalid_argument", "owner transaction required")
-	}
-	if _, err := tx.ExecContext(ctx, "SAVEPOINT core_data_operation"); err != nil {
+// charge accounts rows and bytes without a limit check, for a change that
+// finishes work already admitted (a Run's outcome must be recorded).
+func charge(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
 		return err
 	}
-	if err := work(); err != nil {
-		// Cleanup has its own finite budget when the caller context was canceled.
-		cleanup, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_, rollback := tx.ExecContext(cleanup, "ROLLBACK TO core_data_operation")
-		_, release := tx.ExecContext(cleanup, "RELEASE core_data_operation")
-		return errors.Join(err, rollback, release)
-	}
-	_, err := tx.ExecContext(ctx, "RELEASE core_data_operation")
+	_, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=max(rows+?,0),bytes=max(bytes+?,0) WHERE scope=?", rows, bytes, scope)
 	return err
 }
 

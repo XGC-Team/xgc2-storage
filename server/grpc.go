@@ -20,33 +20,6 @@ type GRPC struct {
 	Grants []Grant
 }
 
-func (s *GRPC) Named(ctx context.Context, r *pb.NamedRequest) (*pb.NamedResponse, error) {
-	request := r.API()
-	if e := s.check(ctx, request.Scope); e != nil {
-		return nil, e
-	}
-	ids := metadata.ValueFromIncomingContext(ctx, "x-request-id")
-	if len(ids) != 1 || ids[0] != request.RequestID {
-		return nil, grpcx.ApplicationError(ctx, status.Error(codes.InvalidArgument, "body/header identity mismatch"))
-	}
-	out, e := s.Store.Named(ctx, request)
-	if e != nil {
-		return nil, grpcError(ctx, e)
-	}
-	return pb.NamedOutput(out), nil
-}
-func (s *GRPC) NamedResult(ctx context.Context, r *pb.ReceiptRequest) (*pb.NamedResponse, error) {
-	request := r.API()
-	if e := s.check(ctx, request.Scope); e != nil {
-		return nil, e
-	}
-	out, e := s.Store.NamedResult(ctx, request)
-	if e != nil {
-		return nil, grpcError(ctx, e)
-	}
-	return pb.NamedOutput(out), nil
-}
-
 func (s *GRPC) check(ctx context.Context, scope api.Scope) error {
 	values := metadata.ValueFromIncomingContext(ctx, "authorization")
 	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") || !authorize(s.Grants, strings.TrimPrefix(values[0], "Bearer "), scope) {

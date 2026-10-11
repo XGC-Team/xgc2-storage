@@ -1,0 +1,124 @@
+# Core data: typed relational facts
+
+Owner: xgc2-storage, `modules/coredata`. Types and limits: `modules/coredata/model` (no SQL,
+driver, engine or XRPC imports). Core calls the functions below directly through
+`host.Host.Core(scope)`; they are Go functions with typed arguments, not requests, and they
+are not exposed over XRPC unless a remote consumer appears. Core decides every domain matter
+(authorization, schemas, visibility, policy, IDs, pins, workflow behavior); Storage checks
+the data guards and constraints inside one owner transaction and decides nothing about
+workflows.
+
+Every method is one transaction: it commits all of its effects or none. A method runs on the
+single writer (writes) or a reader connection (reads), under the caller's deadline or the
+owner's call budget. No savepoint, receipt or JSON envelope is involved. Revisions, versions
+and counts that can exceed 2^53 are canonical decimal **strings**; Run and Session revisions
+are int64.
+
+## Configuration
+
+Resources with branches, immutable commits and CAS heads, kept exactly as they were:
+namespaces (folders), resources, branches, commits with their frozen payload, manifest and
+references, change records, the accepted domain catalog, and the permanent product mutation
+receipts that make every configuration write idempotent by its key. All are Durable.
+
+| Function | Kind | Result |
+| --- | --- | --- |
+| `CreateResource`, `CommitResource` | write | `ConfigurationMutationResult` (created, committed, noop, identity-only; replayed on a repeated key) |
+| `CreateBranch`, `ArchiveBranch`, `SetResourceState`, `UpdateResourceMetadata` | write | `ConfigurationMutationResult` |
+| `CreateNamespace`, `UpdateNamespace`, `SetNamespaceState`, `CloneNamespace` | write | `ConfigurationNamespaceResult` |
+| `ReadResource` | read | immutable snapshot by resource+branch or resource+commit, with the current main visibility pin |
+| `Receipt`, `CloneReceipt` | read | the stored result of a product mutation key |
+| `IncomingReferences` | read | live references that point at a resource |
+| `NamespaceTree` | read | complete live subtree with every current main, verified against its content digest |
+| `Namespaces`, `Resources`, `Branches`, `Commits`, `Changes` | read | catalog metadata, bounded |
+| `DeclareConfigurationDomains` (package function) | write | applies the owner's domain catalog; capabilities of a declared domain cannot change |
+
+## Runs
+
+`runs` holds one row per Run: lineage (`root_run_id`, `parent_run_id`, `call_node_id`,
+`depth`), `session_id`, a unique `idempotency_key`, the pinned workflow (`workflow_resource_id`,
+`workflow_commit_id`, `definition_digest`, `action_id`), the frozen inputs and trigger, the
+status, and, once finished, the termination, error, result, node records and cleanup errors.
+Statuses: `queued`, `running`, `stopping`, `succeeded`, `failed`, `stopped`, `canceled`,
+`interrupted`.
+
+| Function | Class | Behavior |
+| --- | --- | --- |
+| `CreateRun` | Durable | accepts a Run as `queued` or `running`; lineage is checked (a root is its own root at depth 0); with a key, a repeated call returns the stored Run and `created=false` |
+| `UpdateRunStatus(updates...)` | Relaxed | moves open Runs to `running` or `stopping`; one transaction for the whole slice; repeating is a no-op, going back is `failed_precondition`; one bad entry rolls the batch back |
+| `FinishRun` | Durable | records a terminal status and the outcome once; recorded even when the quota is full |
+| `GetRun`, `FindRunByIdempotencyKey` | read | |
+| `ListRuns` | read | newest first by (created_at, id); filters: target, root, session, workflow, statuses, time window; opaque cursor; `OmitPayloads` leaves out the large JSON columns |
+| `InterruptOpenRuns` | Durable | Core's boot step: every open Run becomes `interrupted`; no half-run graph resumes |
+| `PruneRuns` | Relaxed | deletes finished Runs by age and/or by count (newest kept), at most `Limit` per call; never a Run whose root is still open |
+
+Listings are answered from an index in page order, so a page costs the same however long the
+history is: creation order, target, root, session, workflow, a time window, and the open
+statuses (`queued`, `running`, `stopping`; "what is running" reads only the open Runs). A
+filter by a finished status alone walks Runs in creation order until the page is full, which
+`PruneRuns` retention bounds. `TestRecordQueriesUseTheirIndexes` runs the statements the code
+builds through `EXPLAIN QUERY PLAN`.
+
+## Sessions
+
+One Session per target is live (`open` or `stopping`); the database enforces it.
+
+| Function | Class | Behavior |
+| --- | --- | --- |
+| `OpenSession` | Durable | a second live Session on the target is a `conflict`; opening the same Session again returns it with `created=false` |
+| `RequestStop` | Durable | `open` to `stopping` with the stop intent (a JSON object, immutable: later calls return the Session unchanged) |
+| `CloseSession` | Durable | `open`/`stopping` to `closed`; closing again is a no-op |
+| `GetSession`, `ListSessions` | read | newest first; filters: target, experiment resource, statuses |
+| `CloseOpenSessions` | Durable | Core's boot step: live Sessions become `interrupted` |
+
+## Recordings
+
+`AddRecording` (Durable, idempotent by id; different facts under one id are a `conflict`),
+`GetRecording` and `ListRecordings` (oldest first; filters: session, run, kind) keep the index
+of recordings that Runs registered.
+
+## Quota and retention
+
+Rows and bytes of Core data are charged to a per-scope live total (1,000,000 rows, 512 MiB);
+deleting a Run frees its share. `CreateRun`, `OpenSession` and `AddRecording` are refused at
+the limit with `resource_exhausted`, while `FinishRun` always records the outcome of a Run
+that was admitted. Core prunes with `PruneRuns` on its own schedule.
+
+## Schema version and migration
+
+The module's schema version is an integer, currently 2. Opening a database with the same
+version succeeds whatever the code; an older one is migrated in one transaction after a
+consistent backup next to the database (`<db>.before-<module>-v<from>.<unix>.db`, mode 0600);
+a newer one is refused with an error that names the component. `storage-admin` never migrates.
+
+Version 1, which also held the workflow engine's data, is recognized by its complete set of
+tables (a partial set is refused as an unrecognized layout) and migrated in place:
+
+- **kept byte for byte**: namespaces, resources, branches, snapshots (commits), references,
+  changes, the accepted domain catalog and the product mutation receipts; every document
+  collection that is not retired below (credentials, settings, audit rows, Lichtblick documents,
+  Agent-runtime conversations) with its versions, tombstones, indexes and receipts; the
+  database identity;
+- **dropped**: the workflow engine's document collections (Run ledger and its relations,
+  Sessions, triggers, schedules, robot operations, process instances, Jobs, interactions,
+  frozen run configurations and bundles, fleet environments, MCP connections, the adapter
+  runtime ledger, the App Store) in the namespaces that name the module, so a same-named
+  collection of another namespace is untouched; the command ledger, the event log, event offsets
+  and sequences, the execution identity, sealed child-run groups and their views; the namespace
+  `core-panel-state` wholesale;
+- **created empty**: `runs`, `sessions`, `recordings`;
+- **recomputed**: the live quota counter `core_data_usage` (version 1 also charged events and
+  commands and never gave anything back) and the engine's usage and receipt counters;
+- the engine's own schema moves from 1 to 2 in the same transaction: the manifest hash and the
+  Named results disappear.
+
+The new manifest of Core must therefore not declare the retired collections or the panel-state
+namespace. `TestProductionDatabaseMigratesKeepingConfigurationAndDroppingExecutionData` migrates
+a database that the previous release wrote (`testdata/production/storage.db`: two domains,
+folders, resources with a second commit, a branch, a tracking reference, an archived and a
+protected resource, credentials and audit documents with tombstones, workflow-engine documents
+in 25 collections, a command with its events, a sealed child-run group, panel state, Lichtblick
+documents, an Agent-runtime conversation and receipts), compares the digest of every kept
+table and document before and after, checks that nothing of the execution data is left, that
+the pre-migration product receipts still replay, that the rebuilt indexes enforce uniqueness,
+and that a second open migrates and backs up nothing.
