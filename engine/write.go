@@ -48,11 +48,22 @@ func (s *Store) transact(ctx context.Context, d Durability, fn func(context.Cont
 	if err != nil {
 		return err
 	}
+	// The writer connection is shared by every later call: whatever happens in
+	// fn, including a panic that a caller recovers, must not leave its
+	// transaction open.
+	finished := false
+	defer func() {
+		if !finished {
+			tx.Rollback()
+		}
+	}()
 	if err = fn(ctx, tx); err != nil {
-		tx.Rollback()
 		return err
 	}
+	finished = true
 	if err = tx.Commit(); err != nil {
+		// SQLite may keep the transaction open after a failed COMMIT.
+		s.writer.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		return err
 	}
 	s.committed(d)

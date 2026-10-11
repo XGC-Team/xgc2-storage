@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/XGC-Team/xgc2-storage/api"
@@ -70,6 +71,43 @@ func TestFailedTransactionRollsBackAndCountsNoCommit(t *testing.T) {
 	// The writer is still usable and still at the last requested level.
 	if got := synchronous(t, s, Durable); got != 2 {
 		t.Fatalf("writer left at synchronous=%d", got)
+	}
+}
+
+func TestPanickingTransactionRollsBackAndLeavesTheWriterUsable(t *testing.T) {
+	s, _, ctx := setup(t)
+	panicking := func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("the panic did not reach the caller")
+			}
+		}()
+		_ = s.Write(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error {
+			if _, e := tx.ExecContext(ctx, "INSERT INTO scopes VALUES('x','test',0,0)"); e != nil {
+				return e
+			}
+			panic("bug in a data module")
+		})
+	}
+	// The next writer follows at once: it must neither find the connection
+	// inside the previous transaction nor wait for a lock nobody holds.
+	for i := 0; i < 200; i++ {
+		panicking()
+		if err := s.Write(ctx, Relaxed, func(ctx context.Context, tx *sql.Tx) error {
+			_, e := tx.ExecContext(ctx, "INSERT INTO scopes VALUES(?,'test',0,0)", fmt.Sprint("y", i))
+			return e
+		}); err != nil {
+			t.Fatalf("writer wedged after panic %d: %v", i, err)
+		}
+	}
+	var leaked, kept int
+	if err := s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+		if e := tx.QueryRowContext(ctx, "SELECT count(*) FROM scopes WHERE scope='x'").Scan(&leaked); e != nil {
+			return e
+		}
+		return tx.QueryRowContext(ctx, "SELECT count(*) FROM scopes WHERE scope LIKE 'y%'").Scan(&kept)
+	}); err != nil || leaked != 0 || kept != 200 {
+		t.Fatalf("panicking transactions left %d rows, later ones kept %d: %v", leaked, kept, err)
 	}
 }
 
