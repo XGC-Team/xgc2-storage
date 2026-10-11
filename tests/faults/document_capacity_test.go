@@ -22,7 +22,7 @@ func capacityDocument(operation string, padding int) json.RawMessage {
 	return raw
 }
 
-func TestFaultNativeDocumentCeilingWithoutNamedHost(t *testing.T) {
+func TestFaultNativeDocumentCeiling(t *testing.T) {
 	for _, profile := range []string{xrpc.HTTP, xrpc.GRPC} {
 		t.Run(profile, func(t *testing.T) {
 			d := startProfileManifest(t, privateDir(t), true, "", manifest(), profile)

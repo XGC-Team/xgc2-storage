@@ -24,4 +24,7 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
+// Development only: the shared XRPC module comes from the sibling checkout until a
+// release of it is pinned above. scripts/build-package.py refuses to package
+// while a replace directive exists.
 replace github.com/XGC-Team/xgc2-xrpc/go => ../xrpc-go/go
