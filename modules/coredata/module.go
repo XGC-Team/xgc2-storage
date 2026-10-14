@@ -42,13 +42,13 @@ var SchemaSQL string
 var RecordsSQL string
 
 // SchemaVersion is the current schema version of the Core data module. Version
-// 1 is the module that also held the workflow engine's tables.
-const SchemaVersion = 2
+// 1 also held the workflow engine's tables; 3 stores Run JSON compressed.
+const SchemaVersion = 3
 
 // Module registers the Core data module with the storage engine.
 func Module() engine.Module {
 	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize, Legacy: legacy,
-		Migrations: []engine.Migration{{From: 1, Apply: migrate1}}}
+		Migrations: []engine.Migration{{From: 1, Apply: migrate1}, {From: 2, Apply: migrate2}}}
 }
 
 // Initialize creates the current schema in a database that has none.

@@ -125,7 +125,24 @@ func scanRun(row scanner) (model.Run, error) {
 		return r, err
 	}
 	r.Status = model.RunStatus(status)
-	r.Inputs, r.Trigger, r.Error, r.Result, r.Nodes, r.CleanupErrors = rawOrNil(inputs), rawOrNil(trigger), rawOrNil(errored), rawOrNil(result), rawOrNil(nodes), rawOrNil(cleanup)
+	for _, field := range []struct {
+		stored []byte
+		limit  int
+		target *json.RawMessage
+	}{
+		{inputs, model.MaxRunInputsBytes, &r.Inputs},
+		{trigger, model.MaxRunTriggerBytes, &r.Trigger},
+		{errored, model.MaxRunErrorBytes, &r.Error},
+		{result, model.MaxRunResultBytes, &r.Result},
+		{nodes, model.MaxRunNodesBytes, &r.Nodes},
+		{cleanup, model.MaxRunCleanupErrorsBytes, &r.CleanupErrors},
+	} {
+		raw, err := decodeRunPayload(field.stored, field.limit)
+		if err != nil {
+			return r, err
+		}
+		*field.target = rawOrNil(raw)
+	}
 	r.CreatedAt, r.StartedAt, r.FinishedAt = instant(created), instant(started), instant(finished)
 	return r, nil
 }
@@ -213,13 +230,21 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if r.Status == model.RunRunning {
 		r.StartedAt = at
 	}
-	bytes := runBytes(r)
+	storedInputs, err := encodeRunPayload(inputs)
+	if err != nil {
+		return model.Run{}, false, err
+	}
+	storedTrigger, err := encodeRunPayload(trigger)
+	if err != nil {
+		return model.Run{}, false, err
+	}
+	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger))
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
 	_, err = tx.ExecContext(ctx, "INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',?,?,0,1,?)",
 		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, r.IdempotencyKey, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
-		[]byte(inputs), []byte(trigger), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
+		storedInputs, storedTrigger, string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
 	return r, true, err
 }
 
@@ -274,6 +299,12 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 	cleanup, err := jsonField("cleanup errors", f.CleanupErrors, model.MaxRunCleanupErrorsBytes, false, false)
 	if err != nil {
 		return model.Run{}, err
+	}
+	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
+		*field, err = encodeRunPayload(*field)
+		if err != nil {
+			return model.Run{}, err
+		}
 	}
 	var current string
 	err = tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&current)

@@ -90,6 +90,24 @@ func configurationCounts(t *testing.T, db *sql.DB, ctx context.Context) string {
 	}
 	return fmt.Sprint(count(t, db, ctx, "core_resources"), count(t, db, ctx, "core_branches"), count(t, db, ctx, "core_snapshots"), count(t, db, ctx, "core_references"), count(t, db, ctx, "core_changes"), count(t, db, ctx, "core_configuration_receipts"), rows, bytes)
 }
+func configurationQuotaBytes(t *testing.T, db *sql.DB, ctx context.Context) (charged, live int64) {
+	t.Helper()
+	if err := db.QueryRowContext(ctx, "SELECT bytes FROM core_data_usage WHERE scope=?", testScope).Scan(&charged); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"core_namespaces", "core_resources", "core_branches", "core_snapshots", "core_references", "core_changes", "core_configuration_receipts", "core_catalog_receipts"} {
+		expression := "length(body)"
+		if table == "core_snapshots" {
+			expression += "+length(payload)+length(manifest)"
+		}
+		var bytes int64
+		if err := db.QueryRowContext(ctx, "SELECT coalesce(sum("+expression+"),0) FROM "+table+" WHERE scope=?", testScope).Scan(&bytes); err != nil {
+			t.Fatal(err)
+		}
+		live += bytes
+	}
+	return
+}
 func TestConfigurationAtomicReplayCASAndBytes(t *testing.T) {
 	db, ctx, g := configurationFixture(t)
 	q := configurationCreateForTest(t, g, "resource", nil)
@@ -122,7 +140,12 @@ func TestConfigurationAtomicReplayCASAndBytes(t *testing.T) {
 	_, e = run(t, db, ctx, model.ResourceCreateOperation, loser)
 	configurationCode(t, e, "conflict")
 	commit := configurationCommitForTest(t, g, first, "write-two", "b", true, nil, q.Snapshot.Manifest)
+	chargedBefore, liveBefore := configurationQuotaBytes(t, db, ctx)
 	second := configurationWrite(t, db, ctx, model.ResourceCommitOperation, commit)
+	chargedAfter, liveAfter := configurationQuotaBytes(t, db, ctx)
+	if chargedAfter-chargedBefore != liveAfter-liveBefore {
+		t.Fatalf("commit charged %d bytes but live rows grew by %d", chargedAfter-chargedBefore, liveAfter-liveBefore)
+	}
 	if second.Result.Head.Commit.Version != "2" || second.Result.Head.Resource.NextVersion != "3" {
 		t.Fatal(second)
 	}
@@ -162,7 +185,12 @@ func TestConfigurationC1NoopLocationAndLateReceiptRollback(t *testing.T) {
 	move.MoveTo = &model.ConfigurationNamespaceGuard{ID: "destination", ExpectedRevision: "1"}
 	move.ExpectedResourceRevision = "1"
 	move.Snapshot.Change.ID = "move-change"
+	chargedBefore, liveBefore := configurationQuotaBytes(t, db, ctx)
 	moved := configurationWrite(t, db, ctx, model.ResourceCommitOperation, move)
+	chargedAfter, liveAfter := configurationQuotaBytes(t, db, ctx)
+	if chargedAfter-chargedBefore != liveAfter-liveBefore {
+		t.Fatalf("identity-only move charged %d bytes but live rows grew by %d", chargedAfter-chargedBefore, liveAfter-liveBefore)
+	}
 	if moved.Result.Disposition != "identity-only" || moved.Result.Head.Resource.NamespaceID != "destination" || moved.Result.Head.Resource.Revision != "2" || moved.Result.Head.Commit != first.Result.Head.Commit || moved.Result.Head.Branch != first.Result.Head.Branch {
 		t.Fatal("move changed immutable bytes/version/branch")
 	}

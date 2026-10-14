@@ -262,6 +262,8 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 			return out, failure("invalid_argument", "promotion needs an owned named source branch")
 		}
 	}
+	oldResourceBody, _ := encode(r)
+	oldBranchBody, _ := encode(b)
 	mainBytes := 0
 	if d.MainVisibility || q.Main.ID != "" {
 		main, err := configurationCurrentMain(ctx, tx, scope, q.Domain.Key, r, &base)
@@ -338,7 +340,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 			}
 			r.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 			rb, _ := encode(r)
-			if err = reserve(ctx, tx, scope, 0, int64(len(rb))); err != nil {
+			if err = reserve(ctx, tx, scope, 0, int64(len(rb)-len(oldResourceBody))); err != nil {
 				return out, err
 			}
 			if _, err = tx.ExecContext(ctx, "UPDATE core_resources SET namespace_id=?,revision=?,body=? WHERE scope=? AND domain=? AND id=?", configurationNullable(ns), r.Revision, []byte(rb), scope, q.Domain.Key, r.ID); err != nil {
@@ -420,7 +422,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	}
 	rb, _ := encode(r)
 	bb, _ := encode(b)
-	if err = reserve(ctx, tx, scope, 0, int64(len(rb)+len(bb))); err != nil {
+	if err = reserve(ctx, tx, scope, 0, int64(len(rb)+len(bb)-len(oldResourceBody)-len(oldBranchBody))); err != nil {
 		return out, err
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE core_resources SET namespace_id=?,name=?,name_key=?,revision=?,main_commit_id=?,body=? WHERE scope=? AND domain=? AND id=?", configurationNullable(r.NamespaceID), r.Name, r.NameKey, r.Revision, r.MainCommitID, []byte(rb), scope, q.Domain.Key, r.ID); err != nil {

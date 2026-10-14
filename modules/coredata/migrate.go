@@ -3,6 +3,7 @@ package coredata
 import (
 	"context"
 	"database/sql"
+	"errors"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 )
@@ -86,6 +87,43 @@ func migrate1(ctx context.Context, tx *sql.Tx, namespaces []string) error {
 	}
 	// Version 1 also charged events and commands to this counter and never gave
 	// anything back. The live total is what the remaining rows occupy.
+	return rebuildLiveUsage(ctx, tx)
+}
+
+// migrate2 replaces the schema-2 JSON representation, without dropping any Run
+// fact or changing a public value. The owner backs up before this transaction.
+func migrate2(ctx context.Context, tx *sql.Tx, _ []string) error {
+	lastScope, lastID := "", ""
+	for {
+		var scope, id string
+		var size int64
+		var fields [6][]byte
+		err := tx.QueryRowContext(ctx, `SELECT scope,id,bytes,inputs_json,trigger_json,error_json,result_json,nodes_json,cleanup_errors_json
+FROM runs WHERE (scope,id)>(?,?) ORDER BY scope,id LIMIT 1`, lastScope, lastID).
+			Scan(&scope, &id, &size, &fields[0], &fields[1], &fields[2], &fields[3], &fields[4], &fields[5])
+		if errors.Is(err, sql.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		for i, raw := range fields {
+			fields[i], err = encodeRunPayload(raw)
+			if err != nil {
+				return err
+			}
+			size += int64(len(fields[i]) - len(raw))
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE runs SET inputs_json=?,trigger_json=?,error_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,bytes=? WHERE scope=? AND id=?`,
+			fields[0], fields[1], fields[2], fields[3], fields[4], fields[5], size, scope, id); err != nil {
+			return err
+		}
+		lastScope, lastID = scope, id
+	}
+	return rebuildLiveUsage(ctx, tx)
+}
+
+func rebuildLiveUsage(ctx context.Context, tx *sql.Tx) error {
 	_, err := tx.ExecContext(ctx, `DELETE FROM core_data_usage;
 INSERT INTO core_data_usage(scope,rows,bytes) SELECT scope,sum(rows),sum(bytes) FROM (
  SELECT scope,count(*) AS rows,coalesce(sum(length(body)),0) AS bytes FROM core_namespaces GROUP BY scope
@@ -96,6 +134,9 @@ INSERT INTO core_data_usage(scope,rows,bytes) SELECT scope,sum(rows),sum(bytes) 
  UNION ALL SELECT scope,count(*),coalesce(sum(length(body)),0) FROM core_changes GROUP BY scope
  UNION ALL SELECT scope,count(*),coalesce(sum(length(body)),0) FROM core_configuration_receipts GROUP BY scope
  UNION ALL SELECT scope,count(*),coalesce(sum(length(body)),0) FROM core_catalog_receipts GROUP BY scope
+ UNION ALL SELECT scope,count(*),coalesce(sum(bytes),0) FROM runs GROUP BY scope
+ UNION ALL SELECT scope,count(*),coalesce(sum(bytes),0) FROM sessions GROUP BY scope
+ UNION ALL SELECT scope,count(*),coalesce(sum(bytes),0) FROM recordings GROUP BY scope
 ) GROUP BY scope`)
 	return err
 }
