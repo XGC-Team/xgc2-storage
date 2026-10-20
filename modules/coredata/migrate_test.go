@@ -70,6 +70,36 @@ func copyFixture(t *testing.T) string {
 	if err = out.Close(); err != nil {
 		t.Fatal(err)
 	}
+	// The committed fixture freezes lb-1's expiry at 2026-10-17. Extend only
+	// this temporary copy so maintenance still runs and the kept Batch receipt
+	// stays inside its lifetime. The original file is not written.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := db.Exec(`UPDATE receipts SET expires=? WHERE request_id='lb-1'`, time.Now().Add(24*time.Hour).Unix())
+	if err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Fatalf("extend lb-1: %v; close: %v", err, closeErr)
+		}
+		t.Fatal(err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Fatalf("lb-1 rows: %v; close: %v", err, closeErr)
+		}
+		t.Fatal(err)
+	}
+	if affected != 1 {
+		if closeErr := db.Close(); closeErr != nil {
+			t.Fatalf("lb-1 rows %d; close: %v", affected, closeErr)
+		}
+		t.Fatalf("lb-1 receipt rows: %d", affected)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	return path
 }
 

@@ -44,9 +44,10 @@ Statuses: `queued`, `running`, `stopping`, `succeeded`, `failed`, `stopped`, `ca
 
 | Function | Class | Behavior |
 | --- | --- | --- |
-| `CreateRun` | Durable | accepts a Run as `queued` or `running`; lineage is checked (a root is its own root at depth 0); with a key, a repeated call returns the stored Run and `created=false` |
-| `UpdateRunStatus(updates...)` | Relaxed | moves open Runs to `running` or `stopping`; one transaction for the whole slice; repeating is a no-op, going back is `failed_precondition`; one bad entry rolls the batch back |
-| `FinishRun` | Durable | records a terminal status and the outcome once; recorded even when the quota is full |
+| `CreateRun` | Durable | accepts a Run as `queued` or `running`; lineage is checked (a root is its own root at depth 0); with a key, a repeated call returns the stored Run and `created=false`. The key lookup does not compare inputs |
+| `UpdateRunStatus(updates...)` | Relaxed | moves open Runs to `running` or `stopping`; one transaction for the whole slice; repeating the same status is a no-op; a `running` or `stopping` update of an already terminal Run is a no-op and leaves the revision unchanged; an open reverse transition is `failed_precondition`; one bad entry rolls the batch back |
+| `FinishRun` | Durable | records a terminal status and the outcome, even when the quota is full. The same outcome returns the stored Run and does not change the row, its revision, or quota: status and termination match, and error, result, nodes, and cleanup errors match as normalized uncompressed JSON bytes; a zero `At` matches, and a non-zero `At` must equal `FinishedAt`. That replay still enters one Durable write transaction, so the owner's commit and fsync accounting can advance. A different outcome is `failed_precondition` |
+| `ApplyRunOps(ctx, creates []NewRun, updates []RunStatusUpdate, finishes []RunFinish) ([]CreatedRun, error)` | Durable when `creates` or `finishes` is non-empty; Relaxed when only `updates` is non-empty; no transaction when all three are empty | one transaction, ordered creates, then updates, then finishes, using each Run's literal id. The result has one `CreatedRun{Run, Created}` per create; a repeated idempotency key returns the stored Run with `Created=false` and does not compare inputs. `len(creates)+len(updates)+len(finishes) > 1000` (`MaxPageSize`) is `invalid_argument` and opens no transaction. Any error rolls the whole batch back: no partial result and no quota residue. Same-outcome finishes and terminal status updates inside the batch follow `FinishRun` and `UpdateRunStatus`: those rows, revisions, and quota do not change, while a batch that contains a finish still uses one Durable transaction |
 | `GetRun`, `FindRunByIdempotencyKey` | read | |
 | `ListRuns` | read | newest first by (created_at, id); filters: target, root, session, workflow, statuses, time window; opaque cursor; `OmitPayloads` leaves out the large JSON columns |
 | `InterruptOpenRuns` | Durable | Core's boot step: every open Run becomes `interrupted`; no half-run graph resumes |
@@ -87,8 +88,9 @@ of recordings that Runs registered.
 
 Rows and bytes of Core data are charged to a per-scope live total (1,000,000 rows, 512 MiB);
 deleting a Run frees its share. `CreateRun`, `OpenSession` and `AddRecording` are refused at
-the limit with `resource_exhausted`, while `FinishRun` always records the outcome of a Run
-that was admitted. Core prunes with `PruneRuns` on its own schedule.
+the limit with `resource_exhausted`, while the first `FinishRun` of an admitted Run
+records its outcome even when the quota is already full. A same-outcome `FinishRun`
+does not charge quota again. Core prunes with `PruneRuns` on its own schedule.
 
 ## Schema version and migration
 

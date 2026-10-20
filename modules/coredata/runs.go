@@ -1,6 +1,7 @@
 package coredata
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/base64"
@@ -265,7 +266,10 @@ func updateRunStatuses(ctx context.Context, tx *sql.Tx, scope string, updates []
 			return err
 		}
 		from := model.RunStatus(current)
-		if from == u.Status {
+		// Same status is a no-op. A terminal row keeps its outcome when a late
+		// running or stopping update arrives, so a retried batch can still finish.
+		// An open Run never moves backward.
+		if from == u.Status || from.Terminal() {
 			continue
 		}
 		// queued -> running | stopping, running -> stopping; nothing returns.
@@ -300,12 +304,6 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 	if err != nil {
 		return model.Run{}, err
 	}
-	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
-		*field, err = encodeRunPayload(*field)
-		if err != nil {
-			return model.Run{}, err
-		}
-	}
 	var current string
 	err = tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -315,7 +313,20 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 		return model.Run{}, err
 	}
 	if !model.RunStatus(current).Open() {
-		return model.Run{}, failure("failed_precondition", "run already finished")
+		existing, err := selectRun(ctx, tx, scope, "id=?", f.ID)
+		if err != nil {
+			return model.Run{}, err
+		}
+		if !sameRunFinish(existing, f, errored, result, nodes, cleanup) {
+			return model.Run{}, failure("failed_precondition", "run already finished")
+		}
+		return existing, nil
+	}
+	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
+		*field, err = encodeRunPayload(*field)
+		if err != nil {
+			return model.Run{}, err
+		}
 	}
 	// An open Run carries none of these columns, so the row only grows by them.
 	grown := int64(len(f.Termination) + len(errored) + len(result) + len(nodes) + len(cleanup))
@@ -327,6 +338,19 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 		return model.Run{}, err
 	}
 	return selectRun(ctx, tx, scope, "id=?", f.ID)
+}
+
+// sameRunFinish reports whether f repeats the outcome already stored on existing.
+// JSON fields are the normalized uncompressed bytes from jsonField. A zero At
+// matches any stored finish time; a non-zero At must be that exact instant.
+func sameRunFinish(existing model.Run, f model.RunFinish, errored, result, nodes, cleanup []byte) bool {
+	if existing.Status != f.Status || existing.Termination != f.Termination {
+		return false
+	}
+	if !bytes.Equal(existing.Error, errored) || !bytes.Equal(existing.Result, result) || !bytes.Equal(existing.Nodes, nodes) || !bytes.Equal(existing.CleanupErrors, cleanup) {
+		return false
+	}
+	return f.At.IsZero() || nanos(f.At) == nanos(existing.FinishedAt)
 }
 
 func getRun(ctx context.Context, tx *sql.Tx, scope, id string) (model.Run, error) {
@@ -531,18 +555,67 @@ func (s *Store) CreateRun(ctx context.Context, q model.NewRun) (run model.Run, c
 // UpdateRunStatus moves open Runs to running or stopping in one relaxed
 // transaction: it survives a process crash and may lose the last transitions
 // on power loss, which a restart repairs by interrupting open Runs. Repeating
-// a transition is a no-op; a status never goes back.
+// a transition is a no-op. A running or stopping update of an already terminal
+// Run is a no-op and leaves revision unchanged. An open Run never moves backward.
 func (s *Store) UpdateRunStatus(ctx context.Context, updates ...model.RunStatusUpdate) error {
 	return s.db.Write(ctx, engine.Relaxed, func(ctx context.Context, tx *sql.Tx) error {
 		return updateRunStatuses(ctx, tx, s.scope, updates)
 	})
 }
 
-// FinishRun durably records how a Run ended. A Run finishes once.
+// FinishRun durably records how a Run ended. The same outcome returns the
+// stored Run and does not change the row, its revision, or its quota. A
+// different outcome is failed_precondition.
 func (s *Store) FinishRun(ctx context.Context, f model.RunFinish) (model.Run, error) {
 	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.Run, error) {
 		return finishRun(ctx, tx, scope, f)
 	})
+}
+
+// ApplyRunOps applies a batch of Run creations, open-status transitions and
+// terminal finishes in one transaction (creates, then updates, then finishes).
+// The transaction is Durable when creates or finishes is non-empty, and
+// Relaxed when only updates are present. An empty batch is a no-op.
+func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates []model.RunStatusUpdate, finishes []model.RunFinish) ([]model.CreatedRun, error) {
+	if len(creates)+len(updates)+len(finishes) > model.MaxPageSize {
+		return nil, failure("invalid_argument", "at most 1000 run operations per batch")
+	}
+	if len(creates)+len(updates)+len(finishes) == 0 {
+		return nil, nil
+	}
+	mode := engine.Relaxed
+	if len(creates) > 0 || len(finishes) > 0 {
+		mode = engine.Durable
+	}
+	created := make([]model.CreatedRun, 0, len(creates))
+	err := s.db.Write(ctx, mode, func(ctx context.Context, tx *sql.Tx) error {
+		created = created[:0]
+		for _, q := range creates {
+			run, ok, err := createRun(ctx, tx, s.scope, q)
+			if err != nil {
+				return err
+			}
+			created = append(created, model.CreatedRun{Run: run, Created: ok})
+		}
+		if len(updates) > 0 {
+			if err := updateRunStatuses(ctx, tx, s.scope, updates); err != nil {
+				return err
+			}
+		}
+		for _, finish := range finishes {
+			if _, err := finishRun(ctx, tx, s.scope, finish); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(creates) == 0 {
+		return nil, nil
+	}
+	return created, nil
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (model.Run, error) {

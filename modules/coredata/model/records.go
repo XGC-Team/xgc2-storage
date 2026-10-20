@@ -102,6 +102,12 @@ type RunFinish struct {
 	At            time.Time
 }
 
+// CreatedRun is the per-item result of creating a Run in ApplyRunOps.
+type CreatedRun struct {
+	Run     Run
+	Created bool
+}
+
 // RunFilter selects Runs newest first. Zero fields do not filter.
 type RunFilter struct {
 	TargetID           string

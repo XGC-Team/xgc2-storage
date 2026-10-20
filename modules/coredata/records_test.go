@@ -155,9 +155,12 @@ func TestRunStatusUpdatesAreRelaxedBatchableAndForwardOnly(t *testing.T) {
 	if got := must(f.core.GetRun(f.ctx, "b")); got.Status != model.RunRunning {
 		t.Fatalf("partial batch applied: %s", got.Status)
 	}
-	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "b", Status: model.RunFailed}))
-	if err := f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "b", Status: model.RunStopping}); errCode(err) != "failed_precondition" {
-		t.Fatalf("a finished run moved: %v", err)
+	finished := must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "b", Status: model.RunFailed}))
+	if err := f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "b", Status: model.RunStopping}); err != nil {
+		t.Fatalf("a late stopping update of a terminal run: %v", err)
+	}
+	if got := must(f.core.GetRun(f.ctx, "b")); got.Status != model.RunFailed || got.Revision != finished.Revision {
+		t.Fatalf("terminal run moved: %+v", got)
 	}
 }
 
@@ -178,8 +181,49 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 	if rowsAfter != rowsBefore || bytesAfter <= bytesBefore {
 		t.Fatalf("the outcome must grow the row's bytes only: rows %d->%d bytes %d->%d", rowsBefore, rowsAfter, bytesBefore, bytesAfter)
 	}
-	if _, err = f.core.FinishRun(f.ctx, finish); errCode(err) != "failed_precondition" {
-		t.Fatalf("a run finished twice: %v", err)
+	// The replay enters the durable write transaction and commits it. The row,
+	// revision and quota stay put; there is no read outside that transaction.
+	replayAt := stats(t, f)
+	again, err := f.core.FinishRun(f.ctx, finish)
+	if err != nil || !reflect.DeepEqual(again, run) {
+		t.Fatalf("same outcome replay: %+v %v", again, err)
+	}
+	if rows, bytes := usageRows(t, f); rows != rowsAfter || bytes != bytesAfter {
+		t.Fatalf("replay changed quota: rows %d->%d bytes %d->%d", rowsAfter, rows, bytesAfter, bytes)
+	}
+	replayed := stats(t, f)
+	if d, r := replayed.CommitsDurable-replayAt.CommitsDurable, replayed.CommitsRelaxed-replayAt.CommitsRelaxed; d != 1 || r != 0 {
+		t.Fatalf("same-outcome finish transaction: durable=%d relaxed=%d", d, r)
+	}
+	if replayed.Fsyncs < replayAt.Fsyncs+1 {
+		t.Fatalf("durable replay asked for no fsync barrier: %d -> %d", replayAt.Fsyncs, replayed.Fsyncs)
+	}
+	t.Logf("same-outcome finish: commits durable +%d, engine fsyncs +%d, wal %d -> %d", replayed.CommitsDurable-replayAt.CommitsDurable, replayed.Fsyncs-replayAt.Fsyncs, replayAt.WALBytes, replayed.WALBytes)
+	for _, mismatch := range []model.RunFinish{
+		{ID: finish.ID, Status: model.RunFailed, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: "other", Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: []byte(`{"ok":false}`), Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Error: []byte(`{"code":"x"}`), Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: finish.Result, Nodes: []byte(`[]`), CleanupErrors: finish.CleanupErrors, At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: []byte(`[{"id":"x"}]`), At: finish.At},
+		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At.Add(time.Second)},
+	} {
+		if _, err = f.core.FinishRun(f.ctx, mismatch); errCode(err) != "failed_precondition" {
+			t.Fatalf("different outcome accepted: %+v %v", mismatch, err)
+		}
+	}
+	if got := must(f.core.GetRun(f.ctx, "run")); got.Revision != run.Revision || string(got.Result) != string(run.Result) {
+		t.Fatalf("rejected replay changed the row: %+v", got)
+	}
+	zeroAt := newRun("zero-at")
+	must3(f.core.CreateRun(f.ctx, zeroAt))
+	firstZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"})
+	if err != nil || firstZero.FinishedAt.IsZero() {
+		t.Fatalf("zero At finish: %+v %v", firstZero, err)
+	}
+	secondZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"})
+	if err != nil || !reflect.DeepEqual(secondZero, firstZero) {
+		t.Fatalf("zero At replay: %+v %v", secondZero, err)
 	}
 	for name, bad := range map[string]model.RunFinish{
 		"open status":  {ID: "run", Status: model.RunRunning},
@@ -843,5 +887,101 @@ func TestNewScopeRequiresTheModule(t *testing.T) {
 	}
 	if _, err := coredata.New(nil, f.scope); err == nil {
 		t.Fatal("nil owner accepted")
+	}
+}
+
+func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
+	f := openStore(t)
+	before := stats(t, f)
+	if got, err := f.core.ApplyRunOps(f.ctx, nil, nil, nil); err != nil || got != nil {
+		t.Fatalf("empty batch: %+v %v", got, err)
+	}
+	if d, r := commits(t, f, before); d != 0 || r != 0 {
+		t.Fatalf("empty batch wrote: durable=%d relaxed=%d", d, r)
+	}
+	tooMany := make([]model.RunStatusUpdate, model.MaxPageSize+1)
+	if _, err := f.core.ApplyRunOps(f.ctx, nil, tooMany, nil); errCode(err) != "invalid_argument" {
+		t.Fatalf("oversized batch: %v", err)
+	}
+	if d, r := commits(t, f, before); d != 0 || r != 0 {
+		t.Fatalf("rejected batch wrote: durable=%d relaxed=%d", d, r)
+	}
+
+	rows, quota := usageRows(t, f)
+	bad := newRun("bad")
+	bad.Inputs = []byte(`{`)
+	if _, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{newRun("kept"), bad}, nil, nil); errCode(err) != "invalid_argument" {
+		t.Fatalf("partial batch: %v", err)
+	}
+	if f.count(t, "runs") != 0 {
+		t.Fatal("failed batch left a row")
+	}
+	if rowsAfter, bytesAfter := usageRows(t, f); rowsAfter != rows || bytesAfter != quota {
+		t.Fatalf("failed batch leaked quota: %d/%d -> %d/%d", rows, quota, rowsAfter, bytesAfter)
+	}
+
+	start := stats(t, f)
+	q := newRun("life")
+	runningAt := epoch.Add(time.Minute)
+	finishedAt := epoch.Add(time.Hour)
+	created, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{q},
+		[]model.RunStatusUpdate{{ID: "life", Status: model.RunRunning, At: runningAt}},
+		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}})
+	if err != nil || len(created) != 1 || !created[0].Created || created[0].Run.ID != "life" {
+		t.Fatalf("created: %+v %v", created, err)
+	}
+	if d, r := commits(t, f, start); d != 1 || r != 0 {
+		t.Fatalf("mixed batch commits: durable=%d relaxed=%d", d, r)
+	}
+	life := must(f.core.GetRun(f.ctx, "life"))
+	if life.Status != model.RunSucceeded || life.Revision != 3 || !life.StartedAt.Equal(runningAt) || !life.FinishedAt.Equal(finishedAt) {
+		t.Fatalf("ordered lifecycle: %+v", life)
+	}
+
+	statusAt := stats(t, f)
+	if got, err := f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping, At: finishedAt}}, nil); err != nil || got != nil {
+		t.Fatalf("terminal update batch: %+v %v", got, err)
+	}
+	if d, r := commits(t, f, statusAt); d != 0 || r != 1 {
+		t.Fatalf("updates-only commits: durable=%d relaxed=%d", d, r)
+	}
+	if got := must(f.core.GetRun(f.ctx, "life")); got.Status != model.RunSucceeded || got.Revision != 3 {
+		t.Fatalf("terminal update changed the row: %+v", got)
+	}
+
+	replayAt := stats(t, f)
+	rows, quota = usageRows(t, f)
+	replayed, err := f.core.ApplyRunOps(f.ctx, nil,
+		[]model.RunStatusUpdate{{ID: "life", Status: model.RunRunning}},
+		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}})
+	if err != nil || replayed != nil {
+		t.Fatalf("idempotent batch: %+v %v", replayed, err)
+	}
+	if d, r := commits(t, f, replayAt); d != 1 || r != 0 {
+		t.Fatalf("idempotent batch transaction: durable=%d relaxed=%d", d, r)
+	}
+	after := stats(t, f)
+	t.Logf("idempotent batch: commits durable +%d, engine fsyncs +%d, wal %d -> %d", after.CommitsDurable-replayAt.CommitsDurable, after.Fsyncs-replayAt.Fsyncs, replayAt.WALBytes, after.WALBytes)
+	if rowsAfter, bytesAfter := usageRows(t, f); rowsAfter != rows || bytesAfter != quota {
+		t.Fatalf("idempotent batch changed quota: %d/%d -> %d/%d", rows, quota, rowsAfter, bytesAfter)
+	}
+	if got := must(f.core.GetRun(f.ctx, "life")); !reflect.DeepEqual(got, life) {
+		t.Fatalf("idempotent batch changed the row: %+v", got)
+	}
+	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping}}, []model.RunFinish{{ID: "life", Status: model.RunFailed, At: finishedAt}}); errCode(err) != "failed_precondition" {
+		t.Fatalf("different finish in a retry batch: %v", err)
+	}
+	if got := must(f.core.GetRun(f.ctx, "life")); got.Revision != life.Revision {
+		t.Fatalf("rejected retry changed revision: %+v", got)
+	}
+
+	open := newRun("open")
+	must3(f.core.CreateRun(f.ctx, open))
+	check(f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "open", Status: model.RunStopping}))
+	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "open", Status: model.RunRunning}}, nil); errCode(err) != "failed_precondition" {
+		t.Fatalf("open reverse accepted: %v", err)
+	}
+	if got := must(f.core.GetRun(f.ctx, "open")); got.Status != model.RunStopping {
+		t.Fatalf("reverse applied: %s", got.Status)
 	}
 }
