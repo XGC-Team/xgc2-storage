@@ -216,7 +216,16 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 	if e != nil {
 		return out, e
 	}
-	if q.Archived && r.System {
+	if q.RetirementKey != "" {
+		domain, err := configurationDomain(ctx, tx, q.Domain)
+		if err != nil {
+			return out, err
+		}
+		if !q.Archived || !r.System || r.SystemKey != q.RetirementKey || !domain.AllowSystemProvisioning {
+			return out, failure("failed_precondition", "system retirement requires its exact system key and provisioning owner")
+		}
+	}
+	if q.Archived && r.System && q.RetirementKey == "" {
 		return out, failure("failed_precondition", "system resource is protected")
 	}
 	changed := q.Archived != (r.ArchivedAt != "")

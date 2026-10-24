@@ -28,6 +28,8 @@ type ConfigurationBranchArchive struct {
 }
 
 type ConfigurationResourceState struct {
+	// RetirementKey is for the trusted system content owner; ordinary archive leaves it empty.
+	RetirementKey    string                   `json:"retirement_key,omitempty"`
 	Domain           ConfigurationDomainGuard `json:"domain"`
 	Mutation         ConfigurationMutation    `json:"mutation"`
 	ResourceID       string                   `json:"resource_id"`
