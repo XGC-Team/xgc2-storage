@@ -146,8 +146,8 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 		return out, failure("failed_precondition", "system provisioning is not declared or has invalid identity")
 	}
 	if q.SystemKey != "" {
-		if _, _, e := model.NormalizeConfigurationName(model.ConfigurationResourceName, q.SystemKey); e != nil || strings.TrimSpace(q.SystemKey) != q.SystemKey || q.Namespace.ID != "" {
-			return out, failure("invalid_argument", "system key requires a bounded name and structural root")
+		if _, _, e := model.NormalizeConfigurationName(model.ConfigurationResourceName, q.SystemKey); e != nil || strings.TrimSpace(q.SystemKey) != q.SystemKey {
+			return out, failure("invalid_argument", "system key requires a bounded name")
 		}
 		var id string
 		e := tx.QueryRowContext(ctx, "SELECT id FROM core_resources WHERE scope=? AND domain=? AND json_extract(CAST(body AS TEXT),'$.system')=1 AND json_extract(CAST(body AS TEXT),'$.system_key')<>'' AND json_extract(CAST(body AS TEXT),'$.system_key')=?", scope, q.Domain.Key, q.SystemKey).Scan(&id)
@@ -286,7 +286,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 		ns = q.MoveTo.ID
 	}
 	identity := ns != r.NamespaceID || q.NameKey != r.NameKey
-	if r.System && identity && !(q.AllowSystemRename && d.AllowSystemProvisioning && ns == r.NamespaceID) {
+	if r.System && identity && !(d.AllowSystemProvisioning && (ns == r.NamespaceID || q.AllowSystemMove) && (q.NameKey == r.NameKey || q.AllowSystemRename)) {
 		return out, failure("failed_precondition", "protected resource identity cannot change")
 	}
 	if b.NameKey != "main" && identity {

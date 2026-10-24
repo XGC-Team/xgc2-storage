@@ -497,6 +497,27 @@ func TestConfigurationSystemProvisioningIdentityAndCatalogPolicy(t *testing.T) {
 	if renamed.Result.Head.Resource.ID != q.ResourceID || renamed.Result.Head.Resource.SystemKey != q.SystemKey {
 		t.Fatal("authorized rename changed stable protected identity")
 	}
+	execSQL(t, db, ctx, "INSERT INTO core_namespaces VALUES(?,?,?,NULL,?,?,1,0,?)", testScope, g.Key, "templates-core", "Core", "core", []byte(`{}`))
+	move := configurationCommitForTest(t, g, renamed, "protected-move", "c", true, nil, rename.Snapshot.Manifest)
+	move.Name, move.NameKey = "renamed", "renamed"
+	move.ExpectedResourceRevision = renamed.Result.Head.Resource.Revision
+	move.MoveTo = &model.ConfigurationNamespaceGuard{ID: "templates-core", ExpectedRevision: "1"}
+	move.AllowSystemRename = true
+	_, e = run(t, db, ctx, model.ResourceCommitOperation, move)
+	configurationCode(t, e, "failed_precondition")
+	move.AllowSystemMove = true
+	moved := configurationWrite(t, db, ctx, model.ResourceCommitOperation, move)
+	if moved.Result.Head.Resource.ID != q.ResourceID || moved.Result.Head.Resource.SystemKey != q.SystemKey || moved.Result.Head.Resource.NamespaceID != "templates-core" {
+		t.Fatal("authorized namespace move changed stable system identity")
+	}
+	provisioned := configurationCreateForTest(t, g, "system-in-namespace", nil)
+	provisioned.System = true
+	provisioned.SystemKey = "namespaced-system"
+	provisioned.Namespace = *move.MoveTo
+	created := configurationWrite(t, db, ctx, model.ResourceCreateOperation, provisioned)
+	if created.Result.Head.Resource.NamespaceID != "templates-core" {
+		t.Fatal("system resource lost its namespace")
+	}
 	tx, e = db.BeginTx(ctx, nil)
 	if e != nil {
 		t.Fatal(e)

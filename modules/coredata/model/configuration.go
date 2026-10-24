@@ -133,6 +133,7 @@ type ConfigurationResourceCommit struct {
 	// Optional for an ordinary content write, required on global identity change.
 	ExpectedResourceRevision string                        `json:"expected_resource_revision,omitempty"`
 	AppendUnchangedSnapshot  bool                          `json:"append_unchanged_snapshot"`
+	AllowSystemMove          bool                          `json:"allow_system_move"`
 	AllowSystemRename        bool                          `json:"allow_system_rename"`
 	Snapshot                 PreparedConfigurationSnapshot `json:"snapshot"`
 }
