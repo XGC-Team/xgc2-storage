@@ -49,7 +49,9 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 
 	q, a := runs(model.RunFilter{})
 	add("runs, newest first", q, a, "runs_created", true)
-	q, a = runs(model.RunFilter{OmitPayloads: true, Cursor: cursor})
+	q, a = runs(model.RunFilter{ID: "exact", Projection: model.RunObservation, Limit: 1})
+	add("exact Run observation", q, a, "sqlite_autoindex_runs_1", true)
+	q, a = runs(model.RunFilter{Projection: model.RunIdentity, Cursor: cursor})
 	add("runs, next page", q, a, "runs_created", true)
 	q, a = runs(model.RunFilter{Since: time.Unix(1, 0), Until: time.Unix(9, 0)})
 	add("runs in a time range", q, a, "runs_created", true)
@@ -71,6 +73,7 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 	add("failed runs", q, a, "runs_created", true)
 	add("run by idempotency key", "SELECT "+runColumns+" FROM runs WHERE scope=? AND "+byKey, []any{"s", "k"}, "runs_idempotency", false)
 	add("open runs at boot", interruptOpen, []any{1, 1, "s"}, "runs_open", false)
+	add("next eligible expiry", pruneOldest, []any{"s"}, "runs_finished", true)
 	add("prune by age", pruneByAge, []any{"s", 5, 10}, "runs_finished", true)
 	add("prune by count", pruneByCount, []any{"s", 10, 5}, "runs_finished", true)
 

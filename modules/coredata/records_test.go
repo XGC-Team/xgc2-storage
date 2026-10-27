@@ -289,6 +289,13 @@ func TestListRunsFiltersAndPagesNewestFirst(t *testing.T) {
 	if n := count(model.RunFilter{TargetID: "agent-1"}); n != 6 {
 		t.Errorf("target filter: %d", n)
 	}
+	exact := must(f.core.ListRuns(f.ctx, model.RunFilter{ID: "run-03", Projection: model.RunObservation, Limit: 1}))
+	if len(exact.Runs) != 1 || exact.Runs[0].ID != "run-03" || exact.Next != "" || exact.Runs[0].Inputs != nil {
+		t.Fatalf("exact observation: %+v", exact)
+	}
+	if n := count(model.RunFilter{ID: "missing"}); n != 0 {
+		t.Fatalf("missing exact Run returned %d unrelated rows", n)
+	}
 	if n := count(model.RunFilter{WorkflowResourceID: "wf-b"}); n != 4 {
 		t.Errorf("workflow filter: %d", n)
 	}
@@ -304,7 +311,7 @@ func TestListRunsFiltersAndPagesNewestFirst(t *testing.T) {
 	if n := count(model.RunFilter{RootRunID: "run-03"}); n != 1 {
 		t.Errorf("root filter: %d", n)
 	}
-	light := must(f.core.ListRuns(f.ctx, model.RunFilter{Limit: 3, OmitPayloads: true}))
+	light := must(f.core.ListRuns(f.ctx, model.RunFilter{Limit: 3, Projection: model.RunIdentity}))
 	if len(light.Runs) != 3 || light.Runs[0].Inputs != nil || light.Runs[0].Trigger != nil || light.Runs[0].ID != "run-11" {
 		t.Fatalf("summary list: %+v", light.Runs)
 	}
@@ -368,8 +375,8 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 		t.Fatalf("prune without a rule: %v", err)
 	}
 	n, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(4*time.Minute + 30*time.Second)})
-	if err != nil || n != 5 {
-		t.Fatalf("age prune deleted %d: %v", n, err)
+	if err != nil || n.Deleted != 5 || !n.OldestEligibleFinishedAt.Equal(epoch.Add(5*time.Minute+time.Second)) {
+		t.Fatalf("age prune deleted %+v: %v", n, err)
 	}
 	if d, r := commits(t, f, before); d != 0 || r != 1 {
 		t.Fatalf("housekeeping must be relaxed: durable=%d relaxed=%d", d, r)
@@ -378,8 +385,8 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 		t.Fatalf("a child of a live root was pruned: %v", err)
 	}
 	n, err = f.core.PruneRuns(f.ctx, model.RunRetention{KeepNewest: 2})
-	if err != nil || n != 3 {
-		t.Fatalf("count prune deleted %d: %v", n, err)
+	if err != nil || n.Deleted != 3 || !n.OldestEligibleFinishedAt.Equal(epoch.Add(8*time.Minute+time.Second)) {
+		t.Fatalf("count prune deleted %+v: %v", n, err)
 	}
 	page := must(f.core.ListRuns(f.ctx, model.RunFilter{Limit: 100}))
 	var left []string
@@ -396,8 +403,8 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 	// Deleting everything finished returns the counters to the live remainder.
 	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "live-root", Status: model.RunSucceeded}))
 	n, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(24 * 365 * time.Hour), Limit: 2})
-	if err != nil || n != 2 {
-		t.Fatalf("limit not honored: %d %v", n, err)
+	if err != nil || n.Deleted != 2 {
+		t.Fatalf("limit not honored: %+v %v", n, err)
 	}
 }
 
@@ -836,8 +843,8 @@ func TestLiveQuotaStopsNewRunsButNeverTheOutcomeOfAdmittedOnes(t *testing.T) {
 		t.Fatalf("the outcome of an admitted run must always be recorded: %v", err)
 	}
 	// Pruning gives the room back.
-	if n, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: time.Now().Add(time.Hour)}); err != nil || n != 1 {
-		t.Fatalf("prune: %d %v", n, err)
+	if n, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: time.Now().Add(time.Hour)}); err != nil || n.Deleted != 1 {
+		t.Fatalf("prune: %+v %v", n, err)
 	}
 	if _, _, err := f.core.OpenSession(f.ctx, model.NewSession{ID: "s", TargetID: "t", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}); err != nil {
 		t.Fatalf("freed room not reusable: %v", err)

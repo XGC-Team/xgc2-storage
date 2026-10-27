@@ -53,6 +53,7 @@ type Run struct {
 	Termination        string          `json:"termination,omitempty"`
 	Error              json.RawMessage `json:"error,omitempty"`
 	Result             json.RawMessage `json:"result,omitempty"`
+	HasResult          bool            `json:"has_result,omitempty"`
 	Nodes              json.RawMessage `json:"nodes,omitempty"`
 	CleanupErrors      json.RawMessage `json:"cleanup_errors,omitempty"`
 	CreatedAt          time.Time       `json:"created_at"`
@@ -108,8 +109,17 @@ type CreatedRun struct {
 	Created bool
 }
 
+type RunProjection string
+
+const (
+	RunComplete    RunProjection = "complete"
+	RunIdentity    RunProjection = "identity"
+	RunObservation RunProjection = "observation"
+)
+
 // RunFilter selects Runs newest first. Zero fields do not filter.
 type RunFilter struct {
+	ID                 string
 	TargetID           string
 	RootRunID          string
 	SessionID          string
@@ -121,9 +131,11 @@ type RunFilter struct {
 	Limit int
 	// Cursor is the Next value of the previous page.
 	Cursor string
-	// OmitPayloads leaves out inputs, trigger, error, result, nodes and cleanup
-	// errors, which dominate the size of a Run; GetRun returns them.
-	OmitPayloads bool
+	// Projection controls the fixed SQL selection. Identity omits all JSON;
+	// Observation retains trigger, failure and cleanup metadata without reading
+	// or decompressing inputs, node records or results. HasResult remains exact.
+	// Complete (the default) and GetRun return all payloads.
+	Projection RunProjection
 }
 
 type RunPage struct {
@@ -264,3 +276,10 @@ const (
 	MaxRunDepth              = 1024
 	MaxPageSize              = 1000
 )
+
+// RunPruneResult carries the next age boundary from the same indexed eligible
+// set after deletion. A zero timestamp means no eligible terminal row remains.
+type RunPruneResult struct {
+	Deleted                  int
+	OldestEligibleFinishedAt time.Time
+}

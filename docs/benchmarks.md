@@ -142,7 +142,7 @@ second if it did nothing else. Status transitions are Relaxed and cost a small p
 8,300 per second alone, 10,300 per second when 50 share a transaction.
 
 **Reads of Runs.** `GetRun` takes 40 us. A page of 50 Runs (each with about 2.3 KB of frozen
-inputs) takes 0.35 ms without payloads and 0.45 ms with them, which is what `OmitPayloads`
+inputs) takes 0.35 ms without payloads and 0.45 ms with them, which is what the identity projection
 saves. A listing by target, root, session, workflow, creation time or open status is answered from
 an index in page order, so these figures do not grow with the length of the history
 (`TestRecordQueriesUseTheirIndexes`); the benchmark itself uses 5,000 Runs.

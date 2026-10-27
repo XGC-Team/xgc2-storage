@@ -112,17 +112,19 @@ func pageLimit(limit int) (int, error) {
 
 type scanner interface{ Scan(dest ...any) error }
 
-const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision"
+const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0"
 
 // runSummaryColumns replaces the large JSON columns by empty values.
-const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision"
+const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0"
+
+const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',trigger_json,status,termination,error_json,x'',x'',cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0"
 
 func scanRun(row scanner) (model.Run, error) {
 	var r model.Run
 	var status string
 	var inputs, trigger, errored, result, nodes, cleanup []byte
 	var created, started, finished int64
-	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision); err != nil {
+	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult); err != nil {
 		return r, err
 	}
 	r.Status = model.RunStatus(status)
@@ -382,7 +384,7 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
-	for column, value := range map[string]string{"target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID} {
+	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID} {
 		if value == "" {
 			continue
 		}
@@ -425,8 +427,14 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		where, args = append(where, "(created_at,id)<(?,?)"), append(args, at, id)
 	}
 	columns := runColumns
-	if f.OmitPayloads {
+	switch f.Projection {
+	case "", model.RunComplete:
+	case model.RunIdentity:
 		columns = runSummaryColumns
+	case model.RunObservation:
+		columns = runObservationColumns
+	default:
+		return "", nil, 0, failure("invalid_argument", "unknown Run projection")
 	}
 	return "SELECT " + columns + " FROM runs WHERE " + strings.Join(where, " AND ") + " ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1), limit, nil
 }
@@ -464,6 +472,7 @@ const (
 	// A finished Run is only eligible for pruning when its root is finished too.
 	eligibleRuns = "scope=? AND finished_at>0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0)"
 	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
+	pruneOldest  = "SELECT finished_at FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at,id LIMIT 1"
 	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"
 )
 
@@ -479,13 +488,13 @@ func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Ti
 	return int(n), charge(ctx, tx, scope, 0, n*int64(len("interrupted")))
 }
 
-func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetention) (int, error) {
+func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetention) (model.RunPruneResult, error) {
 	limit := r.Limit
 	if limit == 0 {
 		limit = 1000
 	}
 	if limit < 0 || limit > 10000 || r.KeepNewest < 0 || (r.OlderThan.IsZero() && r.KeepNewest == 0) {
-		return 0, failure("invalid_argument", "an age or count limit and a limit within 1..10000 are required")
+		return model.RunPruneResult{}, failure("invalid_argument", "an age or count limit and a limit within 1..10000 are required")
 	}
 	type victim struct {
 		id    string
@@ -513,27 +522,33 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 	}
 	if !r.OlderThan.IsZero() {
 		if err := collect(pruneByAge, scope, nanos(r.OlderThan), limit); err != nil {
-			return 0, err
+			return model.RunPruneResult{}, err
 		}
 	}
-	if r.KeepNewest > 0 {
+	if r.KeepNewest > 0 && len(victims) < limit {
 		if err := collect(pruneByCount, scope, limit, r.KeepNewest); err != nil {
-			return 0, err
+			return model.RunPruneResult{}, err
 		}
 	}
 	var freed int64
 	for _, v := range victims {
 		if _, err := tx.ExecContext(ctx, "DELETE FROM runs WHERE scope=? AND id=?", scope, v.id); err != nil {
-			return 0, err
+			return model.RunPruneResult{}, err
 		}
 		freed += v.bytes
 	}
 	if len(victims) > 0 {
 		if err := release(ctx, tx, scope, int64(len(victims)), freed); err != nil {
-			return 0, err
+			return model.RunPruneResult{}, err
 		}
 	}
-	return len(victims), nil
+	result := model.RunPruneResult{Deleted: len(victims)}
+	var oldest int64
+	if err := tx.QueryRowContext(ctx, pruneOldest, scope).Scan(&oldest); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return model.RunPruneResult{}, err
+	}
+	result.OldestEligibleFinishedAt = instant(oldest)
+	return result, nil
 }
 
 // Runs
@@ -650,8 +665,8 @@ func (s *Store) InterruptOpenRuns(ctx context.Context, at time.Time) (int, error
 
 // PruneRuns deletes finished Runs by age and count and frees their quota. It
 // is relaxed housekeeping; call it again while it returns the limit.
-func (s *Store) PruneRuns(ctx context.Context, r model.RunRetention) (int, error) {
-	return write(ctx, s, engine.Relaxed, func(ctx context.Context, tx *sql.Tx, scope string) (int, error) {
+func (s *Store) PruneRuns(ctx context.Context, r model.RunRetention) (model.RunPruneResult, error) {
+	return write(ctx, s, engine.Relaxed, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunPruneResult, error) {
 		return pruneRuns(ctx, tx, scope, r)
 	})
 }

@@ -269,7 +269,7 @@ func TestFaultKilledProcessKeepsAcknowledgedRunFacts(t *testing.T) {
 			t.Fatalf("acknowledged outcome of %s was lost: %s", id, run.Status)
 		}
 	}
-	open, err := core.ListRuns(deadline(t), model.RunFilter{Statuses: []model.RunStatus{model.RunQueued, model.RunRunning}, Limit: 1000, OmitPayloads: true})
+	open, err := core.ListRuns(deadline(t), model.RunFilter{Statuses: []model.RunStatus{model.RunQueued, model.RunRunning}, Limit: 1000, Projection: model.RunIdentity})
 	if err != nil {
 		t.Fatal(err)
 	}

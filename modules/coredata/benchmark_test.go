@@ -175,7 +175,7 @@ func BenchmarkListRunsPage50WithoutPayloads(b *testing.B) {
 	core, _ := benchSeeded(b, 5000)
 	ctx := context.Background()
 	latencies(b, func(i int) error {
-		_, err := core.ListRuns(ctx, model.RunFilter{TargetID: "local", Limit: 50, OmitPayloads: true})
+		_, err := core.ListRuns(ctx, model.RunFilter{TargetID: "local", Limit: 50, Projection: model.RunIdentity})
 		return err
 	})
 }

@@ -33,6 +33,9 @@ func (s *Store) write(ctx context.Context, d Durability, checked bool, fn func(c
 
 // transact must run under writer admission.
 func (s *Store) transact(ctx context.Context, d Durability, fn func(context.Context, *sql.Tx) error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if d != s.synchronous {
 		level := "FULL"
 		if d == Relaxed {
@@ -44,7 +47,12 @@ func (s *Store) transact(ctx context.Context, d Durability, fn func(context.Cont
 		}
 		s.synchronous = d
 	}
-	tx, err := s.writer.BeginTx(ctx, nil)
+	// This owner, rather than database/sql.awaitDone, must finish rollback
+	// before releasing writer admission. SQL operations still receive ctx and
+	// remain cancellable; only the transaction lifetime is detached. BEGIN is
+	// IMMEDIATE with busy_timeout=0 on this dedicated connection, so it never
+	// waits for another SQLite writer lock after detaching caller cancellation.
+	tx, err := s.writer.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
@@ -57,7 +65,13 @@ func (s *Store) transact(ctx context.Context, d Durability, fn func(context.Cont
 			tx.Rollback()
 		}
 	}()
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	if err = fn(ctx, tx); err != nil {
+		return err
+	}
+	if err = ctx.Err(); err != nil {
 		return err
 	}
 	finished = true
