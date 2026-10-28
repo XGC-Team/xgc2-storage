@@ -160,15 +160,18 @@ type ConfigurationResourceCommit struct {
 // All revisions, NextVersion and Version are positive canonical decimal strings.
 // Timestamps are storage-owned UTC RFC3339Nano strings; empty ArchivedAt is live.
 type ConfigurationResource struct {
-	ID               string `json:"id"`
-	NamespaceID      string `json:"namespace_id"`
-	Name             string `json:"name"`
-	NameKey          string `json:"name_key"`
-	Revision         string `json:"revision"`
-	MainCommitID     string `json:"main_commit_id"`
-	NextVersion      string `json:"next_version"`
-	System           bool   `json:"system"`
-	SystemKey        string `json:"system_key"`
+	ID           string `json:"id"`
+	NamespaceID  string `json:"namespace_id"`
+	Name         string `json:"name"`
+	NameKey      string `json:"name_key"`
+	Revision     string `json:"revision"`
+	MainCommitID string `json:"main_commit_id"`
+	NextVersion  string `json:"next_version"`
+	System       bool   `json:"system"`
+	SystemKey    string `json:"system_key"`
+	// CatalogSelector is a bounded secondary lookup key derived from the
+	// immutable current-main summary. It is not authoring authority.
+	CatalogSelector  string `json:"catalog_selector,omitempty"`
 	OriginResourceID string `json:"origin_resource_id"`
 	OriginCommitID   string `json:"origin_commit_id"`
 	CreatedAt        string `json:"created_at"`

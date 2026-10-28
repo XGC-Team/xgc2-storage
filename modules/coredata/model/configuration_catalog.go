@@ -20,6 +20,14 @@ type ConfigurationCatalogRead struct {
 	Offset          int     `json:"offset"`
 }
 
+// ConfigurationSelectedCatalogRead selects one exact owner-derived current
+// summary key, with the same scope, namespace and page rules as catalog reads.
+type ConfigurationSelectedCatalogRead struct {
+	Catalog      ConfigurationCatalogRead `json:"catalog"`
+	Selector     string                   `json:"selector"`
+	OrdinaryOnly bool                     `json:"ordinary_only"`
+}
+
 // Body retains namespace metadata written by its owner; identity, location,
 // name and revision have their own relational columns.
 type ConfigurationNamespace struct {

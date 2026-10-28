@@ -23,7 +23,7 @@ func (s *Store) ReadResourceCatalog(ctx context.Context, q model.ConfigurationCa
 }
 
 func configurationDecodeResourceRow(row model.ConfigurationResource, archived bool, body []byte) (out model.ConfigurationResource, err error) {
-	if json.Unmarshal(body, &out) != nil || out.ID != row.ID || out.NamespaceID != row.NamespaceID || out.Name != row.Name || out.NameKey != row.NameKey || out.Revision != row.Revision || out.MainCommitID != row.MainCommitID || out.OriginResourceID != row.OriginResourceID || out.OriginCommitID != row.OriginCommitID || !positiveRevision(out.NextVersion) || archived != (out.ArchivedAt != "") {
+	if json.Unmarshal(body, &out) != nil || out.ID != row.ID || out.NamespaceID != row.NamespaceID || out.Name != row.Name || out.NameKey != row.NameKey || out.Revision != row.Revision || out.MainCommitID != row.MainCommitID || out.OriginResourceID != row.OriginResourceID || out.OriginCommitID != row.OriginCommitID || !positiveRevision(out.NextVersion) || out.CatalogSelector != "" && !textKey(out.CatalogSelector) || archived != (out.ArchivedAt != "") {
 		return out, failure("data_loss", "resource metadata disagrees with relational identity")
 	}
 	return out, nil

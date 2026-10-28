@@ -200,3 +200,112 @@ func TestAFailedReceiptExpiryIsRetried(t *testing.T) {
 		t.Fatal("receipt counter not released")
 	}
 }
+
+func TestCheckpointGaugeCoversArmedQueuedAndRunningWork(t *testing.T) {
+	s, _ := maintained(t, func(c *Config) {
+		c.CheckpointDelay = 150 * time.Millisecond
+		c.CallBudget = 3 * time.Second
+	})
+	before, err := s.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitOne(t, s, "gauge", true)
+	armed, err := s.Stats()
+	if err != nil || !armed.CheckpointPending || armed.CheckpointRunning {
+		t.Fatalf("armed=%+v err=%v", armed, err)
+	}
+	// The timer can fire, but the real checkpoint cannot complete until the
+	// single writer gate is released.
+	s.gate <- struct{}{}
+	waitFor(t, "the running checkpoint", 2*time.Second, func() bool {
+		stats, _ := s.Stats()
+		return stats.CheckpointRunning
+	})
+	running, _ := s.Stats()
+	if running.CheckpointPending || !running.CheckpointRunning {
+		t.Fatalf("running=%+v", running)
+	}
+	// A second request while the first is running must remain pending; neither
+	// the first completion nor the queued-to-running handoff can appear idle.
+	s.maintenance.request(workCheckpoint)
+	queued, _ := s.Stats()
+	if !queued.CheckpointPending || !queued.CheckpointRunning {
+		t.Fatalf("queued=%+v", queued)
+	}
+	stop := make(chan struct{})
+	violation := make(chan Stats, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			stats, err := s.Stats()
+			if err == nil && !stats.CheckpointPending && !stats.CheckpointRunning && stats.Checkpoints < before.Checkpoints+2 {
+				select {
+				case violation <- stats:
+				default:
+				}
+			}
+			select {
+			case <-stop:
+				return
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	<-s.gate
+	waitFor(t, "both requested checkpoints", 3*time.Second, func() bool {
+		stats, _ := s.Stats()
+		return stats.Checkpoints >= before.Checkpoints+2 && !stats.CheckpointPending && !stats.CheckpointRunning
+	})
+	close(stop)
+	<-done
+	select {
+	case bad := <-violation:
+		t.Fatalf("false quiet gap: %+v", bad)
+	default:
+	}
+	quiet, _ := s.Stats()
+	for i := 0; i < 20; i++ {
+		observed, err := s.Stats()
+		if err != nil || observed.CheckpointPending || observed.CheckpointRunning || observed.Calls != quiet.Calls {
+			t.Fatalf("passive settled observation=%+v err=%v", observed, err)
+		}
+	}
+}
+
+func TestCheckpointGaugeCoversFailureAndScheduledRetry(t *testing.T) {
+	retryAfter(t, 250*time.Millisecond)
+	failed := make(chan struct{})
+	unblockReport := make(chan struct{})
+	s, _ := maintained(t, func(c *Config) {
+		c.CheckpointDelay = 80 * time.Millisecond
+		c.CallBudget = 80 * time.Millisecond
+		c.OnMaintenanceError = func(error) { close(failed); <-unblockReport }
+	})
+	commitOne(t, s, "retry-gauge", true)
+	before, _ := s.Stats()
+	s.gate <- struct{}{}
+	select {
+	case <-failed:
+	case <-time.After(3 * time.Second):
+		<-s.gate
+		close(unblockReport)
+		t.Fatal("checkpoint did not fail")
+	}
+	reporting, _ := s.Stats()
+	if !reporting.CheckpointRunning {
+		t.Fatalf("failure report appeared quiet: %+v", reporting)
+	}
+	<-s.gate
+	close(unblockReport)
+	waitFor(t, "the armed retry", time.Second, func() bool {
+		stats, _ := s.Stats()
+		return stats.CheckpointPending && !stats.CheckpointRunning
+	})
+	waitFor(t, "the completed retry", 3*time.Second, func() bool {
+		stats, _ := s.Stats()
+		return stats.Checkpoints > before.Checkpoints && !stats.CheckpointPending && !stats.CheckpointRunning
+	})
+}

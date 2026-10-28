@@ -29,10 +29,12 @@ type maintenance struct {
 	done  chan struct{}
 	once  sync.Once
 
-	mu              sync.Mutex
-	checkpointTimer *time.Timer
-	expiryTimer     *time.Timer
-	expiryAt        int64 // Unix second the expiry timer is armed for; 0 when none
+	mu                sync.Mutex
+	checkpointTimer   *time.Timer
+	checkpointRunning bool
+	stopping          bool
+	expiryTimer       *time.Timer
+	expiryAt          int64 // Unix second the expiry timer is armed for; 0 when none
 }
 
 func (s *Store) startMaintenance(ctx context.Context) {
@@ -53,11 +55,14 @@ func (s *Store) stopMaintenance() {
 	m.once.Do(func() {
 		m.stop()
 		m.mu.Lock()
+		m.stopping = true
 		for _, t := range []*time.Timer{m.checkpointTimer, m.expiryTimer} {
 			if t != nil {
 				t.Stop()
 			}
 		}
+		m.checkpointTimer = nil
+		m.work.Store(0)
 		m.mu.Unlock()
 		<-m.done
 	})
@@ -71,9 +76,20 @@ func (m *maintenance) run(ctx context.Context) {
 			return
 		case <-m.kick:
 		}
+		m.mu.Lock()
 		work := m.work.Swap(0)
-		if work&workCheckpoint != 0 && m.report(ctx, m.checkpoint(ctx)) {
-			m.scheduleCheckpoint(maintenanceRetry)
+		if work&workCheckpoint != 0 {
+			m.checkpointRunning = true
+		}
+		m.mu.Unlock()
+		if work&workCheckpoint != 0 {
+			retry := m.report(ctx, m.checkpoint(ctx))
+			m.mu.Lock()
+			if retry {
+				m.scheduleCheckpointLocked(maintenanceRetry)
+			}
+			m.checkpointRunning = false
+			m.mu.Unlock()
 		}
 		if work&workExpire != 0 && m.report(ctx, m.expire(ctx)) {
 			m.armExpiry(time.Now().Add(maintenanceRetry).Unix())
@@ -82,6 +98,15 @@ func (m *maintenance) run(ctx context.Context) {
 }
 
 func (m *maintenance) request(work uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.requestLocked(work)
+}
+
+func (m *maintenance) requestLocked(work uint32) {
+	if m.stopping {
+		return
+	}
 	m.work.Or(work)
 	select {
 	case m.kick <- struct{}{}:
@@ -105,24 +130,25 @@ func (m *maintenance) report(ctx context.Context, err error) bool {
 // afterCommit decides whether the WAL needs attention. A WAL over the
 // threshold is checkpointed at once; otherwise one checkpoint is scheduled a
 // fixed delay after the first commit that follows the previous one.
-func (m *maintenance) afterCommit() {
+func (m *maintenance) afterCommitLocked() {
 	if m.store.walSize() >= m.store.config.CheckpointBytes {
-		m.request(workCheckpoint)
+		m.requestLocked(workCheckpoint)
 		return
 	}
-	m.scheduleCheckpoint(m.store.config.CheckpointDelay)
+	m.scheduleCheckpointLocked(m.store.config.CheckpointDelay)
 }
 
 // scheduleCheckpoint arms the one checkpoint timer unless it is armed already.
-func (m *maintenance) scheduleCheckpoint(delay time.Duration) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *maintenance) scheduleCheckpointLocked(delay time.Duration) {
+	if m.stopping {
+		return
+	}
 	if m.checkpointTimer == nil {
 		m.checkpointTimer = time.AfterFunc(delay, func() {
 			m.mu.Lock()
 			m.checkpointTimer = nil
+			m.requestLocked(workCheckpoint)
 			m.mu.Unlock()
-			m.request(workCheckpoint)
 		})
 	}
 }

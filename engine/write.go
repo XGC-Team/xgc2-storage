@@ -75,12 +75,23 @@ func (s *Store) transact(ctx context.Context, d Durability, fn func(context.Cont
 		return err
 	}
 	finished = true
+	// Publish the successful commit and its scheduled maintenance together
+	// with respect to passive Stats; there is no settled gap between them.
+	if s.maintenance != nil {
+		s.maintenance.mu.Lock()
+	}
 	if err = tx.Commit(); err != nil {
+		if s.maintenance != nil {
+			s.maintenance.mu.Unlock()
+		}
 		// SQLite may keep the transaction open after a failed COMMIT.
 		s.writer.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		return err
 	}
 	s.committed(d)
+	if s.maintenance != nil {
+		s.maintenance.mu.Unlock()
+	}
 	return nil
 }
 

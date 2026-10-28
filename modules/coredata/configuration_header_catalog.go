@@ -28,6 +28,24 @@ func configurationResourceHeadersQuery(q model.ConfigurationCatalogRead, predica
 }
 
 func configurationResourceHeaders(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead) ([]model.ConfigurationResourceHeader, error) {
+	return configurationHeaderPage(ctx, tx, scope, q, "", false)
+}
+
+// ReadSelectedResourceHeaders starts at the exact selector index and reads
+// current-main headers only; it never scans unrelated headers or old commits.
+func (s *Store) ReadSelectedResourceHeaders(ctx context.Context, q model.ConfigurationSelectedCatalogRead) ([]model.ConfigurationResourceHeader, error) {
+	if !textKey(q.Selector) {
+		return nil, failure("invalid_argument", "exact selected catalog key required")
+	}
+	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) ([]model.ConfigurationResourceHeader, error) {
+		return configurationHeaderPage(ctx, tx, scope, q.Catalog, q.Selector, q.OrdinaryOnly)
+	})
+}
+
+func configurationHeaderPage(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead, selector string, ordinary bool) ([]model.ConfigurationResourceHeader, error) {
+	if ordinary && (selector == "" || q.IncludeArchived) || selector != "" && !textKey(selector) {
+		return nil, failure("invalid_argument", "exact selected catalog key and live ordinary scope required")
+	}
 	if _, err := configurationDomain(ctx, tx, q.Domain); err != nil {
 		return nil, err
 	}
@@ -35,7 +53,25 @@ func configurationResourceHeaders(ctx context.Context, tx *sql.Tx, scope string,
 	if err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, configurationResourceHeadersQuery(q, predicate), args...)
+	query := configurationResourceHeadersQuery(q, predicate)
+	if selector != "" {
+		index := "core_resources_catalog_selector"
+		if q.ParentID != nil {
+			index += "_namespace"
+		}
+		if ordinary {
+			index += "_ordinary"
+			predicate += " AND r.origin_resource_id='' AND json_extract(CAST(r.body AS TEXT),'$.system')=0"
+		} else if !q.IncludeArchived {
+			index += "_live"
+		}
+		predicate += " AND json_extract(CAST(r.body AS TEXT),'$.catalog_selector')=?"
+		tail := append([]any(nil), args[len(args)-2:]...)
+		args = append(args[:len(args)-2], selector)
+		args = append(args, tail...)
+		query = "SELECT " + configurationResourceHeaderColumns + " FROM core_resources r INDEXED BY " + index + configurationResourceCatalogJoin + predicate + " ORDER BY r.id LIMIT ? OFFSET ?"
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +111,12 @@ func configurationResourceHeaders(ctx context.Context, tx *sql.Tx, scope string,
 		}
 		if err = configurationProjection(header.Head.Commit, header.Identity, header.CatalogSummary); err != nil {
 			return nil, err
+		}
+		if selector != "" {
+			projected, e := configurationSummarySelector(header.CatalogSummary)
+			if e != nil || projected != selector || header.Head.Resource.CatalogSelector != selector {
+				return nil, failure("data_loss", "current catalog selector disagrees with immutable summary")
+			}
 		}
 		encoded, err := encode(header)
 		if err != nil {

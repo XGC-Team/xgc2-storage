@@ -64,6 +64,9 @@ func configurationPlanBound(s model.PreparedConfigurationSnapshot, control any, 
 	if !bytes.Equal(identity, s.Identity) || model.ValidateConfigurationCatalogProjection(s.Identity, s.CatalogSummary) != nil {
 		return failure("invalid_argument", "identity must match the frozen envelope and catalog summary must be an object")
 	}
+	if _, err := configurationSummarySelector(s.CatalogSummary); err != nil {
+		return failure("invalid_argument", "invalid catalog selector projection")
+	}
 	canonical, err := model.CanonicalConfigurationAssociations(s.Associations)
 	if s.Associations == nil || err != nil || !reflect.DeepEqual(canonical, s.Associations) {
 		return failure("invalid_argument", "explicit sorted unique agent association projection required")
@@ -192,7 +195,8 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 		return out, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	r := model.ConfigurationResource{ID: q.ResourceID, NamespaceID: q.Namespace.ID, Name: q.Name, NameKey: q.NameKey, Revision: "1", MainCommitID: q.CommitID, NextVersion: "2", System: q.System, SystemKey: q.SystemKey, CreatedAt: now, UpdatedAt: now}
+	selector, _ := configurationSummarySelector(q.Snapshot.CatalogSummary)
+	r := model.ConfigurationResource{ID: q.ResourceID, NamespaceID: q.Namespace.ID, Name: q.Name, NameKey: q.NameKey, Revision: "1", MainCommitID: q.CommitID, NextVersion: "2", System: q.System, SystemKey: q.SystemKey, CatalogSelector: selector, CreatedAt: now, UpdatedAt: now}
 	if q.Source != nil {
 		r.OriginResourceID = q.Source.ResourceID
 		r.OriginCommitID = q.Source.CommitID
@@ -446,6 +450,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	}
 	if b.NameKey == "main" {
 		r.MainCommitID = q.CommitID
+		r.CatalogSelector, _ = configurationSummarySelector(q.Snapshot.CatalogSummary)
 		r.Name = q.Name
 		r.NameKey = q.NameKey
 		r.NamespaceID = ns

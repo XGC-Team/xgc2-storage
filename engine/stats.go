@@ -41,10 +41,15 @@ type Stats struct {
 	// Commits by class. Fsyncs counts the durability barriers the owner asked
 	// for: one per durable commit and two per checkpoint that moved frames.
 	// SQLite may add an internal sync for the first frame after a WAL reset.
-	CommitsDurable    uint64 `json:"commits_durable"`
-	CommitsRelaxed    uint64 `json:"commits_relaxed"`
-	Fsyncs            uint64 `json:"fsyncs"`
-	Checkpoints       uint64 `json:"checkpoints"`
+	CommitsDurable uint64 `json:"commits_durable"`
+	CommitsRelaxed uint64 `json:"commits_relaxed"`
+	Fsyncs         uint64 `json:"fsyncs"`
+	Checkpoints    uint64 `json:"checkpoints"`
+	// CheckpointPending is true while a checkpoint timer or request is armed.
+	// CheckpointRunning remains true through admission, execution and retry
+	// scheduling. Reading these flags performs no maintenance or database read.
+	CheckpointPending bool   `json:"checkpoint_pending"`
+	CheckpointRunning bool   `json:"checkpoint_running"`
 	ReceiptsPruned    uint64 `json:"receipts_pruned"`
 	MaintenanceErrors uint64 `json:"maintenance_errors"`
 }
@@ -55,10 +60,19 @@ func (s *Store) Stats() (Stats, error) {
 	if s.closed.Load() {
 		return Stats{}, fail("unavailable", "store closed")
 	}
+	m := s.maintenance
+	if m != nil {
+		m.mu.Lock()
+	}
 	out := Stats{DatabaseID: s.dbid, SQLiteVersion: s.engine, WritersQueued: len(s.queue), WriterCapacity: cap(s.queue), ReadersActive: len(s.reads), ReaderCapacity: cap(s.reads),
 		Calls: s.calls.Load(), Conflicts: s.conflicts.Load(), Timeouts: s.timeouts.Load(), QueueWaitNS: s.waitNS.Load(), SQLTimeNS: s.sqlNS.Load(),
 		CommitsDurable: s.durable.Load(), CommitsRelaxed: s.relaxed.Load(), Fsyncs: s.fsyncs.Load(), Checkpoints: s.checkpoints.Load(),
 		ReceiptsPruned: s.receiptsPruned.Load(), MaintenanceErrors: s.maintenanceErrs.Load()}
+	if m != nil {
+		out.CheckpointPending = m.checkpointTimer != nil || m.work.Load()&workCheckpoint != 0
+		out.CheckpointRunning = m.checkpointRunning
+		m.mu.Unlock()
+	}
 	for suffix, target := range map[string]*int64{"": &out.DatabaseBytes, "-wal": &out.WALBytes, "-shm": &out.SHMBytes} {
 		var st unix.Stat_t
 		if e := unix.Fstatat(s.owner.parent, s.owner.name+suffix, &st, unix.AT_SYMLINK_NOFOLLOW); e == nil {
@@ -82,7 +96,7 @@ func (s *Store) committed(d Durability) {
 		s.relaxed.Add(1)
 	}
 	if s.maintenance != nil {
-		s.maintenance.afterCommit()
+		s.maintenance.afterCommitLocked()
 	}
 }
 
