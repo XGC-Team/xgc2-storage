@@ -15,13 +15,21 @@ import (
 
 const sessionColumns = "id,target_id,predecessor_session_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision"
 
-func scanSession(row scanner) (model.Session, error) {
+func scanSession(row scanner, failedCleanup ...*bool) (model.Session, error) {
 	var v model.Session
 	var status, outcome string
 	var intent, errored []byte
 	var opened, closed int64
-	if err := row.Scan(&v.ID, &v.TargetID, &v.PredecessorSessionID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RunMode, &v.ExperimentName, &v.RootRunID, &status, &intent, &outcome, &errored, &opened, &closed, &v.Revision); err != nil {
+	var failed int64
+	fields := []any{&v.ID, &v.TargetID, &v.PredecessorSessionID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RunMode, &v.ExperimentName, &v.RootRunID, &status, &intent, &outcome, &errored, &opened, &closed, &v.Revision}
+	if len(failedCleanup) > 0 {
+		fields = append(fields, &failed)
+	}
+	if err := row.Scan(fields...); err != nil {
 		return v, err
+	}
+	if len(failedCleanup) > 0 {
+		*failedCleanup[0] = failed != 0
 	}
 	v.Status, v.Outcome = model.SessionStatus(status), model.SessionOutcome(outcome)
 	v.StopIntent, v.Error = rawOrNil(intent), rawOrNil(errored)
@@ -39,6 +47,9 @@ func sessionBytes(v model.Session) int64 {
 
 // liveSessionOfTarget is fixed text so that the plan test can run it as written.
 const liveSessionOfTarget = "SELECT id FROM sessions WHERE scope=? AND target_id=? AND status IN ('open','stopping')"
+const queuedSessionBootKeys = "SELECT target_id,predecessor_session_id FROM sessions INDEXED BY sessions_restart_queued_target WHERE scope=? AND status='queued'"
+const interruptQueuedSessions = "UPDATE sessions INDEXED BY sessions_restart_queued_target SET status='interrupted',closed_at=?,revision=revision+1 WHERE scope=? AND status='queued'"
+const interruptLiveSessions = "UPDATE sessions INDEXED BY sessions_live_target SET status='interrupted',closed_at=?,revision=revision+1 WHERE scope=? AND status IN ('open','stopping')"
 
 func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSession) (model.Session, bool, error) {
 	if !textKey(q.ID) || !textKey(q.TargetID) || !textKey(q.ExperimentResourceID) || !textKey(q.ExperimentCommitID) {
@@ -84,7 +95,10 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Session{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO sessions(scope,id,target_id,predecessor_session_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision,bytes) VALUES(?,?,?,'',?,?,?,?,?,?,x'','',x'',?,0,1,?)", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RunMode, v.ExperimentName, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes)
+	// A Run may already name this Session ID because Run creation does not
+	// require a Session foreign key. Claim any retained failed outcome at the
+	// Session's own creation before later history clearing can discard it.
+	_, err = tx.ExecContext(ctx, "INSERT INTO sessions(scope,id,target_id,predecessor_session_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision,bytes,failed_cleanup) VALUES(?,?,?,'',?,?,?,?,?,?,x'','',x'',?,0,1,?,(SELECT EXISTS(SELECT 1 FROM runs INDEXED BY runs_session_failed WHERE scope=? AND session_id=? AND session_id<>'' AND cleanup_failed>0)))", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RunMode, v.ExperimentName, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes, scope, v.ID)
 	return v, true, err
 }
 
@@ -107,7 +121,7 @@ func requestStop(ctx context.Context, tx *sql.Tx, scope, id string, intent []byt
 	return getSession(ctx, tx, scope, id)
 }
 
-func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, close model.SessionClose) (model.Session, error) {
+func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, close model.SessionClose, cut *retentionChanges) (model.Session, error) {
 	v, err := getSession(ctx, tx, scope, id)
 	if err != nil || !v.Status.Live() {
 		return v, err
@@ -118,6 +132,11 @@ func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, close model
 	}
 	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET status='closed',outcome=?,error_json=?,closed_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status IN ('queued','open','stopping')", string(close.Outcome), []byte(close.Error), nanos(nowOr(close.At)), grown, scope, id); err != nil {
 		return v, err
+	}
+	if v.Status == model.SessionQueued {
+		if err = cut.session(ctx, tx, scope, v.TargetID, v.PredecessorSessionID, false); err != nil {
+			return model.Session{}, err
+		}
 	}
 	return getSession(ctx, tx, scope, id)
 }
@@ -131,6 +150,20 @@ func getSession(ctx context.Context, tx *sql.Tx, scope, id string) (model.Sessio
 		return v, failure("not_found", "session not found")
 	}
 	return v, err
+}
+
+// Activation reads the durable cleanup disposition with the Session it
+// already needs; ordinary Session projections do not select this internal fact.
+func getSessionWithCleanup(ctx context.Context, tx *sql.Tx, scope, id string) (model.Session, bool, error) {
+	if !textKey(id) {
+		return model.Session{}, false, failure("invalid_argument", "session identity required")
+	}
+	var failed bool
+	v, err := scanSession(tx.QueryRowContext(ctx, "SELECT "+sessionColumns+",failed_cleanup FROM sessions WHERE scope=? AND id=?", scope, id), &failed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return v, false, failure("not_found", "session not found")
+	}
+	return v, failed, err
 }
 
 func sessionQuery(scope string, f model.SessionFilter) (query string, args []any, limit int, err error) {
@@ -190,12 +223,63 @@ func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.Session
 	return page, rows.Err()
 }
 
-func closeOpenSessions(ctx context.Context, tx *sql.Tx, scope string, at time.Time) (int, error) {
-	result, err := tx.ExecContext(ctx, "UPDATE sessions SET status='interrupted',closed_at=?,revision=revision+1 WHERE scope=? AND status IN ('queued','open','stopping')", nanos(nowOr(at)), scope)
+func closeOpenSessions(ctx context.Context, tx *sql.Tx, scope string, at time.Time, cut *retentionChanges) (int, error) {
+	// Only queued Sessions are retention guards. Capture precisely the queued
+	// keys before their status update, using the existing queued-target index.
+	type key struct{ target, predecessor string }
+	var keys []key
+	rows, err := tx.QueryContext(ctx, queuedSessionBootKeys, scope)
 	if err != nil {
 		return 0, err
 	}
-	n, err := result.RowsAffected()
+	for rows.Next() {
+		var k key
+		if err = rows.Scan(&k.target, &k.predecessor); err != nil {
+			break
+		}
+		keys = append(keys, k)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	if e := rows.Close(); err == nil {
+		err = e
+	}
+	if err != nil {
+		return 0, err
+	}
+	// These predicates are disjoint and use the two existing partial indexes.
+	// A combined status IN predicate scans all retained Sessions in the scope.
+	finishedAt := nanos(nowOr(at))
+	var n int64
+	if len(keys) > 0 {
+		result, e := tx.ExecContext(ctx, interruptQueuedSessions, finishedAt, scope)
+		if e != nil {
+			return 0, e
+		}
+		queued, e := result.RowsAffected()
+		if e != nil {
+			return 0, e
+		}
+		if queued != int64(len(keys)) {
+			return 0, failure("data_loss", "queued Session boot cut disagrees")
+		}
+		n += queued
+	}
+	result, err := tx.ExecContext(ctx, interruptLiveSessions, finishedAt, scope)
+	if err != nil {
+		return 0, err
+	}
+	live, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	n += live
+	for _, k := range keys {
+		if err = cut.session(ctx, tx, scope, k.target, k.predecessor, false); err != nil {
+			return 0, err
+		}
+	}
 	return int(n), err
 }
 
@@ -228,17 +312,29 @@ func (s *Store) RequestStop(ctx context.Context, id string, intent []byte) (mode
 
 // CloseSession durably closes a live Session with its outcome and optional error.
 // Closing a closed or interrupted Session returns the stored record unchanged.
-func (s *Store) CloseSession(ctx context.Context, id string, close model.SessionClose) (model.Session, error) {
+func (s *Store) CloseSession(ctx context.Context, id string, close model.SessionClose, policy model.RunRetentionPolicy) (model.SessionMutationResult, error) {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.SessionMutationResult{}, err
+	}
 	if close.Outcome != model.SessionStopped && close.Outcome != model.SessionFailed {
-		return model.Session{}, failure("invalid_argument", "a stopped or failed session outcome is required")
+		return model.SessionMutationResult{}, failure("invalid_argument", "a stopped or failed session outcome is required")
 	}
 	stored, err := jsonField("session error", close.Error, model.MaxStopIntentBytes, false, true)
 	if err != nil {
-		return model.Session{}, err
+		return model.SessionMutationResult{}, err
 	}
 	close.Error = stored
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.Session, error) {
-		return closeSession(ctx, tx, scope, id, close)
+	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.SessionMutationResult, error) {
+		var cut retentionChanges
+		session, err := closeSession(ctx, tx, scope, id, close, &cut)
+		if err != nil {
+			return model.SessionMutationResult{}, err
+		}
+		if err = cut.finish(ctx, tx, scope); err != nil {
+			return model.SessionMutationResult{}, err
+		}
+		effect, err := retentionEffect(ctx, tx, scope, &cut, policy)
+		return model.SessionMutationResult{Session: session, Retention: effect}, err
 	})
 }
 
@@ -257,8 +353,20 @@ func (s *Store) ListSessions(ctx context.Context, f model.SessionFilter) (model.
 
 // CloseOpenSessions marks every Session a stopped Core left live as interrupted.
 // Core calls it at boot, before it opens any Session.
-func (s *Store) CloseOpenSessions(ctx context.Context, at time.Time) (int, error) {
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (int, error) {
-		return closeOpenSessions(ctx, tx, scope, at)
+func (s *Store) CloseOpenSessions(ctx context.Context, at time.Time, policy model.RunRetentionPolicy) (model.SessionInterruptResult, error) {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.SessionInterruptResult{}, err
+	}
+	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.SessionInterruptResult, error) {
+		var cut retentionChanges
+		count, err := closeOpenSessions(ctx, tx, scope, at, &cut)
+		if err != nil {
+			return model.SessionInterruptResult{}, err
+		}
+		if err = cut.finish(ctx, tx, scope); err != nil {
+			return model.SessionInterruptResult{}, err
+		}
+		effect, err := retentionEffect(ctx, tx, scope, &cut, policy)
+		return model.SessionInterruptResult{Count: count, Retention: effect}, err
 	})
 }

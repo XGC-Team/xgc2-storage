@@ -155,7 +155,7 @@ func TestRunStatusUpdatesAreRelaxedBatchableAndForwardOnly(t *testing.T) {
 	if got := must(f.core.GetRun(f.ctx, "b")); got.Status != model.RunRunning {
 		t.Fatalf("partial batch applied: %s", got.Status)
 	}
-	finished := must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "b", Status: model.RunFailed}))
+	finished := must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "b", Status: model.RunFailed}, model.RunRetentionPolicy{}))
 	if err := f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "b", Status: model.RunStopping}); err != nil {
 		t.Fatalf("a late stopping update of a terminal run: %v", err)
 	}
@@ -170,7 +170,7 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 	rowsBefore, bytesBefore := usageRows(t, f)
 	before := stats(t, f)
 	finish := model.RunFinish{ID: "run", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), Nodes: []byte(`[{"id":"n","status":"succeeded"}]`), CleanupErrors: []byte(`[]`), At: epoch.Add(time.Hour)}
-	run, err := f.core.FinishRun(f.ctx, finish)
+	run, err := f.core.FinishRun(f.ctx, finish, model.RunRetentionPolicy{})
 	if err != nil || run.Status != model.RunSucceeded || !run.FinishedAt.Equal(finish.At) || string(run.Nodes) != string(finish.Nodes) || run.Termination != "completed" || run.Revision != 2 {
 		t.Fatalf("finished run: %+v %v", run, err)
 	}
@@ -184,8 +184,8 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 	// The replay enters the durable write transaction and commits it. The row,
 	// revision and quota stay put; there is no read outside that transaction.
 	replayAt := stats(t, f)
-	again, err := f.core.FinishRun(f.ctx, finish)
-	if err != nil || !reflect.DeepEqual(again, run) {
+	again, err := f.core.FinishRun(f.ctx, finish, model.RunRetentionPolicy{})
+	if err != nil || !reflect.DeepEqual(again.Run, run.Run) || again.Retention.ChangedFinish {
 		t.Fatalf("same outcome replay: %+v %v", again, err)
 	}
 	if rows, bytes := usageRows(t, f); rows != rowsAfter || bytes != bytesAfter {
@@ -208,7 +208,7 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: []byte(`[{"id":"x"}]`), At: finish.At},
 		{ID: finish.ID, Status: finish.Status, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At.Add(time.Second)},
 	} {
-		if _, err = f.core.FinishRun(f.ctx, mismatch); errCode(err) != "failed_precondition" {
+		if _, err = f.core.FinishRun(f.ctx, mismatch, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 			t.Fatalf("different outcome accepted: %+v %v", mismatch, err)
 		}
 	}
@@ -217,12 +217,12 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 	}
 	zeroAt := newRun("zero-at")
 	must3(f.core.CreateRun(f.ctx, zeroAt))
-	firstZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"})
+	firstZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"}, model.RunRetentionPolicy{})
 	if err != nil || firstZero.FinishedAt.IsZero() {
 		t.Fatalf("zero At finish: %+v %v", firstZero, err)
 	}
-	secondZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"})
-	if err != nil || !reflect.DeepEqual(secondZero, firstZero) {
+	secondZero, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "zero-at", Status: model.RunSucceeded, Termination: "completed"}, model.RunRetentionPolicy{})
+	if err != nil || !reflect.DeepEqual(secondZero.Run, firstZero.Run) || secondZero.Retention.ChangedFinish {
 		t.Fatalf("zero At replay: %+v %v", secondZero, err)
 	}
 	for name, bad := range map[string]model.RunFinish{
@@ -230,16 +230,16 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 		"invalid JSON": {ID: "run", Status: model.RunFailed, Error: []byte(`{`)},
 		"no run":       {ID: "", Status: model.RunFailed},
 	} {
-		if _, err = f.core.FinishRun(f.ctx, bad); errCode(err) != "invalid_argument" {
+		if _, err = f.core.FinishRun(f.ctx, bad, model.RunRetentionPolicy{}); errCode(err) != "invalid_argument" {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if _, err = f.core.FinishRun(f.ctx, model.RunFinish{ID: "ghost", Status: model.RunFailed}); errCode(err) != "not_found" {
+	if _, err = f.core.FinishRun(f.ctx, model.RunFinish{ID: "ghost", Status: model.RunFailed}, model.RunRetentionPolicy{}); errCode(err) != "not_found" {
 		t.Fatalf("missing run: %v", err)
 	}
 	// A queued Run that never started can be canceled; started_at stays empty.
 	must3(f.core.CreateRun(f.ctx, newRun("never-started")))
-	canceled := must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "never-started", Status: model.RunCanceled, Termination: "canceled by operator"}))
+	canceled := must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "never-started", Status: model.RunCanceled, Termination: "canceled by operator"}, model.RunRetentionPolicy{}))
 	if canceled.Status != model.RunCanceled || !canceled.StartedAt.IsZero() || canceled.FinishedAt.IsZero() {
 		t.Fatalf("canceled run: %+v", canceled)
 	}
@@ -258,7 +258,7 @@ func TestListRunsFiltersAndPagesNewestFirst(t *testing.T) {
 		}
 		must3(f.core.CreateRun(f.ctx, q))
 	}
-	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "run-00", Status: model.RunFailed}))
+	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "run-00", Status: model.RunFailed}, model.RunRetentionPolicy{}))
 	check(f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "run-01", Status: model.RunRunning}))
 	var seen []string
 	cursor := ""
@@ -332,12 +332,12 @@ func TestInterruptOpenRunsAtBoot(t *testing.T) {
 		must3(f.core.CreateRun(f.ctx, newRun(id)))
 	}
 	check(f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "running", Status: model.RunRunning}, model.RunStatusUpdate{ID: "stopping", Status: model.RunStopping}))
-	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "done", Status: model.RunSucceeded}))
+	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "done", Status: model.RunSucceeded}, model.RunRetentionPolicy{}))
 	before := stats(t, f)
 	at := epoch.Add(time.Hour)
-	n, err := f.core.InterruptOpenRuns(f.ctx, at)
-	if err != nil || n != 3 {
-		t.Fatalf("interrupted %d: %v", n, err)
+	n, err := f.core.InterruptOpenRuns(f.ctx, at, model.RunRetentionPolicy{})
+	if err != nil || n.Count != 3 {
+		t.Fatalf("interrupted %d: %v", n.Count, err)
 	}
 	if d, _ := commits(t, f, before); d != 1 {
 		t.Fatalf("interrupting is one durable commit, got %d", d)
@@ -351,8 +351,8 @@ func TestInterruptOpenRunsAtBoot(t *testing.T) {
 	if r := must(f.core.GetRun(f.ctx, "done")); r.Status != model.RunSucceeded {
 		t.Errorf("a finished run changed: %+v", r)
 	}
-	if n, err = f.core.InterruptOpenRuns(f.ctx, at); err != nil || n != 0 {
-		t.Fatalf("second boot interrupted %d: %v", n, err)
+	if n, err = f.core.InterruptOpenRuns(f.ctx, at, model.RunRetentionPolicy{}); err != nil || n.Count != 0 {
+		t.Fatalf("second boot interrupted %d: %v", n.Count, err)
 	}
 }
 
@@ -363,12 +363,15 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 		q := newRun(fmt.Sprintf("old-%d", i))
 		q.At = epoch.Add(time.Duration(i) * time.Minute)
 		must3(f.core.CreateRun(f.ctx, q))
-		must(f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, Result: []byte(`{"ok":true}`), At: epoch.Add(time.Duration(i)*time.Minute + time.Second)}))
+		must(f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, Result: []byte(`{"ok":true}`), At: epoch.Add(time.Duration(i)*time.Minute + time.Second)}, model.RunRetentionPolicy{
+
+			// A live root keeps its finished children.
+		}))
 	}
-	// A live root keeps its finished children.
+
 	must3(f.core.CreateRun(f.ctx, newRun("live-root")))
 	must3(f.core.CreateRun(f.ctx, childRun("old-child", "live-root", "live-root", 1)))
-	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "old-child", Status: model.RunSucceeded, At: epoch}))
+	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "old-child", Status: model.RunSucceeded, At: epoch}, model.RunRetentionPolicy{}))
 	rowsFull, bytesFull := usageRows(t, f)
 	before := stats(t, f)
 	if _, err := f.core.PruneRuns(f.ctx, model.RunRetention{}); errCode(err) != "invalid_argument" {
@@ -401,7 +404,7 @@ func TestPruneRunsByAgeAndCountFreesQuotaAndKeepsLiveTrees(t *testing.T) {
 		t.Fatalf("quota after prune: rows %d (full %d) bytes %d (full %d)", rowsAfter, rowsFull, bytesAfter, bytesFull)
 	}
 	// Deleting everything finished returns the counters to the live remainder.
-	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "live-root", Status: model.RunSucceeded}))
+	must(f.core.FinishRun(f.ctx, model.RunFinish{ID: "live-root", Status: model.RunSucceeded}, model.RunRetentionPolicy{}))
 	n, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(24 * 365 * time.Hour), Limit: 2})
 	if err != nil || n.Deleted != 2 {
 		t.Fatalf("limit not honored: %+v %v", n, err)
@@ -473,11 +476,11 @@ func TestSessionLifecycleOneLivePerTarget(t *testing.T) {
 	if _, _, err = f.core.OpenSession(f.ctx, third); errCode(err) != "conflict" {
 		t.Fatalf("stopping session released its target: %v", err)
 	}
-	closed, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(time.Hour), Outcome: model.SessionStopped})
+	closed, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(time.Hour), Outcome: model.SessionStopped}, model.RunRetentionPolicy{})
 	if err != nil || closed.Status != model.SessionClosed || closed.Outcome != model.SessionStopped || closed.Error != nil || closed.Revision != 3 || !closed.ClosedAt.Equal(epoch.Add(time.Hour)) {
 		t.Fatalf("close: %+v %v", closed, err)
 	}
-	again2, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(2 * time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)})
+	again2, err := f.core.CloseSession(f.ctx, "s1", model.SessionClose{At: epoch.Add(2 * time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)}, model.RunRetentionPolicy{})
 	if err != nil || !reflect.DeepEqual(again2, closed) {
 		t.Fatalf("closing twice changed the session: %+v %v", again2, err)
 	}
@@ -560,29 +563,29 @@ func TestCloseSessionRecordsOutcomeAndSurvivesARestart(t *testing.T) {
 			must3(f.core.OpenSession(f.ctx, q))
 			close.At = epoch.Add(time.Hour)
 			before := stats(t, f)
-			closed, err := f.core.CloseSession(f.ctx, q.ID, close)
+			closed, err := f.core.CloseSession(f.ctx, q.ID, close, model.RunRetentionPolicy{})
 			if err != nil || closed.Status != model.SessionClosed || closed.Outcome != close.Outcome || string(closed.Error) != string(close.Error) || !closed.ClosedAt.Equal(close.At) || closed.Revision != 2 || closed.RunMode != q.RunMode || closed.ExperimentName != q.ExperimentName {
 				t.Fatalf("close: %+v %v", closed, err)
 			}
 			if d, r := commits(t, f, before); d != 1 || r != 0 {
 				t.Fatalf("CloseSession must be one durable commit: durable=%d relaxed=%d", d, r)
 			}
-			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed) {
+			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed.Session) {
 				t.Fatalf("get changed closed session fields: %+v", got)
 			}
 			page := must(f.core.ListSessions(f.ctx, model.SessionFilter{}))
-			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed) {
+			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed.Session) {
 				t.Fatalf("list changed closed session fields: %+v", page.Sessions)
 			}
 			f.reopen(t)
-			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed) {
+			if got := must(f.core.GetSession(f.ctx, q.ID)); !reflect.DeepEqual(got, closed.Session) {
 				t.Fatalf("closed session after restart: %+v", got)
 			}
 			page = must(f.core.ListSessions(f.ctx, model.SessionFilter{}))
-			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed) {
+			if len(page.Sessions) != 1 || !reflect.DeepEqual(page.Sessions[0], closed.Session) {
 				t.Fatalf("list after restart: %+v", page.Sessions)
 			}
-			if replay, created, err := f.core.OpenSession(f.ctx, q); err != nil || created || !reflect.DeepEqual(replay, closed) {
+			if replay, created, err := f.core.OpenSession(f.ctx, q); err != nil || created || !reflect.DeepEqual(replay, closed.Session) {
 				t.Fatalf("reopening a closed session changed it: %+v %v %v", replay, created, err)
 			}
 		})
@@ -603,18 +606,18 @@ func TestCloseSessionValidatesOutcomeAndError(t *testing.T) {
 		"error null":          {Outcome: model.SessionFailed, Error: []byte(`null`)},
 		"error string":        {Outcome: model.SessionFailed, Error: []byte(`"error"`)},
 	} {
-		if _, err := f.core.CloseSession(f.ctx, "s", close); errCode(err) != "invalid_argument" {
+		if _, err := f.core.CloseSession(f.ctx, "s", close, model.RunRetentionPolicy{}); errCode(err) != "invalid_argument" {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
 	oversized := model.SessionClose{Outcome: model.SessionFailed, Error: []byte(`{"x":"` + strings.Repeat("a", model.MaxStopIntentBytes) + `"}`)}
-	if _, err := f.core.CloseSession(f.ctx, "s", oversized); errCode(err) != "resource_exhausted" {
+	if _, err := f.core.CloseSession(f.ctx, "s", oversized, model.RunRetentionPolicy{}); errCode(err) != "resource_exhausted" {
 		t.Fatalf("oversized error: %v", err)
 	}
-	if _, err := f.core.CloseSession(f.ctx, "", model.SessionClose{Outcome: model.SessionStopped}); errCode(err) != "invalid_argument" {
+	if _, err := f.core.CloseSession(f.ctx, "", model.SessionClose{Outcome: model.SessionStopped}, model.RunRetentionPolicy{}); errCode(err) != "invalid_argument" {
 		t.Fatalf("missing identity: %v", err)
 	}
-	if _, err := f.core.CloseSession(f.ctx, "ghost", model.SessionClose{Outcome: model.SessionStopped}); errCode(err) != "not_found" {
+	if _, err := f.core.CloseSession(f.ctx, "ghost", model.SessionClose{Outcome: model.SessionStopped}, model.RunRetentionPolicy{}); errCode(err) != "not_found" {
 		t.Fatalf("missing session: %v", err)
 	}
 	if got := must(f.core.GetSession(f.ctx, "s")); !reflect.DeepEqual(got, opened) {
@@ -664,7 +667,7 @@ func TestSessionQuotaCountsRunModeNameOutcomeAndError(t *testing.T) {
 	intent := []byte(`{"by":"operator"}`)
 	must(f.core.RequestStop(f.ctx, q.ID, intent))
 	close := model.SessionClose{At: epoch, Outcome: model.SessionFailed, Error: []byte(`{"code":"workflow_failed"}`)}
-	closed := must(f.core.CloseSession(f.ctx, q.ID, close))
+	closed := must(f.core.CloseSession(f.ctx, q.ID, close, model.RunRetentionPolicy{}))
 	rows3, bytes3 := usageRows(t, f)
 	if want := int64(len(intent) + len(close.Outcome) + len(close.Error)); rows3 != rows2 || bytes3-bytes2 != want {
 		t.Fatalf("stop and close fields not charged: rows %d->%d bytes %d->%d want growth %d", rows2, rows3, bytes2, bytes3, want)
@@ -678,7 +681,7 @@ func TestSessionQuotaCountsRunModeNameOutcomeAndError(t *testing.T) {
 	if storedBytes != bytes3-bytes0 {
 		t.Fatalf("session row bytes %d differ from charged bytes %d", storedBytes, bytes3-bytes0)
 	}
-	if again := must(f.core.CloseSession(f.ctx, q.ID, model.SessionClose{Outcome: model.SessionStopped, Error: []byte(`{"late":true}`)})); !reflect.DeepEqual(again, closed) {
+	if again := must(f.core.CloseSession(f.ctx, q.ID, model.SessionClose{Outcome: model.SessionStopped, Error: []byte(`{"late":true}`)}, model.RunRetentionPolicy{})); !reflect.DeepEqual(again, closed) {
 		t.Fatalf("close replay changed stored record: %+v", again)
 	}
 	if r, b := usageRows(t, f); r != rows3 || b != bytes3 {
@@ -686,7 +689,7 @@ func TestSessionQuotaCountsRunModeNameOutcomeAndError(t *testing.T) {
 	}
 	// Recording an admitted Session's outcome is allowed even at the quota limit.
 	f.exec(t, "UPDATE core_data_usage SET rows=?,bytes=?", coredata.MaxScopeRows, coredata.MaxScopeBytes)
-	must(f.core.CloseSession(f.ctx, base.ID, model.SessionClose{Outcome: model.SessionStopped}))
+	must(f.core.CloseSession(f.ctx, base.ID, model.SessionClose{Outcome: model.SessionStopped}, model.RunRetentionPolicy{}))
 	if r, b := usageRows(t, f); r != coredata.MaxScopeRows || b != coredata.MaxScopeBytes+int64(len(model.SessionStopped)) {
 		t.Fatalf("close at full quota: %d/%d", r, b)
 	}
@@ -698,26 +701,26 @@ func TestCloseOpenSessionsAtBoot(t *testing.T) {
 	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "b", TargetID: "t2", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
 	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "c", TargetID: "t3", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}))
 	must(f.core.RequestStop(f.ctx, "b", []byte(`{}`)))
-	closed := must(f.core.CloseSession(f.ctx, "c", model.SessionClose{At: epoch, Outcome: model.SessionFailed, Error: []byte(`{"code":"test_failure"}`)}))
+	closed := must(f.core.CloseSession(f.ctx, "c", model.SessionClose{At: epoch, Outcome: model.SessionFailed, Error: []byte(`{"code":"test_failure"}`)}, model.RunRetentionPolicy{}))
 	at := epoch.Add(time.Hour)
-	n, err := f.core.CloseOpenSessions(f.ctx, at)
-	if err != nil || n != 2 {
-		t.Fatalf("interrupted %d: %v", n, err)
+	n, err := f.core.CloseOpenSessions(f.ctx, at, model.RunRetentionPolicy{})
+	if err != nil || n.Count != 2 {
+		t.Fatalf("interrupted %d: %v", n.Count, err)
 	}
 	for _, id := range []string{"a", "b"} {
 		s := must(f.core.GetSession(f.ctx, id))
 		if s.Status != model.SessionInterrupted || !s.ClosedAt.Equal(at) || s.Outcome != "" || s.Error != nil {
 			t.Errorf("%s: %+v", id, s)
 		}
-		if again := must(f.core.CloseSession(f.ctx, id, model.SessionClose{At: at.Add(time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)})); !reflect.DeepEqual(again, s) {
+		if again := must(f.core.CloseSession(f.ctx, id, model.SessionClose{At: at.Add(time.Hour), Outcome: model.SessionFailed, Error: []byte(`{"late":true}`)}, model.RunRetentionPolicy{})); !reflect.DeepEqual(again.Session, s) {
 			t.Errorf("closing an interrupted session changed it: %+v", again)
 		}
 	}
-	if s := must(f.core.GetSession(f.ctx, "c")); !reflect.DeepEqual(s, closed) {
+	if s := must(f.core.GetSession(f.ctx, "c")); !reflect.DeepEqual(s, closed.Session) {
 		t.Errorf("a closed session changed: %+v", s)
 	}
-	if n, err = f.core.CloseOpenSessions(f.ctx, at); err != nil || n != 0 {
-		t.Fatalf("second boot interrupted %d: %v", n, err)
+	if n, err = f.core.CloseOpenSessions(f.ctx, at, model.RunRetentionPolicy{}); err != nil || n.Count != 0 {
+		t.Fatalf("second boot interrupted %d: %v", n.Count, err)
 	}
 	if _, _, err = f.core.OpenSession(f.ctx, model.NewSession{ID: "d", TargetID: "t1", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "managed"}); err != nil {
 		t.Fatalf("an interrupted session still holds its target: %v", err)
@@ -803,11 +806,11 @@ func TestExecutionFactsSurviveARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The boot sequence of Core: interrupt what the stopped process left open.
-	if n, err := f.core.InterruptOpenRuns(f.ctx, epoch); err != nil || n != 1 {
-		t.Fatalf("boot interrupt: %d %v", n, err)
+	if n, err := f.core.InterruptOpenRuns(f.ctx, epoch, model.RunRetentionPolicy{}); err != nil || n.Count != 1 {
+		t.Fatalf("boot interrupt: %d %v", n.Count, err)
 	}
-	if n, err := f.core.CloseOpenSessions(f.ctx, epoch); err != nil || n != 1 {
-		t.Fatalf("boot close: %d %v", n, err)
+	if n, err := f.core.CloseOpenSessions(f.ctx, epoch, model.RunRetentionPolicy{}); err != nil || n.Count != 1 {
+		t.Fatalf("boot close: %d %v", n.Count, err)
 	}
 }
 
@@ -839,7 +842,7 @@ func TestLiveQuotaStopsNewRunsButNeverTheOutcomeOfAdmittedOnes(t *testing.T) {
 	if _, _, err := f.core.AddRecording(f.ctx, model.NewRecording{ID: "r", RunID: "admitted", Kind: "k", Path: "/p"}); errCode(err) != "resource_exhausted" {
 		t.Fatalf("a full quota admitted a recording: %v", err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "admitted", Status: model.RunFailed, Result: []byte(`{"why":"disk"}`)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "admitted", Status: model.RunFailed, Result: []byte(`{"why":"disk"}`)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatalf("the outcome of an admitted run must always be recorded: %v", err)
 	}
 	// Pruning gives the room back.
@@ -900,14 +903,14 @@ func TestNewScopeRequiresTheModule(t *testing.T) {
 func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	f := openStore(t)
 	before := stats(t, f)
-	if got, err := f.core.ApplyRunOps(f.ctx, nil, nil, nil); err != nil || got != nil {
+	if got, err := f.core.ApplyRunOps(f.ctx, nil, nil, nil, model.RunRetentionPolicy{}); err != nil || got.Created != nil || got.Retention.ChangedFinish {
 		t.Fatalf("empty batch: %+v %v", got, err)
 	}
 	if d, r := commits(t, f, before); d != 0 || r != 0 {
 		t.Fatalf("empty batch wrote: durable=%d relaxed=%d", d, r)
 	}
 	tooMany := make([]model.RunStatusUpdate, model.MaxPageSize+1)
-	if _, err := f.core.ApplyRunOps(f.ctx, nil, tooMany, nil); errCode(err) != "invalid_argument" {
+	if _, err := f.core.ApplyRunOps(f.ctx, nil, tooMany, nil, model.RunRetentionPolicy{}); errCode(err) != "invalid_argument" {
 		t.Fatalf("oversized batch: %v", err)
 	}
 	if d, r := commits(t, f, before); d != 0 || r != 0 {
@@ -917,7 +920,7 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	rows, quota := usageRows(t, f)
 	bad := newRun("bad")
 	bad.Inputs = []byte(`{`)
-	if _, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{newRun("kept"), bad}, nil, nil); errCode(err) != "invalid_argument" {
+	if _, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{newRun("kept"), bad}, nil, nil, model.RunRetentionPolicy{}); errCode(err) != "invalid_argument" {
 		t.Fatalf("partial batch: %v", err)
 	}
 	if f.count(t, "runs") != 0 {
@@ -933,8 +936,8 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	finishedAt := epoch.Add(time.Hour)
 	created, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{q},
 		[]model.RunStatusUpdate{{ID: "life", Status: model.RunRunning, At: runningAt}},
-		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}})
-	if err != nil || len(created) != 1 || !created[0].Created || created[0].Run.ID != "life" {
+		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}}, model.RunRetentionPolicy{})
+	if err != nil || len(created.Created) != 1 || !created.Created[0].Created || created.Created[0].Run.ID != "life" {
 		t.Fatalf("created: %+v %v", created, err)
 	}
 	if d, r := commits(t, f, start); d != 1 || r != 0 {
@@ -946,7 +949,7 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	}
 
 	statusAt := stats(t, f)
-	if got, err := f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping, At: finishedAt}}, nil); err != nil || got != nil {
+	if got, err := f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping, At: finishedAt}}, nil, model.RunRetentionPolicy{}); err != nil || got.Created != nil || got.Retention.ChangedFinish {
 		t.Fatalf("terminal update batch: %+v %v", got, err)
 	}
 	if d, r := commits(t, f, statusAt); d != 0 || r != 1 {
@@ -960,8 +963,8 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	rows, quota = usageRows(t, f)
 	replayed, err := f.core.ApplyRunOps(f.ctx, nil,
 		[]model.RunStatusUpdate{{ID: "life", Status: model.RunRunning}},
-		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}})
-	if err != nil || replayed != nil {
+		[]model.RunFinish{{ID: "life", Status: model.RunSucceeded, Termination: "completed", Result: []byte(`{"ok":true}`), At: finishedAt}}, model.RunRetentionPolicy{})
+	if err != nil || replayed.Created != nil || replayed.Retention.ChangedFinish {
 		t.Fatalf("idempotent batch: %+v %v", replayed, err)
 	}
 	if d, r := commits(t, f, replayAt); d != 1 || r != 0 {
@@ -975,7 +978,7 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	if got := must(f.core.GetRun(f.ctx, "life")); !reflect.DeepEqual(got, life) {
 		t.Fatalf("idempotent batch changed the row: %+v", got)
 	}
-	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping}}, []model.RunFinish{{ID: "life", Status: model.RunFailed, At: finishedAt}}); errCode(err) != "failed_precondition" {
+	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "life", Status: model.RunStopping}}, []model.RunFinish{{ID: "life", Status: model.RunFailed, At: finishedAt}}, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("different finish in a retry batch: %v", err)
 	}
 	if got := must(f.core.GetRun(f.ctx, "life")); got.Revision != life.Revision {
@@ -985,7 +988,7 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 	open := newRun("open")
 	must3(f.core.CreateRun(f.ctx, open))
 	check(f.core.UpdateRunStatus(f.ctx, model.RunStatusUpdate{ID: "open", Status: model.RunStopping}))
-	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "open", Status: model.RunRunning}}, nil); errCode(err) != "failed_precondition" {
+	if _, err = f.core.ApplyRunOps(f.ctx, nil, []model.RunStatusUpdate{{ID: "open", Status: model.RunRunning}}, nil, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("open reverse accepted: %v", err)
 	}
 	if got := must(f.core.GetRun(f.ctx, "open")); got.Status != model.RunStopping {

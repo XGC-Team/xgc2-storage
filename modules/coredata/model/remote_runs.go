@@ -20,12 +20,13 @@ type RemoteRunLink struct {
 // These are facts at the transaction cut, not a promise that later writes
 // cannot create a new relation or otherwise protect history.
 type RemoteRunResolveResult struct {
-	RootRunID       string    `json:"rootRunId"`
-	Changed         bool      `json:"changed"`
-	LastForRoot     bool      `json:"lastForRoot"`
-	RootFound       bool      `json:"rootFound"`
-	RootFinishedAt  time.Time `json:"rootFinishedAt,omitzero"`
-	OwnerFinishedAt time.Time `json:"ownerFinishedAt,omitzero"`
+	RootRunID       string             `json:"rootRunId"`
+	Changed         bool               `json:"changed"`
+	LastForRoot     bool               `json:"lastForRoot"`
+	RootFound       bool               `json:"rootFound"`
+	RootFinishedAt  time.Time          `json:"rootFinishedAt,omitzero"`
+	OwnerFinishedAt time.Time          `json:"ownerFinishedAt,omitzero"`
+	Retention       RunRetentionEffect `json:"retention"`
 }
 
 type RemoteRunPage struct {

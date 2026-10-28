@@ -13,7 +13,7 @@ func TestRestartRunIdentityReservationAndRetention(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, predecessor); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "old", Status: model.RunStopped, At: epoch.Add(time.Second)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "old", Status: model.RunStopped, At: epoch.Add(time.Second)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	successor := newRun("new")
@@ -53,9 +53,9 @@ func TestRestartRunIdentityReservationAndRetention(t *testing.T) {
 	if err != nil || got.PredecessorRunID != "old" {
 		t.Fatalf("reopen: %+v %v", got, err)
 	}
-	interrupted, err := f.core.InterruptOpenRuns(f.ctx, epoch.Add(2*time.Second))
-	if err != nil || interrupted != 1 {
-		t.Fatalf("boot interruption: %d %v", interrupted, err)
+	interrupted, err := f.core.InterruptOpenRuns(f.ctx, epoch.Add(2*time.Second), model.RunRetentionPolicy{})
+	if err != nil || interrupted.Count != 1 {
+		t.Fatalf("boot interruption: %d %v", interrupted.Count, err)
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour), Limit: 100})
 	if err != nil || pruned.Deleted != 2 {

@@ -38,7 +38,7 @@ func TestRemoteResolutionReturnsItsCommittedCutWhenCancellationRacesCommit(t *te
 		t.Fatal(err)
 	}
 	finishedAt := time.Date(2026, 10, 29, 1, 0, 0, 0, time.UTC)
-	if _, err := store.FinishRun(ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: finishedAt}); err != nil {
+	if _, err := store.FinishRun(ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: finishedAt}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	entered, release := engine.GateNextCommitForModuleTest(t, db)
@@ -50,7 +50,10 @@ func TestRemoteResolutionReturnsItsCommittedCutWhenCancellationRacesCommit(t *te
 		err    error
 	}
 	done := make(chan outcome, 1)
-	go func() { result, err := store.ResolveRemoteRun(callCtx, link); done <- outcome{result, err} }()
+	go func() {
+		result, err := store.ResolveRemoteRun(callCtx, link, model.RunRetentionPolicy{})
+		done <- outcome{result, err}
+	}()
 	select {
 	case <-entered:
 	case early := <-done:

@@ -30,7 +30,7 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 	}
 	rootAt, aAt, bAt := epoch.Add(20*time.Minute), epoch.Add(time.Minute), epoch.Add(2*time.Minute)
 	for id, at := range map[string]time.Time{"root": rootAt, "owner-a": aAt, "owner-b": bAt} {
-		if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: id, Status: model.RunCanceled, At: at}); err != nil {
+		if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: id, Status: model.RunCanceled, At: at}, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -43,7 +43,7 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 		func() model.RemoteRunLink { x := a; x.CallNodeID = "wrong"; return x }(),
 		func() model.RemoteRunLink { x := a; x.RootRunID = "other-root"; return x }(),
 	} {
-		result, err := f.core.ResolveRemoteRun(f.ctx, bad)
+		result, err := f.core.ResolveRemoteRun(f.ctx, bad, model.RunRetentionPolicy{})
 		if errCode(err) != "failed_precondition" || result != (model.RemoteRunResolveResult{}) {
 			t.Fatalf("identity mismatch returned committed facts: %+v %v", result, err)
 		}
@@ -51,26 +51,26 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 	if gotRows, gotBytes := usageRows(t, f); gotRows != rows || gotBytes != bytes {
 		t.Fatal("rejected resolution changed quota")
 	}
-	first, err := f.core.ResolveRemoteRun(f.ctx, a)
-	if err != nil || first != (model.RemoteRunResolveResult{RootRunID: "root", Changed: true}) {
+	first, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
+	if err != nil || first != (model.RemoteRunResolveResult{RootRunID: "root", Changed: true, Retention: model.RunRetentionEffect{EligibilityReleased: true}}) {
 		t.Fatalf("nonfinal owner: %+v %v", first, err)
 	}
 	rowsAfterFirst, bytesAfterFirst := usageRows(t, f)
 	if rowsAfterFirst != rows-1 || bytesAfterFirst >= bytes {
 		t.Fatalf("first release quota: rows %d->%d bytes %d->%d", rows, rowsAfterFirst, bytes, bytesAfterFirst)
 	}
-	replay, err := f.core.ResolveRemoteRun(f.ctx, a)
+	replay, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
 	if err != nil || replay != (model.RemoteRunResolveResult{RootRunID: "root"}) {
 		t.Fatalf("nonfinal replay: %+v %v", replay, err)
 	}
 	if gotRows, gotBytes := usageRows(t, f); gotRows != rowsAfterFirst || gotBytes != bytesAfterFirst {
 		t.Fatal("replay changed quota")
 	}
-	last, err := f.core.ResolveRemoteRun(f.ctx, b)
+	last, err := f.core.ResolveRemoteRun(f.ctx, b, model.RunRetentionPolicy{})
 	if err != nil || !last.Changed || !last.LastForRoot || !last.RootFound || last.RootRunID != "root" || !last.RootFinishedAt.Equal(rootAt) || !last.OwnerFinishedAt.Equal(bAt) {
 		t.Fatalf("final owner: %+v %v", last, err)
 	}
-	replay, err = f.core.ResolveRemoteRun(f.ctx, b)
+	replay, err = f.core.ResolveRemoteRun(f.ctx, b, model.RunRetentionPolicy{})
 	if err != nil || replay != (model.RemoteRunResolveResult{RootRunID: "root"}) {
 		t.Fatalf("final replay: %+v %v", replay, err)
 	}
@@ -105,11 +105,11 @@ func TestResolveRemoteRunDistinguishesLiveAndMissingRoots(t *testing.T) {
 				t.Fatal(err)
 			}
 			at := epoch.Add(time.Minute)
-			if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "owner", Status: model.RunCanceled, At: at}); err != nil {
+			if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "owner", Status: model.RunCanceled, At: at}, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
 			}
 			f.reopen(t)
-			result, err := f.core.ResolveRemoteRun(f.ctx, link)
+			result, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 			if err != nil || !result.Changed || !result.LastForRoot || result.RootFound != exists || !result.RootFinishedAt.IsZero() || !result.OwnerFinishedAt.Equal(at) {
 				t.Fatalf("root status: %+v %v", result, err)
 			}
@@ -150,7 +150,7 @@ func TestResolveRemoteRunConcurrentOwnersAndDuplicateJoin(t *testing.T) {
 				go func(i int, link model.RemoteRunLink) {
 					defer wg.Done()
 					<-start
-					results[i], errs[i] = f.core.ResolveRemoteRun(f.ctx, link)
+					results[i], errs[i] = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 				}(i, link)
 			}
 			close(start)
@@ -200,7 +200,7 @@ func TestResolveRemoteRunScopeAndCancellationLeaveNoFalseCommit(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(f.ctx)
 	cancel()
-	result, err := f.core.ResolveRemoteRun(ctx, link)
+	result, err := f.core.ResolveRemoteRun(ctx, link, model.RunRetentionPolicy{})
 	if errCode(err) != "cancelled" || result != (model.RemoteRunResolveResult{}) {
 		t.Fatalf("canceled result=%+v %v", result, err)
 	}
@@ -210,7 +210,7 @@ func TestResolveRemoteRunScopeAndCancellationLeaveNoFalseCommit(t *testing.T) {
 			t.Fatalf("canceled or foreign mutation removed protection: %v %v", pending, err)
 		}
 	}
-	result, err = f.core.ResolveRemoteRun(f.ctx, link)
+	result, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForRoot {
 		t.Fatalf("scope release=%+v %v", result, err)
 	}
@@ -234,11 +234,15 @@ func TestResolveRemoteRunUsesTransactionCutWhenRootFinishesConcurrently(t *testi
 	var resolved model.RemoteRunResolveResult
 	var resolveErr, finishErr error
 	wg.Add(2)
-	go func() { defer wg.Done(); <-start; resolved, resolveErr = f.core.ResolveRemoteRun(f.ctx, link) }()
 	go func() {
 		defer wg.Done()
 		<-start
-		_, finishErr = f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: at})
+		resolved, resolveErr = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, finishErr = f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: at}, model.RunRetentionPolicy{})
 	}()
 	close(start)
 	wg.Wait()
@@ -267,10 +271,10 @@ func TestResolveRemoteRunNewReservationReprotectsTerminalRoot(t *testing.T) {
 	if err := f.core.ReserveRemoteRun(f.ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: epoch.Add(time.Minute)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: epoch.Add(time.Minute)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	last, err := f.core.ResolveRemoteRun(f.ctx, a)
+	last, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
 	if err != nil || !last.Changed || !last.LastForRoot || !last.RootFound || last.RootFinishedAt.IsZero() {
 		t.Fatalf("last cut=%+v %v", last, err)
 	}
@@ -302,7 +306,11 @@ func TestResolveRemoteRunReportsCancellationVersusActualDurableEffect(t *testing
 		done := make(chan struct{})
 		var result model.RemoteRunResolveResult
 		var err error
-		go func() { <-start; result, err = f.core.ResolveRemoteRun(ctx, link); close(done) }()
+		go func() {
+			<-start
+			result, err = f.core.ResolveRemoteRun(ctx, link, model.RunRetentionPolicy{})
+			close(done)
+		}()
 		close(start)
 		if i%2 == 0 {
 			cancel()
@@ -325,7 +333,7 @@ func TestResolveRemoteRunReportsCancellationVersusActualDurableEffect(t *testing
 			if errCode(err) != "cancelled" || result != (model.RemoteRunResolveResult{}) || !pending {
 				t.Fatalf("canceled request changed relation or returned facts: %+v pending=%v err=%v", result, pending, err)
 			}
-			if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+			if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -344,7 +352,7 @@ func TestResolveRemoteRunOneIntentReturnsOwnershipToBaseline(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := stats(t, f)
-	result, err := f.core.ResolveRemoteRun(f.ctx, link)
+	result, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForRoot || !result.RootFound {
 		t.Fatalf("one resolution=%+v %v", result, err)
 	}
@@ -367,7 +375,7 @@ func TestResolveRemoteRunRacesNewReservationWithoutLosingProtection(t *testing.T
 			t.Fatal(err)
 		}
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: epoch.Add(time.Minute)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: epoch.Add(time.Minute)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	for i := range 8 {
@@ -381,7 +389,11 @@ func TestResolveRemoteRunRacesNewReservationWithoutLosingProtection(t *testing.T
 		var resolved model.RemoteRunResolveResult
 		var resolveErr, reserveErr error
 		wg.Add(2)
-		go func() { defer wg.Done(); <-start; resolved, resolveErr = f.core.ResolveRemoteRun(f.ctx, a) }()
+		go func() {
+			defer wg.Done()
+			<-start
+			resolved, resolveErr = f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
+		}()
 		go func() { defer wg.Done(); <-start; reserveErr = f.core.ReserveRemoteRun(f.ctx, b) }()
 		close(start)
 		wg.Wait()
@@ -394,7 +406,7 @@ func TestResolveRemoteRunRacesNewReservationWithoutLosingProtection(t *testing.T
 		if pending, err := f.core.HasPendingRemoteRoot(f.ctx, "root"); err != nil || !pending {
 			t.Fatalf("new reservation not protected: %v %v", pending, err)
 		}
-		if _, err := f.core.ResolveRemoteRun(f.ctx, b); err != nil {
+		if _, err := f.core.ResolveRemoteRun(f.ctx, b, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
 	}

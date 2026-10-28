@@ -34,83 +34,113 @@ func remoteLinkBytes(link model.RemoteRunLink) (int64, error) {
 // ReserveRemoteRun precedes a remote Start. A later reservation may bind an
 // initially unknown boot exactly once; a retry never removes that binding.
 func (s *Store) ReserveRemoteRun(ctx context.Context, link model.RemoteRunLink) error {
-	return s.changeRemoteRun(ctx, link, false)
+	return s.reserveRemoteRun(ctx, link)
 }
 
 // ResolveRemoteRun requires an exact terminal/joined or definitive unsent
 // identity. A Stop acceptance alone is not a reason to call it.
-func (s *Store) ResolveRemoteRun(ctx context.Context, link model.RemoteRunLink) (model.RemoteRunResolveResult, error) {
+func (s *Store) ResolveRemoteRun(ctx context.Context, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
 	if err := validateRemoteLink(link); err != nil {
 		return model.RemoteRunResolveResult{}, err
 	}
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RemoteRunResolveResult{}, err
+	}
 	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.RemoteRunResolveResult, error) {
-		return resolveRemoteRun(ctx, tx, scope, link)
+		return resolveRemoteRunPolicy(ctx, tx, scope, link, policy)
 	})
 }
 
 func resolveRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink) (model.RemoteRunResolveResult, error) {
-	var remaining int
-	changed, err := changeRemoteRun(ctx, tx, scope, link, true, &remaining)
+	return resolveRemoteRunPolicy(ctx, tx, scope, link, model.RunRetentionPolicy{})
+}
+
+func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
+	var detail remoteRunChangeDetail
+	changed, err := changeRemoteRun(ctx, tx, scope, link, true, &detail)
 	if err != nil {
 		return model.RemoteRunResolveResult{}, err
 	}
 	result := model.RemoteRunResolveResult{RootRunID: link.RootRunID, Changed: changed}
-	if !changed || remaining > 0 {
+	if !changed || detail.remaining > 0 {
 		// Other relations of this owner necessarily share its validated root.
 		return result, nil
 	}
-	var rootFinished, ownerFinished sql.NullInt64
+	var rootFinished sql.NullInt64
 	err = tx.QueryRowContext(ctx, remoteRunLastResolutionQuery,
-		scope, link.RootRunID, link.RootRunID, link.OwnerRunID,
-		scope, link.OwnerRunID, scope, link.RootRunID).Scan(&rootFinished, &ownerFinished)
-	if errors.Is(err, sql.ErrNoRows) {
-		return result, nil
-	}
-	if err != nil {
+		scope, link.RootRunID, scope, link.RootRunID).Scan(&rootFinished)
+	last := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return model.RemoteRunResolveResult{}, err
 	}
-	result.LastForRoot = true
-	result.RootFound = rootFinished.Valid
-	result.RootFinishedAt = instant(rootFinished.Int64)
-	if link.OwnerRunID == link.RootRunID {
-		if !rootFinished.Valid {
-			return model.RemoteRunResolveResult{}, failure("data_loss", "remote owner disappeared during resolution")
+	if last {
+		result.LastForRoot = true
+		result.RootFound = rootFinished.Valid
+		result.RootFinishedAt = instant(rootFinished.Int64)
+		if link.OwnerRunID == link.RootRunID {
+			if !rootFinished.Valid {
+				return model.RemoteRunResolveResult{}, failure("data_loss", "remote owner disappeared during resolution")
+			}
 		}
-		result.OwnerFinishedAt = result.RootFinishedAt
-	} else {
-		if !ownerFinished.Valid {
-			return model.RemoteRunResolveResult{}, failure("data_loss", "remote owner disappeared during resolution")
-		}
-		result.OwnerFinishedAt = instant(ownerFinished.Int64)
+		result.OwnerFinishedAt = instant(detail.ownerFinishedAt)
+	}
+	var cut retentionChanges
+	if detail.ownerFinishedAt > 0 {
+		cut.touch(link.OwnerRunID)
+	}
+	if last && rootFinished.Valid && rootFinished.Int64 > 0 {
+		cut.touch(link.RootRunID)
+	}
+	if err = cut.finish(ctx, tx, scope); err != nil {
+		return model.RemoteRunResolveResult{}, err
+	}
+	result.Retention, err = retentionEffect(ctx, tx, scope, &cut, policy)
+	if err != nil {
+		return model.RemoteRunResolveResult{}, err
 	}
 	return result, nil
 }
 
-// A row is returned only for the final root relation. Both finish times come
-// from keyed rows in this same transaction, without reading Run payloads.
+// A row is returned only for the final root relation. The owner's finish time
+// was already selected while validating the exact relation in this transaction.
 const remoteRunLastResolutionQuery = `SELECT
- (SELECT finished_at FROM runs WHERE scope=? AND id=?),
- CASE WHEN ?=? THEN NULL ELSE (SELECT finished_at FROM runs WHERE scope=? AND id=?) END
+ (SELECT finished_at FROM runs WHERE scope=? AND id=?)
  WHERE NOT EXISTS (SELECT 1 FROM run_remote_pending INDEXED BY run_remote_pending_root WHERE scope=? AND root_run_id=?)`
 
-func (s *Store) changeRemoteRun(ctx context.Context, link model.RemoteRunLink, resolve bool) error {
+func (s *Store) reserveRemoteRun(ctx context.Context, link model.RemoteRunLink) error {
 	if err := validateRemoteLink(link); err != nil {
 		return err
 	}
 	_, err := write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (bool, error) {
-		return changeRemoteRun(ctx, tx, scope, link, resolve, nil)
+		var detail remoteRunChangeDetail
+		changed, e := changeRemoteRun(ctx, tx, scope, link, false, &detail)
+		if e != nil || !detail.inserted || !detail.firstOwnerRelation || link.OwnerRunID == link.RootRunID {
+			return changed, e
+		}
+		var cut retentionChanges
+		if e = cut.invalidateRemoteRoot(ctx, tx, scope, link.RootRunID); e != nil {
+			return false, e
+		}
+		return changed, cut.finish(ctx, tx, scope)
 	})
 	return err
 }
 
-func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, resolve bool, remaining *int) (bool, error) {
+type remoteRunChangeDetail struct {
+	remaining          int
+	ownerFinishedAt    int64
+	inserted           bool
+	firstOwnerRelation bool
+}
+
+func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, resolve bool, detail *remoteRunChangeDetail) (bool, error) {
 	if err := validateRemoteLink(link); err != nil {
 		return false, err
 	}
 	var root, target, status string
 	var count int
-	var total int64
-	err := tx.QueryRowContext(ctx, `SELECT root_run_id,target_id,status,pending_remote_count,pending_remote_bytes FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID).Scan(&root, &target, &status, &count, &total)
+	var total, finishedAt, sessionBytes int64
+	err := tx.QueryRowContext(ctx, `SELECT root_run_id,target_id,status,pending_remote_count,pending_remote_bytes,finished_at,length(CAST(session_id AS BLOB)) FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID).Scan(&root, &target, &status, &count, &total, &finishedAt, &sessionBytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, failure("not_found", "remote control owner is unavailable")
 	}
@@ -152,12 +182,13 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 			if _, err = tx.ExecContext(ctx, `DELETE FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`, scope, link.OwnerRunID, link.TargetID, link.RunID); err != nil {
 				return false, err
 			}
-			if err = release(ctx, tx, scope, 1, logical+rowOverhead); err != nil {
+			charged := logical + rowOverhead + sessionBytes
+			if err = release(ctx, tx, scope, 1, charged); err != nil {
 				return false, err
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes-? WHERE scope=? AND id=?`, count-1, total-logical, logical+rowOverhead, scope, link.OwnerRunID)
-			if err == nil && remaining != nil {
-				*remaining = count - 1
+			_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes-? WHERE scope=? AND id=?`, count-1, total-logical, charged, scope, link.OwnerRunID)
+			if err == nil && detail != nil {
+				detail.remaining, detail.ownerFinishedAt = count-1, finishedAt
 			}
 			return true, err
 		}
@@ -198,13 +229,24 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 	if count == model.MaxRemoteRunLinks || total+logical > model.MaxRemoteRunLinksBytes {
 		return false, failure("resource_exhausted", "remote control owner capacity reached")
 	}
-	if err = reserve(ctx, tx, scope, 1, logical+rowOverhead); err != nil {
+	charged := logical + rowOverhead + sessionBytes
+	if err = reserve(ctx, tx, scope, 1, charged); err != nil {
 		return false, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO run_remote_pending(scope,owner_run_id,root_run_id,target_id,child_run_id,call_node_id,boot_id,encoded_bytes) VALUES(?,?,?,?,?,?,?,?)`, scope, link.OwnerRunID, link.RootRunID, link.TargetID, link.RunID, link.CallNodeID, link.BootID, encoded); err != nil {
+	inserted, err := tx.ExecContext(ctx, `INSERT INTO run_remote_pending(scope,owner_run_id,root_run_id,target_id,child_run_id,call_node_id,boot_id,encoded_bytes,owner_session_id) SELECT ?,?,?,?,?,?,?,?,session_id FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID, link.RootRunID, link.TargetID, link.RunID, link.CallNodeID, link.BootID, encoded, scope, link.OwnerRunID)
+	if err != nil {
 		return false, err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes+? WHERE scope=? AND id=?`, count+1, total+logical, logical+rowOverhead, scope, link.OwnerRunID)
+	if n, e := inserted.RowsAffected(); e != nil {
+		return false, e
+	} else if n != 1 {
+		return false, failure("data_loss", "remote owner disappeared during reservation")
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes+? WHERE scope=? AND id=?`, count+1, total+logical, charged, scope, link.OwnerRunID)
+	if err == nil && detail != nil {
+		detail.inserted = true
+		detail.firstOwnerRelation = count == 0
+	}
 	return true, err
 }
 

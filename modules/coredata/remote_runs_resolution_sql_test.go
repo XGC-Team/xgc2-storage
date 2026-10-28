@@ -91,7 +91,7 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 			}
 			bytesByPopulation[trial][i] = rec.bytes
 		}
-		plans, err := db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+remoteRunLastResolutionQuery, testScope, "root", "root", "owner-b", testScope, "owner-b", testScope, "root")
+		plans, err := db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+remoteRunLastResolutionQuery, testScope, "root", testScope, "root")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -194,14 +194,10 @@ func TestRemoteResolutionSameRootOwnerDoesNotReadFinishTwice(t *testing.T) {
 	}
 	for _, owner := range []string{"root", "owner"} {
 		rec.statements, rec.bytes = nil, 0
-		var rootAt, ownerAt sql.NullInt64
-		err = db.QueryRowContext(ctx, remoteRunLastResolutionQuery, testScope, "root", "root", owner, testScope, owner, testScope, "root").Scan(&rootAt, &ownerAt)
-		wantBytes := 16
-		if owner == "root" {
-			wantBytes = 8
-		}
-		if err != nil || !rootAt.Valid || ownerAt.Valid != (owner != "root") || rec.bytes != wantBytes || len(rec.statements) != 1 {
-			t.Fatalf("owner=%s root=%+v owner=%+v bytes=%d statements=%d err=%v", owner, rootAt, ownerAt, rec.bytes, len(rec.statements), err)
+		var rootAt sql.NullInt64
+		err = db.QueryRowContext(ctx, remoteRunLastResolutionQuery, testScope, "root", testScope, "root").Scan(&rootAt)
+		if err != nil || !rootAt.Valid || rec.bytes != 8 || len(rec.statements) != 1 {
+			t.Fatalf("owner=%s root=%+v bytes=%d statements=%d err=%v", owner, rootAt, rec.bytes, len(rec.statements), err)
 		}
 	}
 }

@@ -15,7 +15,7 @@ import (
 
 // The batch and direct paths use the same SQLite transaction and finish
 // helper. Count actual driver-returned values, including every SELECT.
-func TestBatchFinishDriverReadsOnlyStatusOnChangedRun(t *testing.T) {
+func TestBatchFinishDriverReadsOnlyThinFactsOnChangedRun(t *testing.T) {
 	rec := &headerSQLRecorder{}
 	dsn := "file:" + filepath.Join(t.TempDir(), "finish.db") + "?_pragma=foreign_keys(1)"
 	db := sql.OpenDB(headerCountingConnector{dsn: dsn, rec: rec})
@@ -69,12 +69,12 @@ func TestBatchFinishDriverReadsOnlyStatusOnChangedRun(t *testing.T) {
 		if err = tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		if len(rec.statements) != 1 || rec.statements[0] != "SELECT status FROM runs WHERE scope=? AND id=?" {
+		if len(rec.statements) != 2 || rec.statements[0] != "SELECT status,root_run_id FROM runs WHERE scope=? AND id=?" || !strings.Contains(rec.statements[1], "RETURNING retention_eligible,predecessor_run_id") {
 			t.Fatalf("changed batch selected detail: %q", rec.statements)
 		}
 		selected = append(selected, rec.bytes)
 	}
-	if selected[0] != len(model.RunQueued) || selected[1] != selected[0] {
+	if selected[0] != len(model.RunQueued)+len("small")+8 || selected[1] != selected[0] {
 		t.Fatalf("selected driver bytes small/large=%v", selected)
 	}
 	// The direct return and an exact replay actually need the stored detail.
@@ -97,7 +97,8 @@ func TestBatchFinishDriverReadsOnlyStatusOnChangedRun(t *testing.T) {
 		if err = tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		if len(rec.statements) != 2 || !strings.Contains(rec.statements[1], "inputs_json") || rec.bytes < 200<<10 {
+		last := len(rec.statements) - 1
+		if last < 1 || !strings.Contains(rec.statements[last], "SELECT ") || !strings.Contains(rec.statements[last], "inputs_json") || rec.bytes < 200<<10 {
 			t.Fatalf("%s did not read required detail: statements=%q bytes=%d", id, rec.statements, rec.bytes)
 		}
 	}

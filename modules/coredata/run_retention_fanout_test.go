@@ -26,8 +26,8 @@ func TestRootRetentionFanoutAcrossReopenAndProtectionChanges(t *testing.T) {
 		child := childRun(fmt.Sprintf("child-%03d", i), root.ID, root.ID, 1)
 		child.SessionID = old.ID
 		finish := model.RunFinish{ID: child.ID, Status: model.RunSucceeded, At: epoch.Add(time.Second + time.Duration(i))}
-		created, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{child}, nil, []model.RunFinish{finish})
-		if err != nil || len(created) != 1 || !created[0].Created {
+		created, err := f.core.ApplyRunOps(f.ctx, []model.NewRun{child}, nil, []model.RunFinish{finish}, model.RunRetentionPolicy{})
+		if err != nil || len(created.Created) != 1 || !created.Created[0].Created {
 			t.Fatalf("child %d: %+v %v", i, created, err)
 		}
 	}
@@ -42,7 +42,7 @@ func TestRootRetentionFanoutAcrossReopenAndProtectionChanges(t *testing.T) {
 	prune(0)
 	f.reopen(t)
 	prune(0)
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: root.ID, Status: model.RunSucceeded, At: epoch.Add(3 * time.Hour)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: root.ID, Status: model.RunSucceeded, At: epoch.Add(3 * time.Hour)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	prune(256)
@@ -61,10 +61,10 @@ func TestRootRetentionFanoutAcrossReopenAndProtectionChanges(t *testing.T) {
 	if _, err := f.core.RequestStop(f.ctx, old.ID, []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(4 * time.Hour)}); err != nil {
+	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(4 * time.Hour)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID); err != nil {
+	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	prune(1)

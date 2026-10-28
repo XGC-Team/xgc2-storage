@@ -220,7 +220,7 @@ func coreChild(t *testing.T, dir string) {
 		}
 		fmt.Printf("ACK running %s\n", id)
 		if i%3 == 0 {
-			if _, err = core.FinishRun(ctx, model.RunFinish{ID: id, Status: model.RunSucceeded, Result: json.RawMessage(`{"ok":true}`)}); err != nil {
+			if _, err = core.FinishRun(ctx, model.RunFinish{ID: id, Status: model.RunSucceeded, Result: json.RawMessage(`{"ok":true}`)}, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
 			}
 			fmt.Printf("ACK finished %s\n", id)
@@ -274,12 +274,12 @@ func TestFaultKilledProcessKeepsAcknowledgedRunFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Core's boot repair: whatever the dead process left open ends interrupted.
-	n, err := core.InterruptOpenRuns(deadline(t), time.Now())
-	if err != nil || n != len(open.Runs) {
-		t.Fatalf("boot repair interrupted %d, expected the %d open runs: %v", n, len(open.Runs), err)
+	n, err := core.InterruptOpenRuns(deadline(t), time.Now(), model.RunRetentionPolicy{})
+	if err != nil || n.Count != len(open.Runs) {
+		t.Fatalf("boot repair interrupted %d, expected the %d open runs: %v", n.Count, len(open.Runs), err)
 	}
 	if err = s.Integrity(deadline(t)); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("killed after %d acknowledgements: %d accepted, %d running, %d finished, %d interrupted at boot", len(lines), len(created), len(running), len(finished), n)
+	t.Logf("killed after %d acknowledgements: %d accepted, %d running, %d finished, %d interrupted at boot", len(lines), len(created), len(running), len(finished), n.Count)
 }

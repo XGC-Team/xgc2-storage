@@ -19,7 +19,7 @@ func TestRunExecutionOutcomeSurvivesStorageReopen(t *testing.T) {
 	}
 	result := json.RawMessage(`{"exact":9007199254740993,"data":"` + strings.Repeat("z", 1<<20) + `"}`)
 	nodes := json.RawMessage(`[{"id":"only-full-detail","data":"` + strings.Repeat("x", 1<<20) + `"}]`)
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: request.ID, Status: model.RunSucceeded, Result: result, Nodes: nodes}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: request.ID, Status: model.RunSucceeded, Result: result, Nodes: nodes}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	f.reopen(t)

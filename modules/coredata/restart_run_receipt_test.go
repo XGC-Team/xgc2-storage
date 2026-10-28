@@ -18,7 +18,7 @@ func TestRestartReceiptReadsOnlyAdmissionProofAndObservation(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, q); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunStopped, Error: []byte(`{"message":"closed"}`), Result: []byte(`{"value":42}`), Nodes: []byte(`[{"id":"one"}]`)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunStopped, Error: []byte(`{"message":"closed"}`), Result: []byte(`{"value":42}`), Nodes: []byte(`[{"id":"one"}]`)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.db.Write(f.ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {

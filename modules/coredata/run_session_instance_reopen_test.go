@@ -48,7 +48,7 @@ func TestSessionActionInstanceSelectorPersistsAndAccounts(t *testing.T) {
 	if gotRows != rows || gotBytes != bytes {
 		t.Fatal("rejected Session Action changed quota")
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, At: epoch}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, At: epoch}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	pruned, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})

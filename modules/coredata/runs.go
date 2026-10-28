@@ -246,6 +246,16 @@ func sessionInstanceFromTrigger(sessionID string, trigger []byte) (string, error
 }
 
 func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (model.Run, bool, error) {
+	r, created, err := createRunRaw(ctx, tx, scope, q)
+	if err != nil || !created {
+		return r, created, err
+	}
+	var cut retentionChanges
+	cut.created(r.ID, r.PredecessorRunID)
+	return r, created, cut.finish(ctx, tx, scope)
+}
+
+func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (model.Run, bool, error) {
 	if err := validateNewRun(&q); err != nil {
 		return model.Run{}, false, err
 	}
@@ -364,6 +374,21 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 // validating a terminal replay; reading it after a changed finish would fetch
 // and decode payloads the caller never requested.
 func finishRunWithDetail(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish, wantDetail bool) (model.Run, error) {
+	var cut retentionChanges
+	run, err := finishRunTransition(ctx, tx, scope, f, wantDetail, &cut, "", map[string]struct{}{f.ID: {}})
+	if err != nil {
+		return model.Run{}, err
+	}
+	if err = cut.finish(ctx, tx, scope); err != nil {
+		return model.Run{}, err
+	}
+	return run, nil
+}
+
+// planned contains only actual open successors of this Run which are also
+// being finished in this batch. A later invalid finish rolls the transaction
+// back. Replays are already non-open and cannot suppress a live guard.
+func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish, wantDetail bool, cut *retentionChanges, planned string, plannedSet map[string]struct{}) (model.Run, error) {
 	if !textKey(f.ID) || !f.Status.Terminal() || len(f.Termination) > 255 || strings.ContainsAny(f.Termination, "\x00\r\n") {
 		return model.Run{}, failure("invalid_argument", "a run identity, a terminal status and a short termination reason are required")
 	}
@@ -391,8 +416,8 @@ func finishRunWithDetail(ctx context.Context, tx *sql.Tx, scope string, f model.
 	if err != nil {
 		return model.Run{}, err
 	}
-	var current string
-	err = tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&current)
+	var current, rootID string
+	err = tx.QueryRowContext(ctx, "SELECT status,root_run_id FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&current, &rootID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return model.Run{}, failure("not_found", "run not found")
 	}
@@ -420,10 +445,21 @@ func finishRunWithDetail(ctx context.Context, tx *sql.Tx, scope string, f model.
 	if err = charge(ctx, tx, scope, 0, grown); err != nil {
 		return model.Run{}, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE runs SET status=?,termination=?,error_json=?,error_summary_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,cleanup_failed=?,finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status=?",
-		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current); err != nil {
+	var eligible int64
+	var predecessor, failedSession string
+	_, rootFinishes := plannedSet[rootID]
+	if err = tx.QueryRowContext(ctx, retentionFinish,
+		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current, rootFinishes, planned).Scan(&eligible, &predecessor, &failedSession); err != nil {
 		return model.Run{}, err
 	}
+	// A Session can outlive the display Run. Record the failure on that actual
+	// Session in the same transaction before the Run becomes prunable.
+	if failedSession != "" {
+		if _, err = tx.ExecContext(ctx, "UPDATE sessions SET failed_cleanup=1 WHERE scope=? AND id=? AND failed_cleanup=0", scope, failedSession); err != nil {
+			return model.Run{}, err
+		}
+	}
+	cut.finished(f.ID, predecessor, eligible)
 	if !wantDetail {
 		return model.Run{}, nil
 	}
@@ -582,28 +618,53 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 
 // The statements below are fixed text, so that the plan test can run them as written.
 const (
-	interruptOpen = "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')"
+	// All open roots and successors in this scope end in this same statement.
+	// Their old open state must not guard another row at the final cut.
+	bootLocal     = retentionPendingClear
+	interruptOpen = `UPDATE runs AS r SET status='interrupted',termination='interrupted',finished_at=?1,revision=revision+1,bytes=bytes+?2,
+ (retention_local_ok,retention_eligible)=(WITH local(value) AS MATERIALIZED (SELECT CASE WHEN ?1>0 THEN (` + bootLocal + `) ELSE 0 END) SELECT value,CASE WHEN value THEN (` + retentionSessionClear + `) ELSE 0 END FROM local)
+ WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible`
 
-	// A finished Run is only eligible for pruning when its root is finished too.
-	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
-	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
-	pruneOldest  = "SELECT finished_at FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at,id LIMIT 1"
-	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"
+	// Recheck all active guards before deletion. An absent root is not live.
+	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
+	pruneOldest     = "SELECT finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT 1"
+	pruneCandidates = "SELECT id,bytes,finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT ?"
 )
 
-func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Time) (int, error) {
-	result, err := tx.ExecContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope)
+func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Time, cut *retentionChanges) (int, error) {
+	rows, err := tx.QueryContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope)
 	if err != nil {
 		return 0, err
 	}
-	n, err := result.RowsAffected()
-	if err != nil || n == 0 {
+	n := 0
+	for rows.Next() {
+		var id, predecessor string
+		var eligible int64
+		if err = rows.Scan(&id, &predecessor, &eligible); err != nil {
+			break
+		}
+		cut.finished(id, predecessor, eligible)
+		n++
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	if e := rows.Close(); err == nil {
+		err = e
+	}
+	if err != nil {
 		return 0, err
 	}
-	return int(n), charge(ctx, tx, scope, 0, n*int64(len("interrupted")))
+	if n == 0 {
+		return 0, nil
+	}
+	return n, charge(ctx, tx, scope, 0, int64(n)*int64(len("interrupted")))
 }
 
 func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetention) (model.RunPruneResult, error) {
+	if err := validateRetentionPolicy(model.RunRetentionPolicy{OlderThan: r.OlderThan, KeepNewest: r.KeepNewest}); err != nil {
+		return model.RunPruneResult{}, err
+	}
 	limit := r.Limit
 	if limit == 0 {
 		limit = 1000
@@ -611,50 +672,70 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 	if limit < 0 || limit > 10000 || r.KeepNewest < 0 || (r.OlderThan.IsZero() && r.KeepNewest == 0) {
 		return model.RunPruneResult{}, failure("invalid_argument", "an age or count limit and a limit within 1..10000 are required")
 	}
+	var eligible int64
+	if err := tx.QueryRowContext(ctx, "SELECT coalesce((SELECT retention_eligible_count FROM core_data_usage WHERE scope=?),0)", scope).Scan(&eligible); err != nil {
+		return model.RunPruneResult{}, err
+	}
+	excess := int64(0)
+	if r.KeepNewest > 0 && eligible > int64(r.KeepNewest) {
+		excess = eligible - int64(r.KeepNewest)
+	}
 	type victim struct {
-		id    string
-		bytes int64
+		id              string
+		bytes, finished int64
 	}
 	var victims []victim
-	seen := map[string]bool{}
-	collect := func(query string, args ...any) error {
-		rows, err := tx.QueryContext(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var v victim
-			if err = rows.Scan(&v.id, &v.bytes); err != nil {
-				return err
-			}
-			if !seen[v.id] && len(victims) < limit {
-				seen[v.id] = true
-				victims = append(victims, v)
-			}
-		}
-		return rows.Err()
+	rows, err := tx.QueryContext(ctx, pruneCandidates, scope, limit)
+	if err != nil {
+		return model.RunPruneResult{}, err
 	}
-	if !r.OlderThan.IsZero() {
-		if err := collect(pruneByAge, scope, nanos(r.OlderThan), limit); err != nil {
-			return model.RunPruneResult{}, err
+	for rows.Next() {
+		var v victim
+		if err = rows.Scan(&v.id, &v.bytes, &v.finished); err != nil {
+			break
 		}
+		if int64(len(victims)) >= excess && (r.OlderThan.IsZero() || v.finished >= nanos(r.OlderThan)) {
+			break
+		}
+		victims = append(victims, v)
 	}
-	if r.KeepNewest > 0 && len(victims) < limit {
-		if err := collect(pruneByCount, scope, limit, r.KeepNewest); err != nil {
-			return model.RunPruneResult{}, err
-		}
+	if err == nil {
+		err = rows.Err()
+	}
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return model.RunPruneResult{}, err
 	}
 	var freed int64
 	for _, v := range victims {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM runs WHERE scope=? AND id=?", scope, v.id); err != nil {
+		// A stale or corrupt derived flag must never authorize a deletion.
+		deleted, err := tx.ExecContext(ctx, "DELETE FROM runs AS r WHERE "+eligibleRuns+" AND id=? AND retention_eligible=1", scope, v.id)
+		if err != nil {
 			return model.RunPruneResult{}, err
+		}
+		n, err := deleted.RowsAffected()
+		if err != nil {
+			return model.RunPruneResult{}, err
+		}
+		if n != 1 {
+			return model.RunPruneResult{}, failure("data_loss", "retention eligibility disagrees with protections")
 		}
 		freed += v.bytes
 	}
 	if len(victims) > 0 {
-		if err := release(ctx, tx, scope, int64(len(victims)), freed); err != nil {
+		count := int64(len(victims))
+		updated, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=rows-?,bytes=bytes-?,retention_eligible_count=retention_eligible_count-? WHERE scope=? AND rows>=? AND bytes>=? AND retention_eligible_count>=?", count, freed, count, scope, count, freed, count)
+		if err != nil {
 			return model.RunPruneResult{}, err
+		}
+		n, err := updated.RowsAffected()
+		if err != nil {
+			return model.RunPruneResult{}, err
+		}
+		if n != 1 {
+			return model.RunPruneResult{}, failure("data_loss", "retention quota disagrees")
 		}
 	}
 	result := model.RunPruneResult{Deleted: len(victims)}
@@ -663,6 +744,7 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 		return model.RunPruneResult{}, err
 	}
 	result.OldestEligibleFinishedAt = instant(oldest)
+	result.HasVictim = r.KeepNewest > 0 && eligible-int64(len(victims)) > int64(r.KeepNewest) || !r.OlderThan.IsZero() && oldest > 0 && oldest < nanos(r.OlderThan)
 	return result, nil
 }
 
@@ -696,56 +778,141 @@ func (s *Store) UpdateRunStatus(ctx context.Context, updates ...model.RunStatusU
 // FinishRun durably records how a Run ended. The same outcome returns the
 // stored Run and does not change the row, its revision, or its quota. A
 // different outcome is failed_precondition.
-func (s *Store) FinishRun(ctx context.Context, f model.RunFinish) (model.Run, error) {
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.Run, error) {
-		return finishRun(ctx, tx, scope, f)
+func (s *Store) FinishRun(ctx context.Context, f model.RunFinish, policy model.RunRetentionPolicy) (model.RunFinishResult, error) {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunFinishResult{}, err
+	}
+	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunFinishResult, error) {
+		var cut retentionChanges
+		run, err := finishRunTransition(ctx, tx, scope, f, true, &cut, "", map[string]struct{}{f.ID: {}})
+		if err != nil {
+			return model.RunFinishResult{}, err
+		}
+		if err = cut.finish(ctx, tx, scope); err != nil {
+			return model.RunFinishResult{}, err
+		}
+		effect, err := retentionEffect(ctx, tx, scope, &cut, policy)
+		return model.RunFinishResult{Run: run, Retention: effect}, err
 	})
+}
+
+// Expand the planned set once for a batch and retain only actual open
+// successor/predecessor pairs in that set. Each finish then checks only its
+// own relevant successor identities, not every unrelated planned ID.
+const plannedSuccessorQuery = `WITH planned(id) AS MATERIALIZED (SELECT value FROM json_each(?2))
+ SELECT r.id,r.predecessor_run_id FROM runs r
+ WHERE r.scope=?1 AND r.id IN (SELECT id FROM planned) AND r.finished_at=0
+ AND r.predecessor_run_id<>'' AND r.predecessor_run_id IN (SELECT id FROM planned)`
+
+func batchPlannedSuccessors(ctx context.Context, tx *sql.Tx, scope string, ids []string) (map[string]string, error) {
+	if len(ids) < 2 {
+		return nil, nil
+	}
+	encoded, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := tx.QueryContext(ctx, plannedSuccessorQuery, scope, string(encoded))
+	if err != nil {
+		return nil, err
+	}
+	groups := make(map[string][]string)
+	for rows.Next() {
+		var id, predecessor string
+		if err = rows.Scan(&id, &predecessor); err != nil {
+			break
+		}
+		groups[predecessor] = append(groups[predecessor], id)
+	}
+	if err == nil {
+		err = rows.Err()
+	}
+	if closeErr := rows.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(groups))
+	for predecessor, successors := range groups {
+		value, e := json.Marshal(successors)
+		if e != nil {
+			return nil, e
+		}
+		out[predecessor] = string(value)
+	}
+	return out, nil
 }
 
 // ApplyRunOps applies a batch of Run creations, open-status transitions and
 // terminal finishes in one transaction (creates, then updates, then finishes).
 // The transaction is Durable when creates or finishes is non-empty, and
 // Relaxed when only updates are present. An empty batch is a no-op.
-func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates []model.RunStatusUpdate, finishes []model.RunFinish) ([]model.CreatedRun, error) {
+func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates []model.RunStatusUpdate, finishes []model.RunFinish, policy model.RunRetentionPolicy) (model.RunOpsResult, error) {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunOpsResult{}, err
+	}
 	if len(creates)+len(updates)+len(finishes) > model.MaxPageSize {
-		return nil, failure("invalid_argument", "at most 1000 run operations per batch")
+		return model.RunOpsResult{}, failure("invalid_argument", "at most 1000 run operations per batch")
 	}
 	if len(creates)+len(updates)+len(finishes) == 0 {
-		return nil, nil
+		return model.RunOpsResult{}, nil
 	}
 	mode := engine.Relaxed
 	if len(creates) > 0 || len(finishes) > 0 {
 		mode = engine.Durable
 	}
 	created := make([]model.CreatedRun, 0, len(creates))
+	plannedIDs := make([]string, 0, len(finishes))
+	plannedSet := make(map[string]struct{}, len(finishes))
+	for _, f := range finishes {
+		if _, exists := plannedSet[f.ID]; !exists {
+			plannedIDs = append(plannedIDs, f.ID)
+			plannedSet[f.ID] = struct{}{}
+		}
+	}
+	var effect model.RunRetentionEffect
 	err := s.db.Write(ctx, mode, func(ctx context.Context, tx *sql.Tx) error {
 		created = created[:0]
+		var cut retentionChanges
 		for _, q := range creates {
-			run, ok, err := createRun(ctx, tx, s.scope, q)
+			run, ok, err := createRunRaw(ctx, tx, s.scope, q)
 			if err != nil {
 				return err
 			}
 			created = append(created, model.CreatedRun{Run: run, Created: ok})
+			if ok {
+				cut.created(run.ID, run.PredecessorRunID)
+			}
 		}
 		if len(updates) > 0 {
 			if err := updateRunStatuses(ctx, tx, s.scope, updates); err != nil {
 				return err
 			}
 		}
+		plannedSuccessors, err := batchPlannedSuccessors(ctx, tx, s.scope, plannedIDs)
+		if err != nil {
+			return err
+		}
 		for _, finish := range finishes {
-			if _, err := finishRunWithDetail(ctx, tx, s.scope, finish, false); err != nil {
+			if _, err := finishRunTransition(ctx, tx, s.scope, finish, false, &cut, plannedSuccessors[finish.ID], plannedSet); err != nil {
 				return err
 			}
 		}
-		return nil
+		if err := cut.finish(ctx, tx, s.scope); err != nil {
+			return err
+		}
+		var e error
+		effect, e = retentionEffect(ctx, tx, s.scope, &cut, policy)
+		return e
 	})
 	if err != nil {
-		return nil, err
+		return model.RunOpsResult{}, err
 	}
 	if len(creates) == 0 {
-		return nil, nil
+		created = nil
 	}
-	return created, nil
+	return model.RunOpsResult{Created: created, Retention: effect}, nil
 }
 
 func (s *Store) GetRun(ctx context.Context, id string) (model.Run, error) {
@@ -772,14 +939,26 @@ func (s *Store) FindRunByIdempotencyKey(ctx context.Context, key string) (run mo
 
 // InterruptOpenRuns ends every Run that a stopped Core left open. Core calls it
 // at boot, before it starts any Run, and no half-run graph resumes.
-func (s *Store) InterruptOpenRuns(ctx context.Context, at time.Time) (int, error) {
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (int, error) {
-		return interruptOpenRuns(ctx, tx, scope, at)
+func (s *Store) InterruptOpenRuns(ctx context.Context, at time.Time, policy model.RunRetentionPolicy) (model.RunInterruptResult, error) {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunInterruptResult{}, err
+	}
+	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunInterruptResult, error) {
+		var cut retentionChanges
+		count, err := interruptOpenRuns(ctx, tx, scope, at, &cut)
+		if err != nil {
+			return model.RunInterruptResult{}, err
+		}
+		if err = cut.finish(ctx, tx, scope); err != nil {
+			return model.RunInterruptResult{}, err
+		}
+		effect, err := retentionEffect(ctx, tx, scope, &cut, policy)
+		return model.RunInterruptResult{Count: count, Retention: effect}, err
 	})
 }
 
 // PruneRuns deletes finished Runs by age and count and frees their quota. It
-// is relaxed housekeeping; call it again while it returns the limit.
+// is relaxed housekeeping; continue only while HasVictim is true.
 func (s *Store) PruneRuns(ctx context.Context, r model.RunRetention) (model.RunPruneResult, error) {
 	return write(ctx, s, engine.Relaxed, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunPruneResult, error) {
 		return pruneRuns(ctx, tx, scope, r)

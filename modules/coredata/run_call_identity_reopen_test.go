@@ -16,7 +16,7 @@ func TestRunCallIdentitySurvivesStorageReopen(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, q); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, Result: json.RawMessage(`{"exact":true}`)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: q.ID, Status: model.RunSucceeded, Result: json.RawMessage(`{"exact":true}`)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	f.reopen(t)

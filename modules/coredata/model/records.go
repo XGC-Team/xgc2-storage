@@ -163,15 +163,53 @@ type RunPage struct {
 	Next string
 }
 
-// RunRetention selects finished Runs to delete. A Run whose root Run is still
-// open is kept, so a tree is never cut while it is live.
+// RunRetention selects eligible finished Runs to delete. A live root, pending
+// remote relation or live successor Run or queued successor Session protects
+// the relevant Run. A missing root is not a live root.
 type RunRetention struct {
 	// OlderThan deletes Runs that finished before it.
 	OlderThan time.Time
-	// KeepNewest deletes all but this many finished Runs, newest first (0: no count limit).
+	// KeepNewest keeps this many newest eligible Runs (0 disables the count policy).
+	// Count and age victims are deleted oldest first, ordered by finish time and ID.
 	KeepNewest int
-	// Limit bounds one call (default 1000, at most 10000); call again while it returns Limit.
+	// Limit bounds one call (default 1000, at most 10000).
 	Limit int
+}
+
+// RunRetentionPolicy is captured once at the mutation's committed cut. Zero
+// values disable the corresponding selector; a disabled policy needs no lookup.
+type RunRetentionPolicy struct {
+	OlderThan  time.Time `json:"olderThan,omitzero"`
+	KeepNewest int       `json:"keepNewest"`
+}
+
+// RunRetentionEffect is a same-transaction fact, not a promise about later
+// writes. A later prune always rechecks the authoritative protections.
+type RunRetentionEffect struct {
+	ChangedFinish       bool `json:"changedFinish"`
+	EligibilityReleased bool `json:"eligibilityReleased"`
+	HasVictim           bool `json:"hasVictim"`
+}
+
+type RunFinishResult struct {
+	Run       `json:"run"`
+	Retention RunRetentionEffect `json:"retention"`
+}
+type RunOpsResult struct {
+	Created   []CreatedRun       `json:"created"`
+	Retention RunRetentionEffect `json:"retention"`
+}
+type RunInterruptResult struct {
+	Count     int                `json:"count"`
+	Retention RunRetentionEffect `json:"retention"`
+}
+type SessionMutationResult struct {
+	Session   `json:"session"`
+	Retention RunRetentionEffect `json:"retention"`
+}
+type SessionInterruptResult struct {
+	Count     int                `json:"count"`
+	Retention RunRetentionEffect `json:"retention"`
 }
 
 type SessionStatus string
@@ -308,4 +346,6 @@ const (
 type RunPruneResult struct {
 	Deleted                  int
 	OldestEligibleFinishedAt time.Time
+	// HasVictim is the exact post-delete continuation for the supplied policy.
+	HasVictim bool
 }

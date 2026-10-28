@@ -126,7 +126,7 @@ func BenchmarkFinishRunDurable(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := core.FinishRun(ctx, model.RunFinish{ID: fmt.Sprint("run-", i), Status: model.RunSucceeded, Termination: "completed",
-			Result: []byte(`{"ok":true}`), Nodes: []byte(`[{"id":"a","status":"succeeded"},{"id":"b","status":"succeeded"},{"id":"c","status":"succeeded"}]`)}); err != nil {
+			Result: []byte(`{"ok":true}`), Nodes: []byte(`[{"id":"a","status":"succeeded"},{"id":"b","status":"succeeded"},{"id":"c","status":"succeeded"}]`)}, model.RunRetentionPolicy{}); err != nil {
 			b.Fatal(err)
 		}
 	}

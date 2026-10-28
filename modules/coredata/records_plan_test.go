@@ -73,9 +73,8 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 	add("failed runs", q, a, "runs_created", true)
 	add("run by idempotency key", "SELECT "+runColumns+" FROM runs WHERE scope=? AND "+byKey, []any{"s", "k"}, "runs_idempotency", false)
 	add("open runs at boot", interruptOpen, []any{1, 1, "s"}, "runs_open", false)
-	add("next eligible expiry", pruneOldest, []any{"s"}, "runs_finished", true)
-	add("prune by age", pruneByAge, []any{"s", 5, 10}, "runs_finished", true)
-	add("prune by count", pruneByCount, []any{"s", 10, 5}, "runs_finished", true)
+	add("next eligible expiry", pruneOldest, []any{"s"}, "runs_retention_eligible", true)
+	add("prune candidates", pruneCandidates, []any{"s", 10}, "runs_retention_eligible", true)
 
 	q, a = sessions(model.SessionFilter{})
 	add("sessions, newest first", q, a, "sessions_opened", true)
@@ -84,6 +83,9 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 	q, a = sessions(model.SessionFilter{ExperimentResourceID: "e"})
 	add("sessions of an experiment", q, a, "sessions_experiment", true)
 	add("live session of a target", liveSessionOfTarget, []any{"s", "t"}, "sessions_live_target", false)
+	add("queued Session boot keys", queuedSessionBootKeys, []any{"s"}, "sessions_restart_queued_target", false)
+	add("queued Session boot interruption", interruptQueuedSessions, []any{1, "s"}, "sessions_restart_queued_target", false)
+	add("live Session boot interruption", interruptLiveSessions, []any{1, "s"}, "sessions_live_target", false)
 
 	q, a = recordings(model.RecordingFilter{})
 	add("recordings, oldest first", q, a, "recordings_created", true)
@@ -109,7 +111,11 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 			detail += step + "; "
 		}
 		rows.Close()
-		if strings.Contains(detail, "SCAN ") || !strings.Contains(detail, c.index) || (c.ordered && strings.Contains(detail, "TEMP B-TREE")) {
+		// Boot materializes one correlated scalar named local; this is not a
+		// table traversal. Actual table scans still fail this assertion.
+		tablePlan := strings.ReplaceAll(detail, "SCAN local", "READ local scalar")
+		tablePlan = strings.ReplaceAll(tablePlan, "SCAN CONSTANT ROW", "READ constant row")
+		if strings.Contains(tablePlan, "SCAN ") || !strings.Contains(detail, c.index) || (c.ordered && strings.Contains(detail, "TEMP B-TREE")) {
 			t.Errorf("%s: unexpected plan: %s", name, detail)
 		}
 	}

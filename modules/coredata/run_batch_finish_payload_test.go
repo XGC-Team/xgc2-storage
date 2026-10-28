@@ -18,7 +18,7 @@ func TestBatchFinishDoesNotReadExistingRunPayload(t *testing.T) {
 		f.exec(t, "UPDATE runs SET inputs_json=? WHERE id=?", []byte("not a gzip stream"), id)
 	}
 	finish := model.RunFinish{ID: "batch", Status: model.RunSucceeded, Result: []byte(`{"ok":true}`)}
-	if _, err := f.core.ApplyRunOps(f.ctx, nil, nil, []model.RunFinish{finish}); err != nil {
+	if _, err := f.core.ApplyRunOps(f.ctx, nil, nil, []model.RunFinish{finish}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatalf("changed batch selected an unneeded existing payload: %v", err)
 	}
 	var status string
@@ -31,10 +31,10 @@ func TestBatchFinishDoesNotReadExistingRunPayload(t *testing.T) {
 	if _, err := f.core.GetRun(f.ctx, finish.ID); errCode(err) != "data_loss" {
 		t.Fatalf("full read did not reject corrupt payload: %v", err)
 	}
-	if _, err := f.core.ApplyRunOps(f.ctx, nil, nil, []model.RunFinish{finish}); errCode(err) != "data_loss" {
+	if _, err := f.core.ApplyRunOps(f.ctx, nil, nil, []model.RunFinish{finish}, model.RunRetentionPolicy{}); errCode(err) != "data_loss" {
 		t.Fatalf("replay did not validate stored outcome and payload: %v", err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "direct", Status: model.RunSucceeded}); errCode(err) != "data_loss" {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "direct", Status: model.RunSucceeded}, model.RunRetentionPolicy{}); errCode(err) != "data_loss" {
 		t.Fatalf("direct result did not reject corrupt payload: %v", err)
 	}
 	if err := f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {

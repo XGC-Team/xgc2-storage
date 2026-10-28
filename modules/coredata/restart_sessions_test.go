@@ -22,7 +22,7 @@ func TestRestartSessionReservationPromotionAndRemoteRetention(t *testing.T) {
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: run.ID, Status: model.RunStopped, At: epoch.Add(time.Second)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: run.ID, Status: model.RunStopped, At: epoch.Add(time.Second)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	next := model.NewSession{ID: "next", TargetID: "local", PredecessorSessionID: old.ID, ExperimentResourceID: "experiment", ExperimentCommitID: "frozen-next", RunMode: "simulation", At: epoch.Add(time.Second)}
@@ -36,26 +36,26 @@ func TestRestartSessionReservationPromotionAndRemoteRetention(t *testing.T) {
 	if err != nil || created || winner.ID != next.ID {
 		t.Fatalf("single winner: %+v %t %v", winner, created, err)
 	}
-	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID); errCode(err) != "failed_precondition" {
+	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("premature promotion: %v", err)
 	}
 	if _, err = f.core.RequestStop(f.ctx, old.ID, []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(2 * time.Second)}); err != nil {
+	if _, err = f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(2 * time.Second)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	pruned, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour), Limit: 100})
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatalf("queued dependency pruned: %+v %v", pruned, err)
 	}
-	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID); errCode(err) != "failed_precondition" {
+	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("pending remote promoted: %v", err)
 	}
-	if _, err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	active, err := f.core.ActivateRestartSession(f.ctx, next.ID)
+	active, err := f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{})
 	if err != nil || active.Status != model.SessionOpen || active.PredecessorSessionID != old.ID || active.ExperimentCommitID != "frozen-next" {
 		t.Fatalf("active: %+v %v", active, err)
 	}
@@ -76,8 +76,8 @@ func TestRestartSessionCancelAndBootInterruption(t *testing.T) {
 	if _, _, err := f.core.QueueRestartSession(f.ctx, q); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := f.core.CloseOpenSessions(f.ctx, epoch); err != nil || n != 2 {
-		t.Fatalf("boot: %d %v", n, err)
+	if n, err := f.core.CloseOpenSessions(f.ctx, epoch, model.RunRetentionPolicy{}); err != nil || n.Count != 2 {
+		t.Fatalf("boot: %d %v", n.Count, err)
 	}
 	got, err := f.core.GetSession(f.ctx, "queued")
 	if err != nil || got.Status != model.SessionInterrupted || got.PredecessorSessionID != "old" {
@@ -96,7 +96,7 @@ func TestRestartSessionRejectsFailedPredecessorCleanup(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, run); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: run.ID, Status: model.RunStopped, CleanupErrors: []byte(`[{"message":"teardown failed"}]`)}); err != nil {
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: run.ID, Status: model.RunStopped, CleanupErrors: []byte(`[{"message":"teardown failed"}]`)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	next := old
@@ -108,10 +108,10 @@ func TestRestartSessionRejectsFailedPredecessorCleanup(t *testing.T) {
 	if _, err := f.core.RequestStop(f.ctx, old.ID, []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped}); err != nil {
+	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID); errCode(err) != "failed_precondition" {
+	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("dirty Session promoted: %v", err)
 	}
 }
