@@ -179,11 +179,8 @@ func TestEngineEpochTwoIsRefusedWithoutIndexBackfill(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.Create = false
-	for _, noMigrate := range []bool{false, true} {
-		config.NoMigrate = noMigrate
-		if opened, err := Open(budget(t), config); code(err) != "failed_precondition" || opened != nil {
-			t.Fatalf("older engine was implicitly converted: %v", err)
-		}
+	if opened, err := Open(budget(t), config); code(err) != "failed_precondition" || opened != nil {
+		t.Fatalf("older engine was implicitly converted: %v", err)
 	}
 	raw, err := sql.Open("sqlite", "file:"+config.Path+"?_pragma=query_only(1)")
 	if err != nil {

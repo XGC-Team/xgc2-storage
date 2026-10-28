@@ -61,9 +61,8 @@ func run() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	// The administrator never migrates: an older schema is migrated by the
-	// owning application, after its own backup.
-	store, e := engine.Open(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled(), MaxDBBytes: maxDBBytes, NoMigrate: true})
+	// Administration admits the current stored schema without conversion.
+	store, e := engine.Open(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled(), MaxDBBytes: maxDBBytes})
 	if e != nil {
 		return e
 	}

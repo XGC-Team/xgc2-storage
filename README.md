@@ -1,6 +1,6 @@
 # xgc2-storage
 
-Storage owns persistence for XGC2: SQLite connections, schema, migrations, transactions,
+Storage owns persistence for XGC2: SQLite connections, current schema, transactions,
 durability, maintenance, backup and recovery. It is a **Go library first**. Core embeds it and
 calls typed Go functions; there is no daemon in front of Core and nothing to start before it.
 For processes that cannot embed it, the same owner can be exposed over XRPC (HTTP and gRPC on
@@ -106,9 +106,9 @@ The embedded host admits the current schema only. Older and newer databases are
 refused before serving or changing accepted facts. Core data ships no historic
 decoder or migrator. Fresh development storage is initialized explicitly; opening
 an existing store never deletes its history or unresolved remote ownership.
-The low-level engine retains its generic module migration API for independently
-embedded modules; the product host disables that path. The manifest controls
-current collections, limits and indexes, not permission to convert old schemas.
+The engine requires current schema markers for every declared module and does not
+convert historical layouts. The manifest controls current collections, limits and
+indexes, not permission to convert old schemas.
 
 Run observations read write-derived bounded source and error metadata plus an
 exact cleanup count from the same row. The execution owner supplies source meaning
@@ -150,7 +150,7 @@ verified backup file; there is no tool that edits a live WAL.
 ## Build and test
 
 ```sh
-go vet ./... && go test -p 3 ./...               # unit, migration, quota, concurrency, crash and daemon tests
+go vet ./... && go test -p 3 ./...               # unit, admission, quota, concurrency, crash and daemon tests
 go test -p 3 -race ./engine ./modules/... ./host # race detector (needs cgo)
 go test -run '^$' -bench . ./engine ./modules/coredata   # STORAGE_BENCH_DIR=<dir> picks the filesystem
 CGO_ENABLED=0 go build -o build/xgc2-storage ./cmd/xgc2-storage

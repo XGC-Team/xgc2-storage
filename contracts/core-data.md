@@ -133,8 +133,8 @@ An empty page with a nonempty advancing cursor is legitimate. Each owner holds a
 
 The Core data schema is version10 and is the only admitted layout. No Core legacy probe,
 historical decoder or migration ships. Older/newer stores fail closed without changing
-accepted data or creating a migration backup. The embedding product host disables even
-the engine's optional generic migration path. Development storage is initialized explicitly;
+accepted data or creating a migration backup. The engine also admits current schemas only.
+Development storage is initialized explicitly;
 normal startup never clears history or unresolved remote relations.
 
 Source/error observations are derived at the existing write boundary and kept on the same

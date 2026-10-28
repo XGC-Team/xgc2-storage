@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -14,8 +15,8 @@ import (
 )
 
 // toy is a minimal data module with a configurable schema version.
-func toy(version int, migrations ...Migration) Module {
-	return Module{ID: "toy", Version: version, Migrations: migrations, Install: func(ctx context.Context, tx *sql.Tx) error {
+func toy(version int) Module {
+	return Module{ID: "toy", Version: version, Install: func(ctx context.Context, tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, "CREATE TABLE toy_items(id INTEGER PRIMARY KEY,name TEXT NOT NULL)")
 		if err == nil && version > 1 {
 			_, err = tx.ExecContext(ctx, "ALTER TABLE toy_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0")
@@ -109,111 +110,55 @@ func TestNewerSchemaIsRefusedWithAClearError(t *testing.T) {
 	}
 }
 
-func TestOlderSchemaMigratesInOneTransactionAfterABackup(t *testing.T) {
-	ctx := budget(t)
-	config := toyConfig(t, true, "", toy(1))
-	s, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exec(t, s, "INSERT INTO toy_items(name) VALUES('one'),('two')")
-	s.Close()
-
-	steps := 0
-	migrate := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx, _ []string) error {
-		steps++
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE toy_items ADD COLUMN size INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, "UPDATE toy_items SET size=length(name)")
-		return err
-	}}
-	config.Create, config.Modules = false, []Module{toy(2, migrate)}
-	s, err = Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if steps != 1 || versionOf(t, s, "toy") != 2 || countRows(t, s, "SELECT sum(size) FROM toy_items") != 6 {
-		t.Fatalf("migration did not apply once: steps=%d", steps)
-	}
-	s.Close()
-	backups, _ := filepath.Glob(config.Path + ".before-*")
-	if len(backups) != 1 {
-		t.Fatalf("expected one pre-migration backup, got %v", backups)
-	}
-	info, err := os.Stat(backups[0])
-	if err != nil || info.Mode().Perm() != 0600 {
-		t.Fatalf("backup must be private: %v %v", info, err)
-	}
-	// The backup is the old schema, restorable by copying the file back.
-	old, err := sql.Open("sqlite", "file:"+backups[0]+"?mode=ro&immutable=1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer old.Close()
-	var version, rows int
-	if err = old.QueryRow("SELECT version FROM schema_versions WHERE module='toy'").Scan(&version); err != nil || version != 1 {
-		t.Fatalf("backup is not the old schema: %d %v", version, err)
-	}
-	if err = old.QueryRow("SELECT count(*) FROM toy_items").Scan(&rows); err != nil || rows != 2 {
-		t.Fatalf("backup lost data: %d %v", rows, err)
+func TestNoncurrentModuleVersionIsRefusedWithoutChangingFacts(t *testing.T) {
+	for _, mode := range []string{"missing", "older", "newer"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := budget(t)
+			config := toyConfig(t, true, "", toy(2))
+			s, err := Open(ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec(t, s, "INSERT INTO toy_items(name) VALUES('kept')")
+			switch mode {
+			case "missing":
+				exec(t, s, "DELETE FROM schema_versions WHERE module='toy'")
+			case "older":
+				exec(t, s, "UPDATE schema_versions SET version=1 WHERE module='toy'")
+			case "newer":
+				exec(t, s, "UPDATE schema_versions SET version=3 WHERE module='toy'")
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(config.Path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			called := false
+			module := toy(2)
+			module.Install = func(context.Context, *sql.Tx) error { called = true; return errors.New("installer called on reopen") }
+			config.Create, config.Modules = false, []Module{module}
+			opened, err := Open(ctx, config)
+			if opened != nil {
+				opened.Close()
+				t.Fatal("noncurrent module admitted")
+			}
+			if code(err) != "failed_precondition" || !strings.Contains(err.Error(), "toy") || called {
+				t.Fatalf("%s admission=%v installer=%v", mode, err, called)
+			}
+			after, err := os.ReadFile(config.Path)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("%s refusal changed accepted facts: %v", mode, err)
+			}
+			if backups, _ := filepath.Glob(config.Path + ".before-*"); len(backups) != 0 {
+				t.Fatalf("%s refusal created backup: %v", mode, backups)
+			}
+		})
 	}
 }
 
-func TestFailedMigrationLeavesTheDatabaseUntouched(t *testing.T) {
-	ctx := budget(t)
-	config := toyConfig(t, true, "", toy(1))
-	s, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	exec(t, s, "INSERT INTO toy_items(name) VALUES('one')")
-	s.Close()
-	broken := Migration{From: 1, Apply: func(ctx context.Context, tx *sql.Tx, _ []string) error {
-		if _, err := tx.ExecContext(ctx, "DROP TABLE toy_items"); err != nil {
-			return err
-		}
-		return errors.New("late failure")
-	}}
-	config.Create, config.Modules = false, []Module{toy(2, broken)}
-	if _, err = Open(ctx, config); err == nil || !strings.Contains(err.Error(), "late failure") {
-		t.Fatalf("broken migration: %v", err)
-	}
-	// The owner lock was released and the old schema still opens with its data.
-	config.Modules = []Module{toy(1)}
-	s, err = Open(ctx, config)
-	if err != nil {
-		t.Fatalf("database damaged by a failed migration: %v", err)
-	}
-	defer s.Close()
-	if countRows(t, s, "SELECT count(*) FROM toy_items") != 1 || versionOf(t, s, "toy") != 1 {
-		t.Fatal("failed migration was partially applied")
-	}
-}
-
-func TestNoMigrateRefusesAnOlderSchema(t *testing.T) {
-	ctx := budget(t)
-	config := toyConfig(t, true, "", toy(1))
-	s, err := Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-	config.Create, config.NoMigrate = false, true
-	config.Modules = []Module{toy(2, Migration{From: 1, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})}
-	if _, err = Open(ctx, config); code(err) != "failed_precondition" || !strings.Contains(err.Error(), "older") {
-		t.Fatalf("read-only administration migrated or failed unclearly: %v", err)
-	}
-	// An unchanged schema still opens for administration.
-	config.Modules = []Module{toy(1)}
-	s, err = Open(ctx, config)
-	if err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
-}
-
-func TestAModuleAddedToAnExistingDatabaseIsInstalled(t *testing.T) {
+func TestAddingAModuleOnReopenRequiresExplicitCurrentCreation(t *testing.T) {
 	ctx := budget(t)
 	plain := Config{Path: filepath.Join(t.TempDir(), "plain.db"), Create: true, Manifest: manifest()}
 	os.Chmod(filepath.Dir(plain.Path), 0700)
@@ -221,40 +166,45 @@ func TestAModuleAddedToAnExistingDatabaseIsInstalled(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Close()
-	plain.Create, plain.Manifest, plain.Modules = false, toyManifest(), []Module{toy(1)}
-	s, err = Open(ctx, plain)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(plain.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	exec(t, s, "INSERT INTO toy_items(name) VALUES('x')")
-	if versionOf(t, s, "toy") != 1 {
-		t.Fatal("module version not recorded")
+	called := false
+	module := toy(1)
+	module.Install = func(context.Context, *sql.Tx) error { called = true; return errors.New("installer called on reopen") }
+	plain.Create, plain.Manifest, plain.Modules = false, toyManifest(), []Module{module}
+	opened, err := Open(ctx, plain)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("missing module marker was admitted")
 	}
-	// A namespace naming a module this binary does not contain is refused.
-	s.Close()
+	if code(err) != "failed_precondition" || called {
+		t.Fatalf("missing module admission=%v installer=%v", err, called)
+	}
+	after, err := os.ReadFile(plain.Path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("refused module changed database: %v", err)
+	}
+	if backups, _ := filepath.Glob(plain.Path + ".before-*"); len(backups) != 0 {
+		t.Fatalf("refusal created backup: %v", backups)
+	}
+	// A namespace cannot name a module absent from the compiled owner.
 	plain.Modules = nil
-	if _, err = Open(ctx, plain); code(err) != "failed_precondition" {
+	opened, err = Open(ctx, plain)
+	if opened != nil {
+		opened.Close()
+		t.Fatal("missing compiled module was admitted")
+	}
+	if code(err) != "failed_precondition" || !strings.Contains(err.Error(), "not compiled") {
 		t.Fatalf("missing compiled module: %v", err)
 	}
 }
 
-func TestModuleMigrationsMustNotHaveGaps(t *testing.T) {
-	skip := toy(3, Migration{From: 2, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})
-	if err := skip.validate(); err != nil {
-		t.Fatalf("a module may drop support for older versions: %v", err)
-	}
-	gap := toy(4, Migration{From: 1, Apply: func(context.Context, *sql.Tx, []string) error { return nil }}, Migration{From: 3, Apply: func(context.Context, *sql.Tx, []string) error { return nil }})
-	if err := gap.validate(); err == nil {
-		t.Fatal("gap in the migration path accepted")
-	}
-	if _, err := skip.path(1); err == nil {
-		t.Fatal("unsupported older version had a path")
-	}
-}
-
-// firstSchemaDDL is the first engine schema, frozen here as the migration source.
+// This old engine schema is an isolated refusal fixture, never a decoder or migration source.
 const firstSchemaDDL = `
 CREATE TABLE storage_meta(id INTEGER PRIMARY KEY CHECK(id=1),format TEXT NOT NULL,database_id TEXT NOT NULL,manifest_hash TEXT NOT NULL);
 CREATE TABLE scopes(scope TEXT PRIMARY KEY,namespace TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0));
@@ -370,30 +320,5 @@ func TestChangedIndexesAreRebuiltFromTheRecords(t *testing.T) {
 	s.Close()
 	if err != nil || len(found.Results[0].Records) != 2 {
 		t.Fatalf("index lost after the failed attempt: %+v %v", found, err)
-	}
-}
-
-func TestRetireDropsACollectionAndItsQuota(t *testing.T) {
-	s, _, ctx := setup(t)
-	read := snapshot(t, s, ctx, "a")
-	if _, err := s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, Mutations: []api.Mutation{mutation("state", "a", "0", `{"name":"a"}`), mutation("events", "e", "0", `{"n":1}`)}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Write(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error {
-		return Retire(ctx, tx, "test", "events")
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if countRows(t, s, "SELECT count(*) FROM records WHERE collection='events'") != 0 || countRows(t, s, "SELECT count(*) FROM usage WHERE collection='events'") != 0 {
-		t.Fatal("retired collection left rows")
-	}
-	if countRows(t, s, "SELECT count(*) FROM records WHERE collection='state'") != 1 || countRows(t, s, "SELECT count(*) FROM lookups WHERE collection='state'") != 1 {
-		t.Fatal("retire touched another collection")
-	}
-	if err := s.Write(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error { return Retire(ctx, tx, "test") }); err != nil {
-		t.Fatal(err)
-	}
-	if countRows(t, s, "SELECT count(*) FROM records")+countRows(t, s, "SELECT count(*) FROM scopes") != 0 {
-		t.Fatal("retiring a namespace left rows")
 	}
 }

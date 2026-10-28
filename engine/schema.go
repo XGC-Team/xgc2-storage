@@ -8,10 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"time"
 
 	"github.com/XGC-Team/xgc2-storage/api"
-	"golang.org/x/sys/unix"
 )
 
 // engineVersion identifies the current engine tables and required indexes.
@@ -42,19 +40,6 @@ func (s *Store) usedModules() map[string]bool {
 		}
 	}
 	return used
-}
-
-// namespacesOf lists the manifest namespaces that name a module.
-func (s *Store) namespacesOf(module string) []string {
-	var out []string
-	for _, n := range s.config.Manifest.Namespaces {
-		for _, id := range n.Modules {
-			if id == module {
-				out = append(out, n.ID)
-			}
-		}
-	}
-	return out
 }
 
 func setVersion(ctx context.Context, tx *sql.Tx, module string, version int) error {
@@ -103,14 +88,9 @@ func (s *Store) create(ctx context.Context) error {
 	return tx.Commit()
 }
 
-type migrationStep struct {
-	module string
-	from   int
-	to     int
-	apply  func(context.Context, *sql.Tx, []string) error
-}
-
-func hasTable(ctx context.Context, q Queryer, name string) (bool, error) {
+func hasTable(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}, name string) (bool, error) {
 	var n int
 	err := q.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&n)
 	return n > 0, err
@@ -158,14 +138,13 @@ func (s *Store) storedVersions(ctx context.Context) (map[string]int, error) {
 	return versions, nil
 }
 
-// upgrade admits only the current engine epoch. Compiled modules retain their
-// own explicit installation policy; an engine upgrade never runs implicitly.
-func (s *Store) upgrade(ctx context.Context) error {
+// admitCurrentSchema requires every named module's current persisted marker.
+// Refusal precedes index synchronization and never installs or converts data.
+func (s *Store) admitCurrentSchema(ctx context.Context) error {
 	versions, err := s.storedVersions(ctx)
 	if err != nil {
 		return err
 	}
-	var plan []migrationStep
 	if v := versions["engine"]; v > engineVersion {
 		return fail("failed_precondition", fmt.Sprintf("database engine schema is version %d, newer than this release supports (%d); upgrade the software", v, engineVersion))
 	} else if v < engineVersion {
@@ -178,96 +157,12 @@ func (s *Store) upgrade(ctx context.Context) error {
 		case stored > m.Version:
 			return fail("failed_precondition", fmt.Sprintf("database schema of module %s is version %d, newer than this release supports (%d); upgrade the software", id, stored, m.Version))
 		case stored == 0:
-			install := m.Install
-			plan = append(plan, migrationStep{module: id, from: 0, to: m.Version, apply: func(ctx context.Context, tx *sql.Tx, _ []string) error { return install(ctx, tx) }})
+			return fail("failed_precondition", fmt.Sprintf("database schema of module %s has no current version marker", id))
 		case stored < m.Version:
-			path, err := m.path(stored)
-			if err != nil {
-				return err
-			}
-			for _, step := range path {
-				plan = append(plan, migrationStep{module: id, from: step.From, to: step.From + 1, apply: step.Apply})
-			}
-		}
-	}
-	if len(plan) > 0 {
-		if s.config.NoMigrate {
-			return fail("failed_precondition", "database schema is older than this release; open it with the owning application to migrate it")
-		}
-		if err = s.backupBeforeMigration(ctx, plan); err != nil {
-			return err
-		}
-		tx, err := s.writer.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		for _, step := range plan {
-			if err = step.apply(ctx, tx, s.namespacesOf(step.module)); err != nil {
-				return fmt.Errorf("migrating %s from version %d: %w", step.module, step.from, err)
-			}
-			if err = setVersion(ctx, tx, step.module, step.to); err != nil {
-				return err
-			}
-		}
-		if err = tx.Commit(); err != nil {
-			return err
+			return fail("failed_precondition", fmt.Sprintf("database schema of module %s is version %d; this release requires current version %d", id, stored, m.Version))
 		}
 	}
 	return s.syncIndexes(ctx)
-}
-
-// backupBeforeMigration keeps a consistent private copy next to the database
-// so a failed or unwanted upgrade can be rolled back by restoring the file.
-func (s *Store) backupBeforeMigration(ctx context.Context, plan []migrationStep) error {
-	name := fmt.Sprintf("%s.before-%s-v%d.%d.db", s.owner.name, plan[0].module, plan[0].from, time.Now().Unix())
-	if _, err := s.writer.ExecContext(ctx, "VACUUM INTO ?", fmt.Sprintf("/proc/self/fd/%d/%s", s.owner.parent, name)); err != nil {
-		return err
-	}
-	fd, err := unix.Openat(s.owner.parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
-	if err = unix.Fchmod(fd, 0600); err != nil {
-		return err
-	}
-	if err = unix.Fsync(fd); err != nil {
-		return err
-	}
-	return unix.Fsync(s.owner.parent)
-}
-
-// Retire deletes the data of collections that a release no longer declares,
-// inside a module migration transaction. Without collections it removes the
-// whole namespace, its scopes and its receipts. Live quota counters follow.
-func Retire(ctx context.Context, tx *sql.Tx, namespace string, collections ...string) error {
-	if namespace == "" {
-		return fail("invalid_argument", "namespace required")
-	}
-	const scopes = "scope IN (SELECT scope FROM scopes WHERE namespace=?)"
-	if len(collections) == 0 {
-		for _, statement := range []string{
-			"DELETE FROM lookups WHERE " + scopes, "DELETE FROM records WHERE " + scopes, "DELETE FROM usage WHERE " + scopes,
-			"DELETE FROM receipts WHERE " + scopes, "DELETE FROM collection_indexes WHERE namespace=?", "DELETE FROM scopes WHERE namespace=?",
-		} {
-			if _, err := tx.ExecContext(ctx, statement, namespace); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	for _, c := range collections {
-		for _, statement := range []string{
-			"DELETE FROM lookups WHERE collection=? AND " + scopes, "DELETE FROM records WHERE collection=? AND " + scopes,
-			"DELETE FROM usage WHERE collection=? AND " + scopes, "DELETE FROM collection_indexes WHERE collection=? AND namespace=?",
-		} {
-			if _, err := tx.ExecContext(ctx, statement, c, namespace); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 func indexSignature(c api.Collection) string {

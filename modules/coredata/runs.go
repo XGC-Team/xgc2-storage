@@ -357,6 +357,13 @@ func updateRunStatuses(ctx context.Context, tx *sql.Tx, scope string, updates []
 }
 
 func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish) (model.Run, error) {
+	return finishRunWithDetail(ctx, tx, scope, f, true)
+}
+
+// A batch discards each finished Run. It needs the existing detail only when
+// validating a terminal replay; reading it after a changed finish would fetch
+// and decode payloads the caller never requested.
+func finishRunWithDetail(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish, wantDetail bool) (model.Run, error) {
 	if !textKey(f.ID) || !f.Status.Terminal() || len(f.Termination) > 255 || strings.ContainsAny(f.Termination, "\x00\r\n") {
 		return model.Run{}, failure("invalid_argument", "a run identity, a terminal status and a short termination reason are required")
 	}
@@ -416,6 +423,9 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 	if _, err = tx.ExecContext(ctx, "UPDATE runs SET status=?,termination=?,error_json=?,error_summary_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,cleanup_failed=?,finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status=?",
 		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current); err != nil {
 		return model.Run{}, err
+	}
+	if !wantDetail {
+		return model.Run{}, nil
 	}
 	return selectRun(ctx, tx, scope, "id=?", f.ID)
 }
@@ -723,7 +733,7 @@ func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates
 			}
 		}
 		for _, finish := range finishes {
-			if _, err := finishRun(ctx, tx, s.scope, finish); err != nil {
+			if _, err := finishRunWithDetail(ctx, tx, s.scope, finish, false); err != nil {
 				return err
 			}
 		}

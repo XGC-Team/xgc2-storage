@@ -70,8 +70,7 @@ func Open(ctx context.Context, config Config) (_ *Host, err error) {
 		h.callBudget = 30 * time.Second
 	}
 	h.store, err = engine.Open(startup, engine.Config{Path: config.Path, Create: config.Create, Manifest: config.Manifest, Modules: registry.Compiled(),
-		NoMigrate: true,
-		Readers:   config.Readers, WriterQueue: config.WriterQueue, CallBudget: config.CallBudget, MaxDBBytes: config.MaxDBBytes,
+		Readers: config.Readers, WriterQueue: config.WriterQueue, CallBudget: config.CallBudget, MaxDBBytes: config.MaxDBBytes,
 		OnMaintenanceError: h.maintenanceFailed})
 	if err != nil {
 		return nil, err

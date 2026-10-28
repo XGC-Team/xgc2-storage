@@ -25,7 +25,7 @@ type Config struct {
 	Create   bool
 	Manifest api.Manifest
 	// Modules are the compiled data modules that the manifest's namespaces may
-	// name. A module a namespace names is installed or migrated at Open.
+	// name. Explicit creation installs the named current modules.
 	Modules []Module
 	// Readers is the number of concurrent read connections (default 4, at most 16).
 	Readers int
@@ -50,8 +50,6 @@ type Config struct {
 	// after a commit, which also bounds how long a relaxed commit stays
 	// exposed to power loss (default 1 s). Nothing runs while the database is idle.
 	CheckpointDelay time.Duration
-	// NoMigrate refuses an older schema instead of migrating it.
-	NoMigrate bool
 	// OnMaintenanceError receives failures of background maintenance.
 	OnMaintenanceError func(error)
 }
@@ -212,12 +210,12 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if c.Create {
 		err = s.create(ctx)
 	} else {
-		err = s.upgrade(ctx)
+		err = s.admitCurrentSchema(ctx)
 	}
 	if err != nil {
 		return nil, err
 	}
-	// Leave the schema, and any migration, in the main file rather than the WAL.
+	// Leave the current schema in the main file rather than the WAL.
 	var busy, logPages, checkpointed int
 	if err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logPages, &checkpointed); err != nil {
 		return nil, err

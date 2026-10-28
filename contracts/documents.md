@@ -126,13 +126,13 @@ above its threshold is checkpointed at once, and a stored receipt arms its own e
 runs while the database is idle. `Stats` reports commits by class, durability barriers,
 queue wait, SQL time, checkpoints, receipts pruned and physical DB/WAL/SHM bytes.
 
-## Schema versions and migrations
+## Schema versions
 
-The engine and every data module store an integer schema version. Opening a database with
-the same versions succeeds whatever the code. An older schema is migrated forward in one
-transaction after a consistent private backup (`<db>.before-<module>-v<from>.<time>.db`
-next to the database); a newer schema is refused with an error that names the component.
-`storage-admin` never migrates. SQLite must be 3.51.3 or newer.
+The engine and every data module store an integer schema version. Explicit creation installs
+the current versions. Opening requires every named module's exact current stored marker;
+missing, older and newer markers are refused before index synchronization or service. No
+historical schema conversion, installation on reopen or automatic backup is performed.
+SQLite must be 3.51.3 or newer.
 
 ## Assets, capacity, administration
 
