@@ -103,6 +103,13 @@ The low-level engine retains its generic module migration API for independently
 embedded modules; the product host disables that path. The manifest controls
 current collections, limits and indexes, not permission to convert old schemas.
 
+Run observations read write-derived bounded source and error metadata plus an
+exact cleanup count from the same row. The execution owner supplies source meaning
+without rewriting the opaque trigger. Short errors remain exact; large errors
+require a bounded preview. Explicit Run detail retains every original JSON byte.
+List pages have both a row cap and an encoded-response budget; continuation names
+the last returned row, never a discarded lookahead row.
+
 ## Optional XRPC exposure and the daemon
 
 `h.Serve(ctx, host.ServeConfig{TargetID, HTTPSocket, GRPCSocket, Grants, Limits})` serves the

@@ -58,6 +58,7 @@ func TestRunObservationDoesNotReadOrDecompressExecutionPayloads(t *testing.T) {
 	defer tx.Rollback()
 	trigger := json.RawMessage(`{"kind":"session-action","instanceId":"native","presetId":"start","n":9007199254740993}`)
 	request := model.NewRun{ID: "observed", TargetID: "local", WorkflowResourceID: "workflow", WorkflowCommitID: "commit", DefinitionDigest: strings.Repeat("d", 64), ActionID: "run", Inputs: json.RawMessage(`{"large":"` + strings.Repeat("input", 100000) + `"}`), Trigger: trigger}
+	request.SourceObservation = json.RawMessage(`{"invocation":{"instanceId":"native","presetId":"start"}}`)
 	if _, _, err = createRun(ctx, tx, testScope, request); err != nil {
 		t.Fatal(err)
 	}
@@ -66,9 +67,9 @@ func TestRunObservationDoesNotReadOrDecompressExecutionPayloads(t *testing.T) {
 	if err != nil || !full.HasResult {
 		t.Fatalf("finish result: %+v %v", full, err)
 	}
-	// Corrupt all three execution payloads. An observation must still read the
+	// Corrupt all execution payloads. An observation must still read the
 	// exact metadata, proving these blobs never enter the decompression path.
-	if _, err = tx.ExecContext(ctx, "UPDATE runs SET inputs_json=x'01',result_json=x'02',nodes_json=x'03' WHERE id=?", request.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE runs SET inputs_json=x'01',trigger_json=x'02',error_json=x'03',result_json=x'04',nodes_json=x'05',cleanup_errors_json=x'06' WHERE id=?", request.ID); err != nil {
 		t.Fatal(err)
 	}
 	page, err := listRuns(ctx, tx, testScope, model.RunFilter{Projection: model.RunObservation})
@@ -76,7 +77,7 @@ func TestRunObservationDoesNotReadOrDecompressExecutionPayloads(t *testing.T) {
 		t.Fatalf("observation: %+v %v", page, err)
 	}
 	got := page.Runs[0]
-	if len(got.Inputs) != 0 || len(got.Result) != 0 || len(got.Nodes) != 0 || !got.HasResult || !bytes.Equal(got.Trigger, trigger) || !bytes.Equal(got.Error, finish.Error) || !bytes.Equal(got.CleanupErrors, finish.CleanupErrors) {
+	if len(got.Inputs)+len(got.Trigger)+len(got.Result)+len(got.Nodes)+len(got.CleanupErrors) != 0 || !got.HasResult || !bytes.Equal(got.SourceObservation, request.SourceObservation) || !bytes.Equal(got.Error, finish.Error) || got.CleanupFailed != 1 {
 		t.Fatalf("observation lost metadata or read payloads: %+v", got)
 	}
 	identity, err := listRuns(ctx, tx, testScope, model.RunFilter{Projection: model.RunIdentity})
@@ -98,10 +99,10 @@ func TestRunPayloadRejectsCorruptionAndDecodedOverflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, value := range map[string][]byte{
-		"plaintext is not schema 3": raw,
-		"missing checksum":          packed[:len(packed)-1],
-		"trailing data":             append(append([]byte{}, packed...), 0),
-		"decoded overflow":          packed,
+		"plaintext is not the current compressed format": raw,
+		"missing checksum": packed[:len(packed)-1],
+		"trailing data":    append(append([]byte{}, packed...), 0),
+		"decoded overflow": packed,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := decodeRunPayload(value, 100); err == nil {

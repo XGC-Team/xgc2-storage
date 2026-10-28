@@ -49,7 +49,7 @@ Statuses: `queued`, `running`, `stopping`, `succeeded`, `failed`, `stopped`, `ca
 | `FinishRun` | Durable | records a terminal status and the outcome, even when the quota is full. The same outcome returns the stored Run and does not change the row, its revision, or quota: status and termination match, and error, result, nodes, and cleanup errors match as normalized uncompressed JSON bytes; a zero `At` matches, and a non-zero `At` must equal `FinishedAt`. That replay still enters one Durable write transaction, so the owner's commit and fsync accounting can advance. A different outcome is `failed_precondition` |
 | `ApplyRunOps(ctx, creates []NewRun, updates []RunStatusUpdate, finishes []RunFinish) ([]CreatedRun, error)` | Durable when `creates` or `finishes` is non-empty; Relaxed when only `updates` is non-empty; no transaction when all three are empty | one transaction, ordered creates, then updates, then finishes, using each Run's literal id. The result has one `CreatedRun{Run, Created}` per create; a repeated idempotency key returns the stored Run with `Created=false` and does not compare inputs. `len(creates)+len(updates)+len(finishes) > 1000` (`MaxPageSize`) is `invalid_argument` and opens no transaction. Any error rolls the whole batch back: no partial result and no quota residue. Same-outcome finishes and terminal status updates inside the batch follow `FinishRun` and `UpdateRunStatus`: those rows, revisions, and quota do not change, while a batch that contains a finish still uses one Durable transaction |
 | `GetRun`, `FindRunByIdempotencyKey` | read | |
-| `ListRuns` | read | newest first by (created_at, id); filters: exact id, target, root, session, workflow, statuses, time window; opaque cursor; fixed `complete`, `identity` and `observation` projections; observation retains trigger/failure/cleanup metadata and result presence without selecting or decompressing input, result or node payloads. Exact-id observation uses the primary key for bounded source navigation |
+| `ListRuns` | read | newest first by (created_at, id); filters: exact id, target, root, session, workflow, accepted Experiment/instance, statuses, time window; opaque cursor; fixed `complete`, `identity` and `observation` projections; observation selects write-derived bounded source/error metadata, exact cleanup cardinality and result presence without selecting or decompressing any full execution JSON. Pages obey the response-byte budget as well as the row limit; an oversized first row is refused explicitly. Exact-id observation uses the primary key for bounded source navigation |
 | `InterruptOpenRuns` | Durable | Core's boot step: every open Run becomes `interrupted`; no half-run graph resumes |
 | `PruneRuns` | Relaxed | deletes finished Runs by age and/or by count (newest kept), at most `Limit` per call; never a Run whose root is still open. Returns `RunPruneResult{Deleted, OldestEligibleFinishedAt}` from the same indexed eligible set after deletion; zero time means no eligible terminal Run remains |
 
@@ -92,10 +92,39 @@ the limit with `resource_exhausted`, while the first `FinishRun` of an admitted 
 records its outcome even when the quota is already full. A same-outcome `FinishRun`
 does not charge quota again. Core prunes with `PruneRuns` on its own schedule.
 
+## Unresolved remote control ownership
+
+`ReserveRemoteRun` durably places a bounded relation on its accepted owner's existing
+Run row before a remote Start leaves. The relation records owner/root/target/remote Run,
+call node and optional boot. Boot may bind once; conflicting or downgraded resolution
+cannot join a different process. `ResolveRemoteRun` requires exact identity and is called
+only after definitive unsent/rejection or authoritative terminal join, never Stop acceptance.
+These are Durable owner transactions, with idempotent bytes and exact quota release.
+
+Age/count/all-closed pruning excludes each unresolved owner and its local root in the same
+transaction. Other finished development history remains eligible. Close/reopen preserves
+those control facts without reading full Run payloads. No extra execution ledger is created.
+
+`ListPendingRemoteRuns` returns at most128 links and inspects at most16 indexed pending
+owner rows per call (8MiB of admitted relation JSON), never unrelated history. Its opaque
+cursor binds the target and stable owner/remote identities, not mutable array offsets.
+An empty page with a nonempty advancing cursor is legitimate. Each owner holds at most
+1024 links/512KiB; reader cancellation, row identity, boot and corruption failures are explicit.
+
 ## Current schema admission
 
-The Core data schema is version4 and is the only admitted layout. No Core legacy probe,
+The Core data schema is version5 and is the only admitted layout. No Core legacy probe,
 historical decoder or migration ships. Older/newer stores fail closed without changing
 accepted data or creating a migration backup. The embedding product host disables even
 the engine's optional generic migration path. Development storage is initialized explicitly;
 normal startup never clears history or unresolved remote relations.
+
+Source/error observations are derived at the existing write boundary and kept on the same
+row. Storage accepts a bounded source projection from the execution owner and never
+reinterprets opaque Trigger JSON. Its generated indexed Experiment/instance coordinates
+come from that projection. Source observation is limited to16KiB; an Error preview to4KiB.
+Short errors remain byte-exact across every JSON shape; a large full error requires its
+explicit bounded preview. Cleanup must be an array or null; its exact cardinality is written
+once. Complete reads keep original trigger/error/cleanup/result bytes. Current-format tests
+cover rejection without mutation, close/reopen ownership, quota, selected index plans,
+corrupt unused detail, byte paging and stable same-time cursors.

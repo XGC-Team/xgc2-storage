@@ -49,17 +49,23 @@ type Run struct {
 	ActionID           string          `json:"action_id"`
 	Inputs             json.RawMessage `json:"inputs,omitempty"`
 	Trigger            json.RawMessage `json:"trigger,omitempty"`
-	Status             RunStatus       `json:"status"`
-	Termination        string          `json:"termination,omitempty"`
-	Error              json.RawMessage `json:"error,omitempty"`
-	Result             json.RawMessage `json:"result,omitempty"`
-	HasResult          bool            `json:"has_result,omitempty"`
-	Nodes              json.RawMessage `json:"nodes,omitempty"`
-	CleanupErrors      json.RawMessage `json:"cleanup_errors,omitempty"`
-	CreatedAt          time.Time       `json:"created_at"`
-	StartedAt          time.Time       `json:"started_at,omitzero"`
-	FinishedAt         time.Time       `json:"finished_at,omitzero"`
-	Revision           int64           `json:"revision"`
+	// SourceObservation is a bounded projection supplied by the execution owner
+	// when the Run is accepted. Storage never reinterprets opaque Trigger JSON.
+	SourceObservation json.RawMessage `json:"source_observation,omitempty"`
+	Status            RunStatus       `json:"status"`
+	Termination       string          `json:"termination,omitempty"`
+	Error             json.RawMessage `json:"error,omitempty"`
+	ErrorSummary      json.RawMessage `json:"error_summary,omitempty"`
+	Result            json.RawMessage `json:"result,omitempty"`
+	HasResult         bool            `json:"has_result,omitempty"`
+	Nodes             json.RawMessage `json:"nodes,omitempty"`
+	CleanupErrors     json.RawMessage `json:"cleanup_errors,omitempty"`
+	CleanupFailed     int             `json:"cleanup_failed,omitempty"`
+	Projection        RunProjection   `json:"-"`
+	CreatedAt         time.Time       `json:"created_at"`
+	StartedAt         time.Time       `json:"started_at,omitzero"`
+	FinishedAt        time.Time       `json:"finished_at,omitzero"`
+	Revision          int64           `json:"revision"`
 }
 
 // NewRun accepts a Run. RootRunID defaults to ID and Status to queued. A
@@ -80,6 +86,7 @@ type NewRun struct {
 	ActionID           string
 	Inputs             json.RawMessage
 	Trigger            json.RawMessage
+	SourceObservation  json.RawMessage
 	Status             RunStatus
 	At                 time.Time
 }
@@ -93,10 +100,13 @@ type RunStatusUpdate struct {
 
 // RunFinish ends a Run with a terminal status and its outcome.
 type RunFinish struct {
-	ID            string
-	Status        RunStatus
-	Termination   string
-	Error         json.RawMessage
+	ID          string
+	Status      RunStatus
+	Termination string
+	Error       json.RawMessage
+	// ErrorSummary is required for an Error larger than MaxRunErrorSummaryBytes.
+	// A short Error is its own exact summary; a supplied different value is invalid.
+	ErrorSummary  json.RawMessage
 	Result        json.RawMessage
 	Nodes         json.RawMessage
 	CleanupErrors json.RawMessage
@@ -119,12 +129,15 @@ const (
 
 // RunFilter selects Runs newest first. Zero fields do not filter.
 type RunFilter struct {
-	ID                 string
-	TargetID           string
-	RootRunID          string
-	SessionID          string
-	WorkflowResourceID string
-	Statuses           []RunStatus
+	// These select accepted Experiment invocation identity from the same-row source projection.
+	ExperimentResourceID string
+	WorkflowInstanceID   string
+	ID                   string
+	TargetID             string
+	RootRunID            string
+	SessionID            string
+	WorkflowResourceID   string
+	Statuses             []RunStatus
 	// Since is inclusive and Until exclusive, both on the creation time.
 	Since, Until time.Time
 	// Limit defaults to 100 and is at most 1000.
@@ -132,8 +145,8 @@ type RunFilter struct {
 	// Cursor is the Next value of the previous page.
 	Cursor string
 	// Projection controls the fixed SQL selection. Identity omits all JSON;
-	// Observation retains trigger, failure and cleanup metadata without reading
-	// or decompressing inputs, node records or results. HasResult remains exact.
+	// Observation selects only write-derived source/error metadata and exact
+	// cleanup cardinality. It never reads any full execution JSON column.
 	// Complete (the default) and GetRun return all payloads.
 	Projection RunProjection
 }
@@ -265,16 +278,18 @@ type RecordingPage struct {
 }
 
 const (
-	MaxRunInputsBytes        = 4 << 20
-	MaxRunTriggerBytes       = 1 << 20
-	MaxRunErrorBytes         = 256 << 10
-	MaxRunResultBytes        = 4 << 20
-	MaxRunNodesBytes         = 8 << 20
-	MaxRunCleanupErrorsBytes = 256 << 10
-	MaxStopIntentBytes       = 64 << 10
-	MaxRecordingMetadata     = 256 << 10
-	MaxRunDepth              = 1024
-	MaxPageSize              = 1000
+	MaxRunInputsBytes            = 4 << 20
+	MaxRunTriggerBytes           = 1 << 20
+	MaxRunSourceObservationBytes = 16 << 10
+	MaxRunErrorBytes             = 256 << 10
+	MaxRunErrorSummaryBytes      = 4 << 10
+	MaxRunResultBytes            = 4 << 20
+	MaxRunNodesBytes             = 8 << 20
+	MaxRunCleanupErrorsBytes     = 256 << 10
+	MaxStopIntentBytes           = 64 << 10
+	MaxRecordingMetadata         = 256 << 10
+	MaxRunDepth                  = 1024
+	MaxPageSize                  = 1000
 )
 
 // RunPruneResult carries the next age boundary from the same indexed eligible

@@ -89,10 +89,13 @@ func encodeCursor(at int64, id string) string {
 }
 
 func decodeCursor(cursor string) (int64, string, error) {
+	if len(cursor) > 1024 {
+		return 0, "", failure("invalid_argument", "invalid page cursor")
+	}
 	raw, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err == nil {
 		if at, id, ok := strings.Cut(string(raw), "\x00"); ok {
-			if n, e := strconv.ParseInt(at, 10, 64); e == nil && id != "" {
+			if n, e := strconv.ParseInt(at, 10, 64); e == nil && textKey(id) && strconv.FormatInt(n, 10) == at {
 				return n, id, nil
 			}
 		}
@@ -112,22 +115,31 @@ func pageLimit(limit int) (int, error) {
 
 type scanner interface{ Scan(dest ...any) error }
 
-const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0"
+const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
 
 // runSummaryColumns replaces the large JSON columns by empty values.
-const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0"
+const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,x'',x'',0"
 
-const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',trigger_json,status,termination,error_json,x'',x'',cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0"
+const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,error_summary_json,x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
 
-func scanRun(row scanner) (model.Run, error) {
+func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) {
 	var r model.Run
 	var status string
 	var inputs, trigger, errored, result, nodes, cleanup []byte
 	var created, started, finished int64
-	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult); err != nil {
+	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult, &r.SourceObservation, &r.ErrorSummary, &r.CleanupFailed); err != nil {
 		return r, err
 	}
 	r.Status = model.RunStatus(status)
+	if _, err := jsonField("source observation", r.SourceObservation, model.MaxRunSourceObservationBytes, false, true); err != nil {
+		return model.Run{}, err
+	}
+	if _, err := jsonField("error summary", r.ErrorSummary, model.MaxRunErrorSummaryBytes, false, false); err != nil {
+		return model.Run{}, err
+	}
+	if len(projection) > 0 {
+		r.Projection = projection[0]
+	}
 	for _, field := range []struct {
 		stored []byte
 		limit  int
@@ -140,6 +152,10 @@ func scanRun(row scanner) (model.Run, error) {
 		{nodes, model.MaxRunNodesBytes, &r.Nodes},
 		{cleanup, model.MaxRunCleanupErrorsBytes, &r.CleanupErrors},
 	} {
+		if r.Projection == model.RunObservation && field.target == &r.Error {
+			r.Error = rawOrNil(field.stored)
+			continue
+		}
 		raw, err := decodeRunPayload(field.stored, field.limit)
 		if err != nil {
 			return r, err
@@ -166,7 +182,7 @@ func runBytes(r model.Run) int64 {
 	for _, s := range []string{r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.SessionID, r.IdempotencyKey, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID, r.Termination} {
 		n += len(s)
 	}
-	return int64(n + len(r.Inputs) + len(r.Trigger) + len(r.Error) + len(r.Result) + len(r.Nodes) + len(r.CleanupErrors))
+	return int64(n + len(r.Inputs) + len(r.Trigger) + len(r.Error) + len(r.Result) + len(r.Nodes) + len(r.CleanupErrors) + len(r.SourceObservation) + len(r.ErrorSummary))
 }
 
 func validateNewRun(q *model.NewRun) error {
@@ -210,6 +226,10 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if err != nil {
 		return model.Run{}, false, err
 	}
+	source, err := jsonField("source observation", q.SourceObservation, model.MaxRunSourceObservationBytes, false, true)
+	if err != nil {
+		return model.Run{}, false, err
+	}
 	if q.IdempotencyKey != "" {
 		existing, err := selectRun(ctx, tx, scope, byKey, q.IdempotencyKey)
 		if err == nil {
@@ -229,7 +249,7 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	at := nowOr(q.At)
 	r := model.Run{ID: q.ID, TargetID: q.TargetID, RootRunID: q.RootRunID, ParentRunID: q.ParentRunID, CallNodeID: q.CallNodeID, Depth: q.Depth, SessionID: q.SessionID,
 		IdempotencyKey: q.IdempotencyKey, WorkflowResourceID: q.WorkflowResourceID, WorkflowCommitID: q.WorkflowCommitID, DefinitionDigest: q.DefinitionDigest, ActionID: q.ActionID,
-		Inputs: inputs, Trigger: trigger, Status: q.Status, CreatedAt: at, Revision: 1}
+		Inputs: inputs, Trigger: trigger, SourceObservation: source, Status: q.Status, CreatedAt: at, Revision: 1}
 	if r.Status == model.RunRunning {
 		r.StartedAt = at
 	}
@@ -245,9 +265,9 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',?,?,0,1,?)",
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
 		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, r.IdempotencyKey, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
-		storedInputs, storedTrigger, string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
+		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
 	return r, true, err
 }
 
@@ -306,6 +326,14 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 	if err != nil {
 		return model.Run{}, err
 	}
+	preview, err := errorSummary(errored, f.ErrorSummary)
+	if err != nil {
+		return model.Run{}, err
+	}
+	cleanupFailed, err := cleanupCardinality(cleanup)
+	if err != nil {
+		return model.Run{}, err
+	}
 	var current string
 	err = tx.QueryRowContext(ctx, "SELECT status FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&current)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -319,7 +347,7 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 		if err != nil {
 			return model.Run{}, err
 		}
-		if !sameRunFinish(existing, f, errored, result, nodes, cleanup) {
+		if !sameRunFinish(existing, f, errored, result, nodes, cleanup) || !bytes.Equal(existing.ErrorSummary, preview) || existing.CleanupFailed != cleanupFailed {
 			return model.Run{}, failure("failed_precondition", "run already finished")
 		}
 		return existing, nil
@@ -331,12 +359,12 @@ func finishRun(ctx context.Context, tx *sql.Tx, scope string, f model.RunFinish)
 		}
 	}
 	// An open Run carries none of these columns, so the row only grows by them.
-	grown := int64(len(f.Termination) + len(errored) + len(result) + len(nodes) + len(cleanup))
+	grown := int64(len(f.Termination) + len(errored) + len(result) + len(nodes) + len(cleanup) + len(preview))
 	if err = charge(ctx, tx, scope, 0, grown); err != nil {
 		return model.Run{}, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE runs SET status=?,termination=?,error_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status=?",
-		string(f.Status), f.Termination, []byte(errored), []byte(result), []byte(nodes), []byte(cleanup), nanos(nowOr(f.At)), grown, scope, f.ID, current); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE runs SET status=?,termination=?,error_json=?,error_summary_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,cleanup_failed=?,finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status=?",
+		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current); err != nil {
 		return model.Run{}, err
 	}
 	return selectRun(ctx, tx, scope, "id=?", f.ID)
@@ -384,7 +412,7 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
-	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID} {
+	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID, "source_experiment_id": f.ExperimentResourceID, "source_instance_id": f.WorkflowInstanceID} {
 		if value == "" {
 			continue
 		}
@@ -450,19 +478,40 @@ func listRuns(ctx context.Context, tx *sql.Tx, scope string, f model.RunFilter) 
 	}
 	defer rows.Close()
 	var page model.RunPage
+	// Keep room for the page envelope and the largest admitted cursor (a signed
+	// nanosecond timestamp, separator and a 255-byte identifier, then base64).
+	// This budgets this SDK response, not OS I/O or a different wire wrapper.
+	const envelopeBudget = 1024
+	used := envelopeBudget
 	for rows.Next() {
-		r, err := scanRun(rows)
-		if err != nil {
-			return page, err
-		}
 		if len(page.Runs) == limit {
-			last := page.Runs[limit-1]
+			last := page.Runs[len(page.Runs)-1]
 			page.Next = encodeCursor(nanos(last.CreatedAt), last.ID)
 			break
 		}
+		r, err := scanRun(rows, f.Projection)
+		if err != nil {
+			return model.RunPage{}, err
+		}
+		encoded, err := json.Marshal(r)
+		if err != nil {
+			return model.RunPage{}, err
+		}
+		if used+len(encoded)+1 > model.MaxResponseBytes {
+			if len(page.Runs) == 0 {
+				return model.RunPage{}, failure("resource_exhausted", "one Run exceeds the list response budget; request its exact detail")
+			}
+			last := page.Runs[len(page.Runs)-1]
+			page.Next = encodeCursor(nanos(last.CreatedAt), last.ID)
+			break
+		}
+		used += len(encoded) + 1
 		page.Runs = append(page.Runs, r)
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return model.RunPage{}, err
+	}
+	return page, nil
 }
 
 // The statements below are fixed text, so that the plan test can run them as written.
@@ -470,7 +519,7 @@ const (
 	interruptOpen = "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')"
 
 	// A finished Run is only eligible for pruning when its root is finished too.
-	eligibleRuns = "scope=? AND finished_at>0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0)"
+	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.root_run_id=r.id AND p.pending_remote_count>0)"
 	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
 	pruneOldest  = "SELECT finished_at FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at,id LIMIT 1"
 	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"
