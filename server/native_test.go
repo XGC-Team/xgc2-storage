@@ -34,6 +34,7 @@ func TestNativeProfilesPrecisionAuthAndReceipt(t *testing.T) {
 			}
 			defer os.RemoveAll(dir)
 			m := api.Manifest{Format: "storage-v1", Namespaces: []api.Namespace{{ID: "docs", Owner: "tests", Schema: "docs.v1", MaxScopes: 2, MaxReceipts: 16, ReceiptTTLSeconds: 3600, Collections: []api.Collection{{ID: "documents", MaxRecordBytes: 3 << 20, MaxRecords: 100, MaxBytes: 8 << 20, Retention: "tests", Recovery: "backup"}}}}}
+			m.Namespaces[0].Collections[0].Indexes = []api.Index{{ID: "counter", Fields: []string{"counter"}}}
 			store, e := engine.Open(ctx, engine.Config{Path: filepath.Join(dir, "fixture.db"), Create: true, Manifest: m})
 			if e != nil {
 				t.Fatal(e)
@@ -124,10 +125,32 @@ func TestNativeProfilesPrecisionAuthAndReceipt(t *testing.T) {
 			if string(read.Results[0].Records[0].Data) != `{"counter":9223372036854775806,"name":"Layout"}` {
 				t.Fatalf("precision lost: %s", read.Results[0].Records[0].Data)
 			}
+			beforeHeaders, _ := store.Stats()
+			headers, e := c.Snapshot(ctx, "read-headers", api.SnapshotRequest{Scope: scope, At: &read.Token,
+				Queries: []api.Query{{Collection: "documents", Keys: []string{"layout", "active", "absent"}, HeaderIndex: "counter"}}})
+			if e != nil || len(headers.Results) != 1 || len(headers.Results[0].Records) != 3 {
+				t.Fatalf("native header projection did not survive %s transport: %v", profile, e)
+			}
+			for _, record := range headers.Results[0].Records {
+				if record.Header == nil || len(record.Data) != 0 || record.Header.Index != "counter" {
+					t.Fatalf("%s transport confused a header with full Data", profile)
+				}
+			}
+			layout := headers.Results[0].Records[0]
+			if layout.Header.Bytes != int64(len(read.Results[0].Records[0].Data)) || string(layout.Header.Tuple) != `[{"number":"9223372036854775806"}]` || !headers.Results[0].Records[2].Missing {
+				t.Fatal("native header conversion lost exact bytes, numeric precision or missing identity")
+			}
+			afterHeaders, _ := store.Stats()
+			if afterHeaders.SnapshotPayloadReads != beforeHeaders.SnapshotPayloadReads || afterHeaders.SnapshotPayloadBytes != beforeHeaders.SnapshotPayloadBytes {
+				t.Fatal("native header conversion silently requested full documents")
+			}
 			unauthorized := scope
 			unauthorized.User = "other"
 			if _, e = c.Snapshot(ctx, "forbidden", api.SnapshotRequest{Scope: unauthorized, Queries: []api.Query{{Collection: "documents", Limit: 1}}}); e == nil {
 				t.Fatal("unauthorized scope succeeded")
+			}
+			if _, e = c.Snapshot(ctx, "forbidden-header", api.SnapshotRequest{Scope: unauthorized, Queries: []api.Query{{Collection: "documents", Keys: []string{"layout"}, HeaderIndex: "counter"}}}); xrpc.Code(e) != "permission_denied" {
+				t.Fatalf("native header projection bypassed its scope grant: %v", e)
 			}
 			if _, e = c.Batch(ctx, req); e != nil {
 				t.Fatalf("idempotent replay %v", e)

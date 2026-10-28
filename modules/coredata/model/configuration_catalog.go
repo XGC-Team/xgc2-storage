@@ -28,6 +28,35 @@ type ConfigurationSelectedCatalogRead struct {
 	OrdinaryOnly bool                     `json:"ordinary_only"`
 }
 
+// ConfigurationCatalogPageRead binds a page to the revision of precisely the
+// selected current-main catalog. A nil ExpectedGeneration starts a new cut.
+type ConfigurationCatalogPageRead struct {
+	Catalog      ConfigurationCatalogRead `json:"catalog"`
+	Selector     string                   `json:"selector,omitempty"`
+	OrdinaryOnly bool                     `json:"ordinary_only"`
+	// ChoiceOnly fences only facts used by an ordinary current-main choice:
+	// identity, name, selector, location, visibility, and current commit.
+	ChoiceOnly         bool   `json:"choice_only"`
+	ExpectedGeneration *int64 `json:"expected_generation,omitempty"`
+}
+
+type ConfigurationCatalogHeaderPage struct {
+	Headers    []ConfigurationResourceHeader `json:"headers"`
+	Choices    []ConfigurationCatalogChoice  `json:"choices"`
+	Generation int64                         `json:"generation"`
+}
+
+// ConfigurationCatalogChoice omits lineage, branch metadata and authored
+// content. Identity and Summary are the immutable admitted projection.
+type ConfigurationCatalogChoice struct {
+	ResourceID string `json:"resource_id"`
+	Name       string `json:"name"`
+	CommitID   string `json:"commit_id"`
+	Protected  bool   `json:"protected"`
+	Identity   []byte `json:"identity"`
+	Summary    []byte `json:"summary"`
+}
+
 // Body retains namespace metadata written by its owner; identity, location,
 // name and revision have their own relational columns.
 type ConfigurationNamespace struct {
@@ -69,7 +98,8 @@ type ConfigurationNamespaceWrite struct {
 	Archived         bool                         `json:"archived"`
 }
 type ConfigurationNamespaceResult struct {
-	AffectedAgentIDs []string               `json:"affected_agent_ids"`
-	Namespace        ConfigurationNamespace `json:"namespace"`
-	Replayed         bool                   `json:"replayed"`
+	AffectedAgentIDs    []string               `json:"affected_agent_ids"`
+	AffectedWorkflowIDs []string               `json:"affected_workflow_ids"`
+	Namespace           ConfigurationNamespace `json:"namespace"`
+	Replayed            bool                   `json:"replayed"`
 }

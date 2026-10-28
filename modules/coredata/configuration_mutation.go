@@ -223,13 +223,16 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = reserve(ctx, tx, scope, 2, int64(len(rb)+len(bb))); err != nil {
 		return out, err
 	}
-	if _, err = tx.ExecContext(ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", scope, q.Domain.Key, r.ID, configurationNullable(r.NamespaceID), r.Name, r.NameKey, r.Revision, r.MainCommitID, 0, r.OriginResourceID, r.OriginCommitID, []byte(rb)); err != nil {
+	if _, err = tx.ExecContext(ctx, "INSERT INTO core_resources(scope,domain,id,namespace_id,name,name_key,revision,main_commit_id,archived,origin_resource_id,origin_commit_id,body) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", scope, q.Domain.Key, r.ID, configurationNullable(r.NamespaceID), r.Name, r.NameKey, r.Revision, r.MainCommitID, 0, r.OriginResourceID, r.OriginCommitID, []byte(rb)); err != nil {
 		return out, err
 	}
 	if _, err = tx.ExecContext(ctx, "INSERT INTO core_branches VALUES(?,?,?,?,?,?,?,?)", scope, q.Domain.Key, b.ID, r.ID, b.NameKey, b.HeadCommitID, b.Revision, []byte(bb)); err != nil {
 		return out, err
 	}
-	if err = configurationInsertSnapshot(ctx, tx, scope, q.Domain.Key, c, q.Snapshot); err != nil {
+	if err = configurationInsertSnapshot(ctx, tx, scope, q.Domain.Key, c, q.Snapshot, q.Domain.Key == "robot"); err != nil {
+		return out, err
+	}
+	if err = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, nil, &r); err != nil {
 		return out, err
 	}
 	if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, c.ID, model.ResourceCreateOperation, q.Mutation, q.Snapshot.Change, "", ""); err != nil {
@@ -243,7 +246,7 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err != nil {
 		return out, err
 	}
-	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCreateOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "created", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, AffectedWorkflowIDs: robotWorkflowEffects(q.Domain.Key, false, true, "", r.Name, nil, q.Snapshot.References), Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCreateOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "created", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
 	err = configurationFinishReceipt(ctx, tx, scope, out, q.Snapshot, control, 0)
 	return out, err
 }
@@ -269,6 +272,7 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err != nil {
 		return out, err
 	}
+	oldResource := r
 	b, err := configurationBranch(ctx, tx, scope, q.Domain.Key, q.Branch.ID)
 	if err != nil {
 		return out, err
@@ -378,6 +382,9 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 			if _, err = tx.ExecContext(ctx, "UPDATE core_resources SET namespace_id=?,revision=?,body=? WHERE scope=? AND domain=? AND id=?", configurationNullable(ns), r.Revision, []byte(rb), scope, q.Domain.Key, r.ID); err != nil {
 				return out, err
 			}
+			if err = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, &oldResource, &r); err != nil {
+				return out, err
+			}
 			if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, base.Head.Commit.ID, "move", q.Mutation, model.ConfigurationChange{ID: q.Snapshot.Change.ID, Summary: "resource location changed", Nodes: []model.ConfigurationNodeChange{}}, beforePath, afterPath); err != nil {
 				return out, err
 			}
@@ -484,7 +491,15 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if _, err = tx.ExecContext(ctx, "UPDATE core_branches SET head_commit_id=?,revision=?,body=? WHERE scope=? AND domain=? AND id=?", b.HeadCommitID, b.Revision, []byte(bb), scope, q.Domain.Key, b.ID); err != nil {
 		return out, err
 	}
-	if err = configurationInsertSnapshot(ctx, tx, scope, q.Domain.Key, c, q.Snapshot); err != nil {
+	if b.NameKey == "main" {
+		if err = configurationRobotReferenceLiveness(ctx, tx, scope, q.Domain.Key, base.Head.Commit.ID, base.References, false); err != nil {
+			return out, err
+		}
+	}
+	if err = configurationInsertSnapshot(ctx, tx, scope, q.Domain.Key, c, q.Snapshot, q.Domain.Key == "robot" && b.NameKey == "main"); err != nil {
+		return out, err
+	}
+	if err = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, &oldResource, &r); err != nil {
 		return out, err
 	}
 	if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, c.ID, model.ResourceCommitOperation, q.Mutation, q.Snapshot.Change, "", ""); err != nil {
@@ -501,11 +516,15 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 			return out, err
 		}
 	}
-	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCommitOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "committed", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
+	var workflowEffects []string
+	if b.NameKey == "main" {
+		workflowEffects = robotWorkflowEffects(q.Domain.Key, true, true, oldResource.Name, r.Name, base.References, q.Snapshot.References)
+	}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, AffectedWorkflowIDs: workflowEffects, Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCommitOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "committed", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
 	err = configurationFinishReceipt(ctx, tx, scope, out, q.Snapshot, control, mainBytes)
 	return out, err
 }
-func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain string, c model.ConfigurationCommit, s model.PreparedConfigurationSnapshot) error {
+func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain string, c model.ConfigurationCommit, s model.PreparedConfigurationSnapshot, currentMainLive bool) error {
 	cb, e := encode(c)
 	if e != nil {
 		return e
@@ -529,13 +548,13 @@ func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain 
 	if _, e = tx.ExecContext(ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", scope, domain, c.ID, c.ResourceID, c.BranchID, c.Version, c.SourceCommitID, c.ContentDigest, s.Payload, s.Manifest, s.Identity, s.CatalogSummary, []byte(cb)); e != nil {
 		return e
 	}
-	stmt, e := tx.PrepareContext(ctx, "INSERT INTO core_references VALUES(?,?,?,?,?,?,?,?)")
+	stmt, e := tx.PrepareContext(ctx, "INSERT INTO core_references(scope,domain,commit_id,slot,target_domain,target_resource_id,target_commit_id,body,current_main_live) VALUES(?,?,?,?,?,?,?,?,?)")
 	if e != nil {
 		return e
 	}
 	defer stmt.Close()
 	for i, ref := range s.References {
-		if _, e = stmt.ExecContext(ctx, scope, domain, c.ID, ref.Slot, ref.TargetDomain, ref.TargetResourceID, ref.TargetCommitID, []byte(bodies[i])); e != nil {
+		if _, e = stmt.ExecContext(ctx, scope, domain, c.ID, ref.Slot, ref.TargetDomain, ref.TargetResourceID, ref.TargetCommitID, []byte(bodies[i]), currentMainLive); e != nil {
 			return e
 		}
 	}

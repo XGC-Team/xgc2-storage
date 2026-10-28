@@ -43,7 +43,7 @@ var RecordsSQL string
 
 // SchemaVersion is the only admitted Core data layout. Development storage is
 // initialized explicitly; this module never migrates or scrubs older facts.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // Module registers the Core data module with the storage engine.
 func Module() engine.Module {

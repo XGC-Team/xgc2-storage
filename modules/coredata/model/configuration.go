@@ -234,9 +234,21 @@ type ConfigurationCommitIdentity struct {
 
 // ConfigurationCommitCatalog contains one resource's selected immutable page
 // and the same-reader current-main visibility fence.
+type ConfigurationHistoryFence struct {
+	NextVersion string `json:"next_version"`
+	Generation  int64  `json:"generation"`
+	Archived    bool   `json:"archived"`
+}
+
+type ConfigurationCommitCatalogRead struct {
+	Catalog       ConfigurationCatalogRead   `json:"catalog"`
+	ExpectedFence *ConfigurationHistoryFence `json:"expected_fence,omitempty"`
+}
+
 type ConfigurationCommitCatalog struct {
 	Resource    ConfigurationResource       `json:"resource"`
 	CurrentMain ConfigurationVisibilityPin  `json:"current_main"`
+	Fence       ConfigurationHistoryFence   `json:"fence"`
 	Items       []ConfigurationCommitHeader `json:"items"`
 }
 type ConfigurationCommitHeader struct {
@@ -264,15 +276,17 @@ type ConfigurationReceipt struct {
 }
 type ConfigurationMutationResult struct {
 	// AffectedAgentIDs is the bounded exact-identity union from the before and after transaction views.
-	AffectedAgentIDs []string               `json:"affected_agent_ids"`
-	Found            bool                   `json:"found"`
-	Replayed         bool                   `json:"replayed"`
-	Key              string                 `json:"key"`
-	Domain           string                 `json:"domain"`
-	Operation        string                 `json:"operation"`
-	IntentDigest     string                 `json:"intent_digest"`
-	PlanDigest       string                 `json:"plan_digest"`
-	Result           ConfigurationPublished `json:"result"`
+	AffectedAgentIDs []string `json:"affected_agent_ids"`
+	// AffectedWorkflowIDs contains only Workflow labels changed by this Robot mutation.
+	AffectedWorkflowIDs []string               `json:"affected_workflow_ids"`
+	Found               bool                   `json:"found"`
+	Replayed            bool                   `json:"replayed"`
+	Key                 string                 `json:"key"`
+	Domain              string                 `json:"domain"`
+	Operation           string                 `json:"operation"`
+	IntentDigest        string                 `json:"intent_digest"`
+	PlanDigest          string                 `json:"plan_digest"`
+	Result              ConfigurationPublished `json:"result"`
 }
 
 // Exactly one selector: resource+branch, resource+commit, or namespace+name_key.

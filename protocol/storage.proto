@@ -7,10 +7,11 @@ message Token { string database_id=1; string schema=2; string revision=3; }
 message Query {
  string collection=1; repeated string keys=2; string index=3;
  repeated bytes equal_json=4; string after=5; int32 limit=6;
- bool include_deleted=7;
+ bool include_deleted=7; string header_index=8;
 }
 message SnapshotRequest { Scope scope=1; repeated Query queries=2; Token at=3; }
-message Record { string key=1; string version=2; bool deleted=3; bool missing=4; bytes data_json=5; string collection=6; }
+message RecordHeader { int64 bytes=1; string index=2; bytes tuple_json=3; }
+message Record { string key=1; string version=2; bool deleted=3; bool missing=4; bytes data_json=5; string collection=6; RecordHeader header=7; }
 message QueryResult { string collection=1; repeated Record records=2; string next_after=3; }
 message SnapshotResponse { Scope scope=1; Token token=2; repeated QueryResult results=3; }
 message Mutation { string collection=1; string key=2; string expected_version=3; bool delete=4; bytes data_json=5; }

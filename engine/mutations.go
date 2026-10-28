@@ -97,7 +97,19 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		var v int64
 		var deleted bool
 		var oldData []byte
-		err = tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v, &deleted, &oldData)
+		var oldBytes int64
+		if len(c.Indexes) == 0 || m.Delete {
+			// Deletion and unindexed replacement need versions and byte counts.
+			// Declared deletion tuples are removed by the exact record-key index;
+			// SQLite need not copy the obsolete body into the application.
+			s.mutationMetadataReads.Add(1)
+			err = tx.QueryRowContext(ctx, "SELECT version,deleted,length(data) FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v, &deleted, &oldBytes)
+		} else {
+			s.mutationPayloadReads.Add(1)
+			err = tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, m.Collection, m.Key).Scan(&v, &deleted, &oldData)
+			oldBytes = int64(len(oldData))
+			s.mutationPayloadBytes.Add(uint64(len(oldData)))
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			v = 0
 		} else if err != nil {
@@ -109,11 +121,20 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		}
 		previous[i] = previousRecord{version: v, live: v > 0 && !deleted, tombstone: v > 0 && deleted}
 		if previous[i].live {
-			previous[i].bytes = int64(len(oldData) + len(m.Key))
+			previous[i].bytes = oldBytes + int64(len(m.Key))
+		}
+		if m.Delete {
+			if previous[i].live && len(c.Indexes) != 0 {
+				if err := deleteRecordLookups(ctx, tx, id, c, m.Key); err != nil {
+					return nil, err
+				}
+			}
+			continue
 		}
 		hadIndexes := previous[i].live
 		var oldDocument map[string]any
 		if hadIndexes && len(c.Indexes) > 0 {
+			s.mutationOldDecodes.Add(1)
 			_, oldDocument, err = canonicalObject(oldData)
 			if err != nil {
 				return nil, err
@@ -217,4 +238,38 @@ func (s *Store) applyMutations(ctx context.Context, tx *sql.Tx, id string, next 
 		}
 	}
 	return versions, nil
+}
+
+// deleteRecordLookups removes only this exact record's owner-maintained index
+// entries. RETURNING validates the declared entry set without reading Data or
+// scanning the collection's index-value ranges. Any mismatch rolls back Batch.
+func deleteRecordLookups(ctx context.Context, tx *sql.Tx, scope string, collection api.Collection, key string) error {
+	rows, err := tx.QueryContext(ctx, "DELETE FROM lookups INDEXED BY lookups_by_key WHERE scope=? AND collection=? AND key=? RETURNING index_name", scope, collection.ID, key)
+	if err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(collection.Indexes))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		declared := false
+		for _, index := range collection.Indexes {
+			declared = declared || index.ID == name
+		}
+		if !declared || seen[name] {
+			rows.Close()
+			return fail("data_loss", "record index entries disagree with their declaration")
+		}
+		seen[name] = true
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return err
+	}
+	if len(seen) != len(collection.Indexes) {
+		return fail("data_loss", "record is missing a declared index entry")
+	}
+	return nil
 }

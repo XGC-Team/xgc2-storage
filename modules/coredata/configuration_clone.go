@@ -27,7 +27,7 @@ func configurationCloneReceipt(ctx context.Context, tx *sql.Tx, scope string, q 
 	if intent != q.Mutation.IntentDigest || op != model.ConfigurationNamespaceCloneOperation {
 		return out, failure("conflict", "mutation identity reused")
 	}
-	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || !validAffectedAgentIDs(out.AffectedAgentIDs) {
+	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || !validAffectedAgentIDs(out.AffectedAgentIDs) || !validAffectedWorkflows(out.AffectedWorkflowIDs) {
 		return out, failure("data_loss", "invalid namespace clone receipt")
 	}
 	out.Replayed = true
@@ -149,6 +149,12 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 		out.AffectedAgentIDs, err = mergeAffectedAgents(out.AffectedAgentIDs, created.AffectedAgentIDs)
 		if err != nil {
 			return out, err
+		}
+		if len(created.AffectedWorkflowIDs) != 0 {
+			out.AffectedWorkflowIDs, err = mergeAffectedWorkflows(out.AffectedWorkflowIDs, created.AffectedWorkflowIDs)
+			if err != nil {
+				return out, err
+			}
 		}
 	}
 	body, err := encode(out)

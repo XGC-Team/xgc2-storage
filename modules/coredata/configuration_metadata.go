@@ -21,6 +21,7 @@ func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string
 	if err != nil {
 		return out, err
 	}
+	oldResource := r
 	if r.Revision != q.ExpectedRevision {
 		return out, failure("conflict", "resource revision changed")
 	}
@@ -72,6 +73,9 @@ func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string
 		if _, err = tx.ExecContext(ctx, "UPDATE core_resources SET namespace_id=?,revision=?,body=? WHERE scope=? AND domain=? AND id=?", configurationNullable(r.NamespaceID), r.Revision, body, scope, q.Domain.Key, r.ID); err != nil {
 			return out, err
 		}
+		if err = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, &oldResource, &r); err != nil {
+			return out, err
+		}
 		change := model.ConfigurationChange{ID: digest(struct{ Domain, Key string }{q.Domain.Key, q.Mutation.Key}), Summary: op, Nodes: []model.ConfigurationNodeChange{}}
 		if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, snapshot.Head.Commit.ID, op, q.Mutation, change, before, r.NamespaceID); err != nil {
 			return out, err
@@ -87,5 +91,5 @@ func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string
 	}
 	// The audit above includes the exact location change; do not append a second
 	// generic state audit when storing the one durable product receipt.
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: snapshot.Head.Commit}, false, nil)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: snapshot.Head.Commit}, false, nil, nil)
 }

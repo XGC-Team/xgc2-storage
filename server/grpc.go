@@ -56,7 +56,7 @@ func grpcError(ctx context.Context, e error) error {
 			code = codes.Unavailable
 		case "permission_denied":
 			code = codes.PermissionDenied
-		case "corrupt":
+		case "corrupt", "data_loss":
 			code = codes.DataLoss
 		case "io_error":
 			code = codes.Internal

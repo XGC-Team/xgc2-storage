@@ -184,7 +184,7 @@ func seedTree(t *testing.T, db *sql.DB, ctx context.Context) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		execSQL(t, db, ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,5,?,0,'','', '{}')", testScope, "robot", id, namespace, id, id, commit)
+		execSQL(t, db, ctx, "INSERT INTO core_resources(scope,domain,id,namespace_id,name,name_key,revision,main_commit_id,archived,origin_resource_id,origin_commit_id,body) VALUES(?,?,?,?,?,?,5,?,0,'','', '{}')", testScope, "robot", id, namespace, id, id, commit)
 		execSQL(t, db, ctx, "INSERT INTO core_branches VALUES(?,?,?,?,'main',?,4,'{}')", testScope, "robot", branch, id, commit)
 		catalogDigest, err := model.ConfigurationCatalogDigest(pin, identity, summary)
 		if err != nil {
@@ -200,7 +200,7 @@ func seedTree(t *testing.T, db *sql.DB, ctx context.Context) {
 		}
 		execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,7,'',?,?,?,?,?,?)", testScope, "robot", commit, id, branch, pin, []byte(payload), []byte(manifest), identity, summary, commitBody)
 		for _, f := range refs {
-			execSQL(t, db, ctx, "INSERT INTO core_references VALUES(?,?,?,?,?,?,?,?)", testScope, "robot", commit, f.Slot, f.TargetDomain, f.TargetResourceID, f.TargetCommitID, []byte(f.Body))
+			execSQL(t, db, ctx, "INSERT INTO core_references(scope,domain,commit_id,slot,target_domain,target_resource_id,target_commit_id,body) VALUES(?,?,?,?,?,?,?,?)", testScope, "robot", commit, f.Slot, f.TargetDomain, f.TargetResourceID, f.TargetCommitID, []byte(f.Body))
 		}
 	}
 }

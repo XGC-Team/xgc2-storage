@@ -87,6 +87,11 @@ declared collections: `Snapshot`, `Batch` (atomic compare-and-set, optional `Rel
 reader while the consumer computes. A batch has a receipt only when it carries a request id; an
 in-process caller that needs no replay protection leaves it empty.
 
+An exact-key query can select `header_index` for a declared scalar index.
+Each returned record then carries `header` (stored byte length and index tuple)
+instead of `data`. Missing keys and tombstones keep their explicit identities.
+Headers use the same snapshot revision and aggregate row/byte limits as full reads.
+
 ### Quotas
 
 Quotas count **live** rows and bytes: deleting frees them at once. Document collections keep a
@@ -95,6 +100,8 @@ counters maintained with the revision, expired by a timer set for the next expir
 
 ## Current schema admission
 
+The current engine epoch is 3. It includes the scoped record-key lookup index;
+older engine epochs are refused without migration or index backfill.
 The embedded host admits the current schema only. Older and newer databases are
 refused before serving or changing accepted facts. Core data ships no historic
 decoder or migrator. Fresh development storage is initialized explicitly; opening

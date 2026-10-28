@@ -27,14 +27,14 @@ func configurationStateReceipt(ctx context.Context, tx *sql.Tx, scope, op string
 	return configurationReceipt(ctx, tx, scope, model.ConfigurationReceipt{Domain: d, Key: m.Key, IntentDigest: m.IntentDigest, Operations: []string{op}})
 }
 
-func configurationStateFinish(ctx context.Context, tx *sql.Tx, scope, op string, d model.ConfigurationDomainGuard, m model.ConfigurationMutation, plan, disposition string, h model.ConfigurationHead, changed bool, affected []string) (out model.ConfigurationMutationResult, err error) {
+func configurationStateFinish(ctx context.Context, tx *sql.Tx, scope, op string, d model.ConfigurationDomainGuard, m model.ConfigurationMutation, plan, disposition string, h model.ConfigurationHead, changed bool, affected, affectedWorkflows []string) (out model.ConfigurationMutationResult, err error) {
 	if changed {
 		c := model.ConfigurationChange{ID: digest(struct{ Domain, Key string }{d.Key, m.Key}), Summary: op, Nodes: []model.ConfigurationNodeChange{}}
 		if err = configurationChange(ctx, tx, scope, d.Key, h.Resource.ID, h.Commit.ID, op, m, c, "", ""); err != nil {
 			return out, err
 		}
 	}
-	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: m.Key, Domain: d.Key, Operation: op, IntentDigest: m.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: disposition, Head: h}}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, AffectedWorkflowIDs: affectedWorkflows, Found: true, Key: m.Key, Domain: d.Key, Operation: op, IntentDigest: m.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: disposition, Head: h}}
 	err = configurationSaveReceipt(ctx, tx, scope, out)
 	return
 }
@@ -123,7 +123,7 @@ func configurationBranchCreate(ctx context.Context, tx *sql.Tx, scope string, q 
 	if e != nil {
 		return out, e
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, "created", model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, true, nil)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, "created", model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, true, nil, nil)
 }
 
 func configurationBranchArchive(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationBranchArchive) (out model.ConfigurationMutationResult, err error) {
@@ -177,6 +177,21 @@ func configurationBranchArchive(ctx context.Context, tx *sql.Tx, scope string, q
 		if _, e = tx.ExecContext(ctx, "UPDATE core_branches SET revision=?,body=? WHERE scope=? AND domain=? AND id=?", b.Revision, body, scope, q.Domain.Key, b.ID); e != nil {
 			return out, e
 		}
+		// A newly forked branch has no authored history rows. Once it does,
+		// archiving changes the branch metadata returned with those rows.
+		if source.Head.Commit.BranchID == b.ID {
+			result, updateErr := tx.ExecContext(ctx, "UPDATE core_resources SET history_generation=history_generation+1 WHERE scope=? AND domain=? AND id=? AND history_generation<9223372036854775807", scope, q.Domain.Key, r.ID)
+			if updateErr != nil {
+				return out, updateErr
+			}
+			count, updateErr := result.RowsAffected()
+			if updateErr != nil {
+				return out, updateErr
+			}
+			if count != 1 {
+				return out, failure("resource_exhausted", "history generation exhausted")
+			}
+		}
 	}
 	plan, e := model.ConfigurationBranchArchivePlanDigest(q)
 	if e != nil {
@@ -186,7 +201,7 @@ func configurationBranchArchive(ctx context.Context, tx *sql.Tx, scope string, q
 	if changed {
 		disposition = "archived"
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, changed, nil)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, changed, nil, nil)
 }
 
 func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceState) (out model.ConfigurationMutationResult, err error) {
@@ -255,6 +270,7 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 				return out, e
 			}
 		}
+		oldResource := r
 		old, _ := encode(r)
 		r.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
 		r.ArchivedAt = ""
@@ -272,7 +288,21 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 		if e = reserve(ctx, tx, scope, 0, int64(len(body)-len(old))); e != nil {
 			return out, e
 		}
-		if _, e = tx.ExecContext(ctx, "UPDATE core_resources SET revision=?,archived=?,body=? WHERE scope=? AND domain=? AND id=?", r.Revision, q.Archived, body, scope, q.Domain.Key, r.ID); e != nil {
+		result, updateErr := tx.ExecContext(ctx, "UPDATE core_resources SET revision=?,archived=?,body=?,history_generation=history_generation+1 WHERE scope=? AND domain=? AND id=? AND history_generation<9223372036854775807", r.Revision, q.Archived, body, scope, q.Domain.Key, r.ID)
+		if updateErr != nil {
+			return out, updateErr
+		}
+		count, updateErr := result.RowsAffected()
+		if updateErr != nil {
+			return out, updateErr
+		}
+		if count != 1 {
+			return out, failure("resource_exhausted", "history generation exhausted")
+		}
+		if e = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, &oldResource, &r); e != nil {
+			return out, e
+		}
+		if e = configurationRobotReferenceLiveness(ctx, tx, scope, q.Domain.Key, r.MainCommitID, source.References, !q.Archived); e != nil {
 			return out, e
 		}
 		if !q.Archived {
@@ -354,5 +384,9 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 			return out, e
 		}
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: source.Head.Commit}, changed, affected)
+	var workflowEffects []string
+	if changed {
+		workflowEffects = robotWorkflowEffects(q.Domain.Key, q.Archived, !q.Archived, r.Name, r.Name, source.References, source.References)
+	}
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: source.Head.Commit}, changed, affected, workflowEffects)
 }

@@ -365,7 +365,7 @@ func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model
 	if intent != q.IntentDigest || !allowed {
 		return out, failure("conflict", "product mutation identity reused")
 	}
-	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || out.Key != q.Key || out.Domain != q.Domain.Key || out.Operation != op || out.IntentDigest != intent || !out.Found || !validAffectedAgentIDs(out.AffectedAgentIDs) {
+	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || out.Key != q.Key || out.Domain != q.Domain.Key || out.Operation != op || out.IntentDigest != intent || !out.Found || !validAffectedAgentIDs(out.AffectedAgentIDs) || !validAffectedWorkflows(out.AffectedWorkflowIDs) {
 		return out, failure("data_loss", "invalid durable product receipt")
 	}
 	out.Replayed = true

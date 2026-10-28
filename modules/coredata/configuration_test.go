@@ -88,20 +88,23 @@ func configurationCounts(t *testing.T, db *sql.DB, ctx context.Context) string {
 	if e := db.QueryRowContext(ctx, "SELECT rows,bytes FROM core_data_usage WHERE scope=?", testScope).Scan(&rows, &bytes); e != nil && !errors.Is(e, sql.ErrNoRows) {
 		t.Fatal(e)
 	}
-	return fmt.Sprint(count(t, db, ctx, "core_resources"), count(t, db, ctx, "core_branches"), count(t, db, ctx, "core_snapshots"), count(t, db, ctx, "core_references"), count(t, db, ctx, "core_configuration_agent_index"), count(t, db, ctx, "core_changes"), count(t, db, ctx, "core_configuration_receipts"), rows, bytes)
+	return fmt.Sprint(count(t, db, ctx, "core_resources"), count(t, db, ctx, "core_branches"), count(t, db, ctx, "core_snapshots"), count(t, db, ctx, "core_references"), count(t, db, ctx, "core_configuration_agent_index"), count(t, db, ctx, "core_configuration_catalog_cuts"), count(t, db, ctx, "core_changes"), count(t, db, ctx, "core_configuration_receipts"), rows, bytes)
 }
 func configurationQuotaBytes(t *testing.T, db *sql.DB, ctx context.Context) (charged, live int64) {
 	t.Helper()
 	if err := db.QueryRowContext(ctx, "SELECT bytes FROM core_data_usage WHERE scope=?", testScope).Scan(&charged); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"core_namespaces", "core_resources", "core_branches", "core_snapshots", "core_references", "core_configuration_agent_index", "core_changes", "core_configuration_receipts", "core_catalog_receipts"} {
+	for _, table := range []string{"core_namespaces", "core_resources", "core_branches", "core_snapshots", "core_references", "core_configuration_agent_index", "core_configuration_catalog_cuts", "core_changes", "core_configuration_receipts", "core_catalog_receipts"} {
 		expression := "length(body)"
 		if table == "core_snapshots" {
 			expression += "+length(payload)+length(manifest)+length(identity_json)+length(catalog_summary_json)"
 		}
 		if table == "core_configuration_agent_index" {
 			expression = "length(kind)+length(agent_id)+length(slot_id)+length(related_robot_resource_id)"
+		}
+		if table == "core_configuration_catalog_cuts" {
+			expression = "length(CAST(scope AS BLOB))+length(CAST(domain AS BLOB))+length(CAST(selector AS BLOB))+length(CAST(namespace_id AS BLOB))+64"
 		}
 		var bytes int64
 		if err := db.QueryRowContext(ctx, "SELECT coalesce(sum("+expression+"),0) FROM "+table+" WHERE scope=?", testScope).Scan(&bytes); err != nil {

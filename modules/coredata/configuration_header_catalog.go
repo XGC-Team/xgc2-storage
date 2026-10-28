@@ -49,6 +49,10 @@ func configurationHeaderPage(ctx context.Context, tx *sql.Tx, scope string, q mo
 	if _, err := configurationDomain(ctx, tx, q.Domain); err != nil {
 		return nil, err
 	}
+	return configurationHeaderPageInDomain(ctx, tx, scope, q, selector, ordinary)
+}
+
+func configurationHeaderPageInDomain(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead, selector string, ordinary bool) ([]model.ConfigurationResourceHeader, error) {
 	predicate, args, limit, err := configurationResourceCatalogSelector(scope, q)
 	if err != nil {
 		return nil, err
@@ -60,8 +64,10 @@ func configurationHeaderPage(ctx context.Context, tx *sql.Tx, scope string, q mo
 			index += "_namespace"
 		}
 		if ordinary {
+			// Clone origin is provenance, not protection. Filter the explicit
+			// System flag before LIMIT/OFFSET with the ordinary selector index.
 			index += "_ordinary"
-			predicate += " AND r.origin_resource_id='' AND json_extract(CAST(r.body AS TEXT),'$.system')=0"
+			predicate += " AND json_extract(CAST(r.body AS TEXT),'$.system')=0"
 		} else if !q.IncludeArchived {
 			index += "_live"
 		}

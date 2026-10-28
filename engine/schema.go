@@ -14,9 +14,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// engineVersion is the schema version of the engine's own tables. Version 1
-// carried a manifest hash, Named receipts and lifetime-counted usage.
-const engineVersion = 2
+// engineVersion identifies the current engine tables and required indexes.
+// Older engine epochs are refused without migration or index rebuilding.
+const engineVersion = 3
 
 const ddl = `
 CREATE TABLE storage_meta(id INTEGER PRIMARY KEY CHECK(id=1),database_id TEXT NOT NULL);
@@ -27,6 +27,7 @@ CREATE TABLE usage(scope TEXT NOT NULL,collection TEXT NOT NULL,records INTEGER 
 CREATE TABLE records(scope TEXT NOT NULL,collection TEXT NOT NULL,key TEXT NOT NULL,version INTEGER NOT NULL,deleted INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(scope,collection,key));
 CREATE INDEX records_tombstones ON records(scope,collection,version) WHERE deleted=1;
 CREATE TABLE lookups(scope TEXT NOT NULL,collection TEXT NOT NULL,index_name TEXT NOT NULL,index_value TEXT NOT NULL,key TEXT NOT NULL,unique_value TEXT,PRIMARY KEY(scope,collection,index_name,index_value,key),UNIQUE(scope,collection,index_name,unique_value));
+CREATE INDEX lookups_by_key ON lookups(scope,collection,key);
 CREATE TABLE receipts(scope TEXT NOT NULL,request_id TEXT NOT NULL,digest TEXT NOT NULL,expires INTEGER NOT NULL,body BLOB NOT NULL,PRIMARY KEY(scope,request_id));
 CREATE INDEX receipts_expiry ON receipts(expires);
 CREATE TABLE collection_indexes(namespace TEXT NOT NULL,collection TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(namespace,collection));
@@ -115,9 +116,8 @@ func hasTable(ctx context.Context, q Queryer, name string) (bool, error) {
 	return n > 0, err
 }
 
-// storedVersions reads the schema version of every installed component. A
-// database written before versions existed counts as engine version 1 and
-// each module reports its own legacy installation.
+// storedVersions reads current explicit component markers. An absent marker
+// is refused without probing historic layouts or invoking legacy decoders.
 func (s *Store) storedVersions(ctx context.Context) (map[string]int, error) {
 	versions := map[string]int{}
 	ok, err := hasTable(ctx, s.writer, "storage_meta")
@@ -131,25 +131,7 @@ func (s *Store) storedVersions(ctx context.Context) (map[string]int, error) {
 		return nil, err
 	}
 	if !ok {
-		var format string
-		if err = s.writer.QueryRowContext(ctx, "SELECT format,database_id FROM storage_meta WHERE id=1").Scan(&format, &s.dbid); err != nil || format != "storage-v1" {
-			return nil, fail("failed_precondition", "not a storage-v1 or newer database")
-		}
-		versions["engine"] = 1
-		for id := range s.usedModules() {
-			m := s.modules[id]
-			if m.Legacy == nil {
-				continue
-			}
-			v, err := m.Legacy(ctx, s.writer)
-			if err != nil {
-				return nil, err
-			}
-			if v > 0 {
-				versions[id] = v
-			}
-		}
-		return versions, nil
+		return nil, fail("failed_precondition", "current engine schema version markers are required")
 	}
 	if err = s.writer.QueryRowContext(ctx, "SELECT database_id FROM storage_meta WHERE id=1").Scan(&s.dbid); err != nil {
 		return nil, err
@@ -176,8 +158,8 @@ func (s *Store) storedVersions(ctx context.Context) (map[string]int, error) {
 	return versions, nil
 }
 
-// upgrade opens an existing database. The same schema version opens whatever
-// the code, an older one is migrated after a backup, a newer one is refused.
+// upgrade admits only the current engine epoch. Compiled modules retain their
+// own explicit installation policy; an engine upgrade never runs implicitly.
 func (s *Store) upgrade(ctx context.Context) error {
 	versions, err := s.storedVersions(ctx)
 	if err != nil {
@@ -187,9 +169,7 @@ func (s *Store) upgrade(ctx context.Context) error {
 	if v := versions["engine"]; v > engineVersion {
 		return fail("failed_precondition", fmt.Sprintf("database engine schema is version %d, newer than this release supports (%d); upgrade the software", v, engineVersion))
 	} else if v < engineVersion {
-		for ; v < engineVersion; v++ {
-			plan = append(plan, migrationStep{module: "engine", from: v, to: v + 1, apply: engineMigrations[v]})
-		}
+		return fail("failed_precondition", fmt.Sprintf("database engine schema is version %d; this release requires current version %d", v, engineVersion))
 	}
 	for _, id := range sortedModuleIDs(s.modules, s.usedModules()) {
 		m := s.modules[id]
@@ -256,37 +236,6 @@ func (s *Store) backupBeforeMigration(ctx context.Context, plan []migrationStep)
 		return err
 	}
 	return unix.Fsync(s.owner.parent)
-}
-
-// engineMigrations[v] upgrades the engine's own tables from version v to v+1.
-var engineMigrations = map[int]func(context.Context, *sql.Tx, []string) error{1: migrateEngine1}
-
-// migrateEngine1 upgrades the engine tables from version 1 to 2: the manifest hash
-// and Named results disappear, receipts get incremental counters and usage
-// counts live records and bytes instead of every key ever written.
-func migrateEngine1(ctx context.Context, tx *sql.Tx, _ []string) error {
-	for _, statement := range []string{
-		"ALTER TABLE storage_meta DROP COLUMN format",
-		"ALTER TABLE storage_meta DROP COLUMN manifest_hash",
-		"CREATE TABLE schema_versions(module TEXT PRIMARY KEY,version INTEGER NOT NULL CHECK(version>0))",
-		// Named receipts belonged to in-process data calls, which keep none.
-		"DELETE FROM receipts WHERE EXISTS (SELECT 1 FROM named_results n WHERE n.scope=receipts.scope AND n.request_id=receipts.request_id)",
-		"DROP TABLE named_results",
-		"ALTER TABLE scopes ADD COLUMN receipts INTEGER NOT NULL DEFAULT 0 CHECK(receipts>=0)",
-		"UPDATE scopes SET receipts=(SELECT count(*) FROM receipts r WHERE r.scope=scopes.scope)",
-		"ALTER TABLE usage ADD COLUMN tombstones INTEGER NOT NULL DEFAULT 0",
-		`UPDATE usage SET
- records=(SELECT count(*) FROM records r WHERE r.scope=usage.scope AND r.collection=usage.collection AND r.deleted=0),
- bytes=(SELECT coalesce(sum(length(r.data)+length(CAST(r.key AS BLOB))),0) FROM records r WHERE r.scope=usage.scope AND r.collection=usage.collection AND r.deleted=0),
- tombstones=(SELECT count(*) FROM records r WHERE r.scope=usage.scope AND r.collection=usage.collection AND r.deleted=1)`,
-		"CREATE INDEX records_tombstones ON records(scope,collection,version) WHERE deleted=1",
-		"CREATE TABLE collection_indexes(namespace TEXT NOT NULL,collection TEXT NOT NULL,signature TEXT NOT NULL,PRIMARY KEY(namespace,collection))",
-	} {
-		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return err
-		}
-	}
-	return setVersion(ctx, tx, "engine", engineVersion)
 }
 
 // Retire deletes the data of collections that a release no longer declares,

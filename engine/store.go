@@ -107,6 +107,10 @@ type Store struct {
 	waitNS, sqlNS                                atomic.Uint64
 	durable, relaxed, fsyncs                     atomic.Uint64
 	checkpoints, receiptsPruned, maintenanceErrs atomic.Uint64
+	mutationMetadataReads, mutationPayloadReads  atomic.Uint64
+	mutationPayloadBytes, mutationOldDecodes     atomic.Uint64
+	snapshotPayloadReads, snapshotPayloadBytes   atomic.Uint64
+	snapshotHeaderReads, snapshotHeaderBytes     atomic.Uint64
 	maintenance                                  *maintenance
 }
 

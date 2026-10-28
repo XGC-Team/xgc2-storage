@@ -87,6 +87,12 @@ func (c *local) Snapshot(ctx context.Context, _ string, r api.SnapshotRequest) (
 	}
 	defer cancel()
 	out, err := c.store.Snapshot(ctx, r)
+	if err == nil {
+		err = validateSnapshotRepresentation(r, out)
+		if err != nil {
+			out = api.SnapshotResponse{}
+		}
+	}
 	return out, localError(err)
 }
 

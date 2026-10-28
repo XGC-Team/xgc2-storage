@@ -30,7 +30,7 @@ func SnapshotInput(r api.SnapshotRequest) *SnapshotRequest {
 		out.At = token(*r.At)
 	}
 	for _, q := range r.Queries {
-		item := &Query{Collection: q.Collection, Keys: q.Keys, Index: q.Index, After: q.After, Limit: int32(q.Limit), IncludeDeleted: q.IncludeDeleted}
+		item := &Query{Collection: q.Collection, Keys: q.Keys, Index: q.Index, After: q.After, Limit: int32(q.Limit), IncludeDeleted: q.IncludeDeleted, HeaderIndex: q.HeaderIndex}
 		for _, v := range q.Equal {
 			item.EqualJson = append(item.EqualJson, []byte(v))
 		}
@@ -45,7 +45,7 @@ func (r *SnapshotRequest) API() api.SnapshotRequest {
 		out.At = &t
 	}
 	for _, q := range r.Queries {
-		item := api.Query{Collection: q.Collection, Keys: q.Keys, Index: q.Index, After: q.After, Limit: int(q.Limit), IncludeDeleted: q.IncludeDeleted}
+		item := api.Query{Collection: q.Collection, Keys: q.Keys, Index: q.Index, After: q.After, Limit: int(q.Limit), IncludeDeleted: q.IncludeDeleted, HeaderIndex: q.HeaderIndex}
 		for _, v := range q.EqualJson {
 			item.Equal = append(item.Equal, json.RawMessage(v))
 		}
@@ -76,10 +76,18 @@ func (r *SnapshotResponse) API() api.SnapshotResponse {
 	return out
 }
 func record(r api.Record) *Record {
-	return &Record{Collection: r.Collection, Key: r.Key, Version: r.Version, Deleted: r.Deleted, Missing: r.Missing, DataJson: r.Data}
+	out := &Record{Collection: r.Collection, Key: r.Key, Version: r.Version, Deleted: r.Deleted, Missing: r.Missing, DataJson: r.Data}
+	if r.Header != nil {
+		out.Header = &RecordHeader{Bytes: r.Header.Bytes, Index: r.Header.Index, TupleJson: r.Header.Tuple}
+	}
+	return out
 }
 func apiRecord(r *Record) api.Record {
-	return api.Record{Collection: r.Collection, Key: r.Key, Version: r.Version, Deleted: r.Deleted, Missing: r.Missing, Data: r.DataJson}
+	out := api.Record{Collection: r.Collection, Key: r.Key, Version: r.Version, Deleted: r.Deleted, Missing: r.Missing, Data: r.DataJson}
+	if r.Header != nil {
+		out.Header = &api.RecordHeader{Bytes: r.Header.Bytes, Index: r.Header.Index, Tuple: r.Header.TupleJson}
+	}
+	return out
 }
 func BatchInput(r api.BatchRequest) *BatchRequest {
 	out := &BatchRequest{Scope: scope(r.Scope), Expected: token(r.Expected), RequestId: r.RequestID}

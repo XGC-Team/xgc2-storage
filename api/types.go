@@ -30,6 +30,9 @@ type Query struct {
 	After          string            `json:"after,omitempty"`
 	Limit          int               `json:"limit,omitempty"`
 	IncludeDeleted bool              `json:"include_deleted,omitempty"`
+	// HeaderIndex selects exact-key metadata plus one declared index tuple.
+	// Returned records carry Header instead of Data, including absent keys.
+	HeaderIndex string `json:"header_index,omitempty"`
 }
 type SnapshotRequest struct {
 	Scope   Scope   `json:"scope"`
@@ -44,6 +47,16 @@ type Record struct {
 	Deleted    bool            `json:"deleted,omitempty"`
 	Missing    bool            `json:"missing,omitempty"`
 	Data       json.RawMessage `json:"data,omitempty"`
+	Header     *RecordHeader   `json:"header,omitempty"`
+}
+
+// RecordHeader is a projection, never a complete document. Bytes is the stored
+// BLOB length. Tuple contains the declared index's scalars; numbers use
+// {"number":"<canonical rational>"}. Missing/deleted keys have no live tuple.
+type RecordHeader struct {
+	Bytes int64           `json:"bytes"`
+	Index string          `json:"index"`
+	Tuple json.RawMessage `json:"tuple,omitempty"`
 }
 type QueryResult struct {
 	Collection string   `json:"collection"`

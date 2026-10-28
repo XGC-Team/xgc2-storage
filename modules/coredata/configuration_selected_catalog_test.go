@@ -103,14 +103,14 @@ func TestSelectedCatalogUsesIndexAndFixedBytesWithUnrelatedResourcesAndHistory(t
 		current = configurationWrite(t, db, ctx, model.ResourceCommitOperation, q)
 		previous = q.Snapshot.Manifest
 	}
-	read := func() (int, string) {
+	read := func(ordinary bool) (int, string) {
 		t.Helper()
 		rec.statements, rec.bytes = nil, 0
 		tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
 			t.Fatal(err)
 		}
-		rows, err := configurationHeaderPage(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 8}, "camera:chosen", false)
+		rows, err := configurationHeaderPage(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 8}, "camera:chosen", ordinary)
 		tx.Rollback()
 		if err != nil || len(rows) != 1 || rows[0].Head.Commit.ID != current.Result.Head.Commit.ID || len(rec.statements) != 2 {
 			t.Fatalf("selected rows=%+v statements=%d err=%v", rows, len(rec.statements), err)
@@ -123,32 +123,49 @@ func TestSelectedCatalogUsesIndexAndFixedBytesWithUnrelatedResourcesAndHistory(t
 		}
 		return rec.bytes, query
 	}
-	baseline, query := read()
+	baseline, query := read(false)
+	ordinaryBaseline, ordinaryQuery := read(true)
 	for i := 0; i < 256; i++ {
 		q := configurationCreateForTest(t, domain, fmt.Sprintf("other-%03d", i), nil)
 		q.Snapshot.CatalogSummary, _ = json.Marshal(map[string]string{"_catalogSelector": fmt.Sprintf("camera:other-%03d", i)})
 		configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
 	}
-	got, _ := read()
+	got, _ := read(false)
 	if got != baseline {
 		t.Fatalf("unrelated resources changed driver bytes: %d vs %d", baseline, got)
 	}
-	rows, err := db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, testScope, domain.Key, "camera:chosen", 8, 0)
-	if err != nil {
-		t.Fatal(err)
+	ordinaryGot, _ := read(true)
+	if ordinaryGot != ordinaryBaseline {
+		t.Fatalf("unrelated resources changed ordinary selected driver bytes: %d vs %d", ordinaryBaseline, ordinaryGot)
 	}
-	defer rows.Close()
-	var plan strings.Builder
-	for rows.Next() {
-		var a, b, c int
-		var detail string
-		if err := rows.Scan(&a, &b, &c, &detail); err != nil {
+	t.Logf("selected driver bytes with 1 vs 257 resources: all=%d/%d ordinary=%d/%d", baseline, got, ordinaryBaseline, ordinaryGot)
+	for name, statement := range map[string]string{"all": query, "ordinary": ordinaryQuery} {
+		rows, err := db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+statement, testScope, domain.Key, "camera:chosen", 8, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
-		plan.WriteString(detail + "; ")
-	}
-	if !strings.Contains(plan.String(), "core_resources_catalog_selector_live (") || strings.Contains(plan.String(), "SCAN r") || strings.Contains(plan.String(), "USE TEMP B-TREE") {
-		t.Fatalf("selected plan is not indexed: %s", plan.String())
+		var plan strings.Builder
+		for rows.Next() {
+			var a, b, c int
+			var detail string
+			if err := rows.Scan(&a, &b, &c, &detail); err != nil {
+				rows.Close()
+				t.Fatal(err)
+			}
+			plan.WriteString(detail + "; ")
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		rows.Close()
+		index := "core_resources_catalog_selector_live ("
+		if name == "ordinary" {
+			index = "core_resources_catalog_selector_ordinary ("
+		}
+		if !strings.Contains(plan.String(), index) || strings.Contains(plan.String(), "SCAN r") || strings.Contains(plan.String(), "USE TEMP B-TREE") {
+			t.Fatalf("%s selected plan is not indexed: %s", name, plan.String())
+		}
 	}
 }
 
@@ -227,7 +244,7 @@ func TestSelectedCatalogEachScopeUsesTheMatchingIndex(t *testing.T) {
 	}
 }
 
-func TestSelectedCatalogOrdinaryExcludesSystemCloneAndArchive(t *testing.T) {
+func TestSelectedCatalogOrdinaryIncludesCloneAndExcludesSystemAndArchive(t *testing.T) {
 	db, ctx, domain := configurationFixture(t)
 	for _, id := range []string{"ordinary", "system", "clone", "archived"} {
 		q := configurationCreateForTest(t, domain, id, nil)
@@ -245,7 +262,7 @@ func TestSelectedCatalogOrdinaryExcludesSystemCloneAndArchive(t *testing.T) {
 	}
 	rows, err := configurationHeaderPage(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 10}, "scene", true)
 	tx.Rollback()
-	if err != nil || len(rows) != 1 || rows[0].Head.Resource.ID != "ordinary" {
+	if err != nil || len(rows) != 2 || rows[0].Head.Resource.ID != "clone" || rows[1].Head.Resource.ID != "ordinary" {
 		t.Fatalf("ordinary rows=%+v err=%v", rows, err)
 	}
 }

@@ -14,7 +14,7 @@ import (
 )
 
 func TestOnlyCurrentCoreSchemaOpensWithoutChangingAcceptedFacts(t *testing.T) {
-	for _, version := range []int{1, 2, 3, 4, 5, 6, 7, coredata.SchemaVersion + 1} {
+	for _, version := range []int{1, 2, 3, 4, 5, 6, 7, 8, coredata.SchemaVersion + 1} {
 		t.Run(string(rune('0'+version)), func(t *testing.T) {
 			f := openStore(t)
 			if _, _, err := f.core.CreateRun(f.ctx, newRun("accepted-root")); err != nil {

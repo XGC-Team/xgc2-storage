@@ -52,6 +52,20 @@ type Stats struct {
 	CheckpointRunning bool   `json:"checkpoint_running"`
 	ReceiptsPruned    uint64 `json:"receipts_pruned"`
 	MaintenanceErrors uint64 `json:"maintenance_errors"`
+	// Previous-record work during generic Batch mutation preparation. Metadata
+	// reads return version/deleted/byte length only; payload reads return Data
+	// for declared index maintenance. Payload bytes count bytes returned by SQL
+	// to Go, not physical reads or total heap. Old decodes count index parsing.
+	MutationMetadataReads uint64 `json:"mutation_metadata_reads"`
+	MutationPayloadReads  uint64 `json:"mutation_payload_reads"`
+	MutationPayloadBytes  uint64 `json:"mutation_payload_bytes"`
+	MutationOldDecodes    uint64 `json:"mutation_old_decodes"`
+	// Snapshot representation work at actual SQL materialization. Header bytes
+	// count returned tuple bytes, excluding the source BLOB length.
+	SnapshotPayloadReads uint64 `json:"snapshot_payload_reads"`
+	SnapshotPayloadBytes uint64 `json:"snapshot_payload_bytes"`
+	SnapshotHeaderReads  uint64 `json:"snapshot_header_reads"`
+	SnapshotHeaderBytes  uint64 `json:"snapshot_header_bytes"`
 }
 
 func (s *Store) Stats() (Stats, error) {
@@ -68,6 +82,10 @@ func (s *Store) Stats() (Stats, error) {
 		Calls: s.calls.Load(), Conflicts: s.conflicts.Load(), Timeouts: s.timeouts.Load(), QueueWaitNS: s.waitNS.Load(), SQLTimeNS: s.sqlNS.Load(),
 		CommitsDurable: s.durable.Load(), CommitsRelaxed: s.relaxed.Load(), Fsyncs: s.fsyncs.Load(), Checkpoints: s.checkpoints.Load(),
 		ReceiptsPruned: s.receiptsPruned.Load(), MaintenanceErrors: s.maintenanceErrs.Load()}
+	out.MutationMetadataReads, out.MutationPayloadReads = s.mutationMetadataReads.Load(), s.mutationPayloadReads.Load()
+	out.MutationPayloadBytes, out.MutationOldDecodes = s.mutationPayloadBytes.Load(), s.mutationOldDecodes.Load()
+	out.SnapshotPayloadReads, out.SnapshotPayloadBytes = s.snapshotPayloadReads.Load(), s.snapshotPayloadBytes.Load()
+	out.SnapshotHeaderReads, out.SnapshotHeaderBytes = s.snapshotHeaderReads.Load(), s.snapshotHeaderBytes.Load()
 	if m != nil {
 		out.CheckpointPending = m.checkpointTimer != nil || m.work.Load()&workCheckpoint != 0
 		out.CheckpointRunning = m.checkpointRunning

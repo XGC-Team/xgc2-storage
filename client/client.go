@@ -99,6 +99,12 @@ func checkResponse(v any) error {
 }
 func (c *Client) Snapshot(ctx context.Context, id string, r api.SnapshotRequest) (out api.SnapshotResponse, err error) {
 	err = c.call(ctx, id, "/v1/snapshot", "Snapshot", r, &out)
+	if err == nil {
+		err = localError(validateSnapshotRepresentation(r, out))
+		if err != nil {
+			out = api.SnapshotResponse{}
+		}
+	}
 	return
 }
 func (c *Client) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt, err error) {

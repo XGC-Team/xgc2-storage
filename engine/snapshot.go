@@ -36,6 +36,9 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 		out, e = s.snapshot(ctx, tx, n, r)
 		return e
 	})
+	if err != nil {
+		out = api.SnapshotResponse{}
+	}
 	return out, err
 }
 
@@ -60,6 +63,9 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 	appendRecord := func(result *api.QueryResult, record api.Record) error {
 		total++
 		bytes += len(record.Key) + len(record.Data) + 128
+		if record.Header != nil {
+			bytes += len(record.Header.Tuple) + len(record.Header.Index) + 128
+		}
 		if total > api.MaxRows || bytes > api.MaxResponseBytes-8192 {
 			return fail("resource_exhausted", "whole snapshot exceeds row/byte budget")
 		}
@@ -67,7 +73,7 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 		return nil
 	}
 	for _, q := range r.Queries {
-		result, e := queryRecords(ctx, tx, id, n, q, appendRecord)
+		result, e := s.queryRecords(ctx, tx, id, n, q, appendRecord)
 		if e != nil {
 			return out, e
 		}
@@ -78,11 +84,14 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 
 // queryRecords materializes one bounded data query in a caller-owned
 // transaction. appendRecord charges every record to the snapshot's budget.
-func queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q api.Query, appendRecord func(*api.QueryResult, api.Record) error) (result api.QueryResult, err error) {
+func (s *Store) queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q api.Query, appendRecord func(*api.QueryResult, api.Record) error) (result api.QueryResult, err error) {
 	result = api.QueryResult{Collection: q.Collection, Records: []api.Record{}}
 	c, e := collection(n, q.Collection)
 	if e != nil {
 		return result, e
+	}
+	if q.HeaderIndex != "" {
+		return s.queryRecordHeaders(ctx, tx, id, c, q, appendRecord)
 	}
 	if q.After != "" && !key(q.After) {
 		return result, fail("invalid_argument", "invalid page key")
@@ -99,6 +108,8 @@ func queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q
 			var v int64
 			var deleted int
 			e := tx.QueryRowContext(ctx, "SELECT version,deleted,data FROM records WHERE scope=? AND collection=? AND key=?", id, c.ID, k).Scan(&v, &deleted, &record.Data)
+			s.snapshotPayloadReads.Add(1)
+			s.snapshotPayloadBytes.Add(uint64(len(record.Data)))
 			if errors.Is(e, sql.ErrNoRows) {
 				record.Missing = true
 				v = 0
@@ -177,6 +188,8 @@ func queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q
 				rows.Close()
 				return result, e
 			}
+			s.snapshotPayloadReads.Add(1)
+			s.snapshotPayloadBytes.Add(uint64(len(record.Data)))
 			record.Version = strconv.FormatInt(v, 10)
 			record.Deleted = deleted != 0
 			count++

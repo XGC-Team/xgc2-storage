@@ -267,7 +267,7 @@ CREATE INDEX receipts_expiry ON receipts(expires);
 CREATE TABLE named_results(scope TEXT NOT NULL,request_id TEXT NOT NULL,body BLOB NOT NULL,PRIMARY KEY(scope,request_id),FOREIGN KEY(scope,request_id) REFERENCES receipts(scope,request_id) ON DELETE CASCADE);
 `
 
-func TestFirstEngineSchemaMigratesInPlace(t *testing.T) {
+func TestFirstEngineSchemaIsRefusedWithoutMutation(t *testing.T) {
 	ctx := budget(t)
 	dir := t.TempDir()
 	os.Chmod(dir, 0700)
@@ -304,53 +304,24 @@ func TestFirstEngineSchemaMigratesInPlace(t *testing.T) {
 	}
 
 	config := Config{Path: path, Manifest: manifest()}
-	s, err := Open(ctx, config)
+	if opened, err := Open(ctx, config); code(err) != "failed_precondition" || opened != nil {
+		t.Fatalf("retired engine schema was not refused: %v", err)
+	}
+	if backups, _ := filepath.Glob(path + ".before-*"); len(backups) != 0 {
+		t.Fatalf("engine refusal started implicit migration work: %v", backups)
+	}
+	raw, err = sql.Open("sqlite", "file:"+path+"?_pragma=query_only(1)")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer s.Close()
-	if backups, _ := filepath.Glob(path + ".before-engine-v1.*"); len(backups) != 1 {
-		t.Fatalf("the upgrade took no backup: %v", backups)
+	defer raw.Close()
+	var data string
+	if err := raw.QueryRowContext(ctx, "SELECT data FROM records WHERE collection='state' AND key='a'").Scan(&data); err != nil || data != `{"name":"a"}` {
+		t.Fatalf("engine refusal changed the accepted record: %q %v", data, err)
 	}
-	stats, _ := s.Stats()
-	if stats.DatabaseID != "00112233445566778899aabbccddeeff" || versionOf(t, s, "engine") != engineVersion {
-		t.Fatalf("identity or version: %+v", stats)
-	}
-	for _, table := range []string{"named_results"} {
-		if n := countRows(t, s, "SELECT count(*) FROM sqlite_master WHERE name=?", table); n != 0 {
-			t.Fatalf("%s survived the migration", table)
-		}
-	}
-	// Named receipts are gone, the document receipt and its counter remain.
-	if countRows(t, s, "SELECT count(*) FROM receipts") != 1 || receiptCount(t, s) != 1 {
-		t.Fatal("receipt cleanup or counter wrong")
-	}
-	if _, err = s.Receipt(ctx, api.ReceiptRequest{Scope: testScope, RequestID: "doc"}); err != nil {
-		t.Fatalf("document receipt lost: %v", err)
-	}
-	// Usage now counts live data and keeps tombstones separately.
-	records, bytes, tombstones := usageOf(t, s, "state")
-	if records != 1 || tombstones != 1 || bytes != int64(len(`{"name":"a"}`)+1) {
-		t.Fatalf("state usage was not recomputed: %d %d %d", records, bytes, tombstones)
-	}
-	// Data is readable under the existing token and the tombstone keeps its version.
-	read, err := s.Snapshot(ctx, api.SnapshotRequest{Scope: testScope, Queries: []api.Query{{Collection: "state", Keys: []string{"a", "b"}, IncludeDeleted: false}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(read.Results[0].Records[0].Data) != `{"name":"a"}` || !read.Results[0].Records[1].Deleted || read.Results[0].Records[1].Version != "4" || read.Token.Revision != "9" {
-		t.Fatalf("migrated documents: %+v", read)
-	}
-	// New writes work, and the lookups were rebuilt for the current manifest.
-	if _, err = s.Batch(ctx, api.BatchRequest{Scope: testScope, Expected: read.Token, RequestID: "after", Mutations: []api.Mutation{mutation("state", "c", "0", `{"name":"c"}`)}}); err != nil {
-		t.Fatal(err)
-	}
-	indexed, err := s.Snapshot(ctx, api.SnapshotRequest{Scope: testScope, Queries: []api.Query{{Collection: "state", Index: "unique", Equal: []json.RawMessage{json.RawMessage(`"a"`)}}}})
-	if err != nil || len(indexed.Results[0].Records) != 1 {
-		t.Fatalf("lookup rows not usable after migration: %+v %v", indexed, err)
-	}
-	if err = s.Integrity(ctx); err != nil {
-		t.Fatal(err)
+	var named int
+	if err := raw.QueryRowContext(ctx, "SELECT count(*) FROM named_results").Scan(&named); err != nil || named != 1 {
+		t.Fatalf("engine refusal changed historic tables: %d %v", named, err)
 	}
 }
 
