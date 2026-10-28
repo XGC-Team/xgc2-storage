@@ -73,17 +73,17 @@ func TestPendingRemoteRunProtectsOwnerAndRootAcrossReopenUntilExactJoin(t *testi
 	if _, err := f.core.GetRun(f.ctx, "owner"); err == nil {
 		t.Fatal("fixture failed to corrupt unused execution data")
 	}
-	if errCode(f.core.ResolveRemoteRun(f.ctx, bad)) != "failed_precondition" {
+	if _, err := f.core.ResolveRemoteRun(f.ctx, bad); errCode(err) != "failed_precondition" {
 		t.Fatal("foreign boot joined another process")
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour), Limit: 100})
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatal("failed join freed authority", err)
 	}
-	if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal("exact join retry failed", err)
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour), Limit: 100})
@@ -131,7 +131,7 @@ func TestPendingRemotePageAdvancesAcrossUnmatchedOwnersAndMutations(t *testing.T
 			}
 			seen[link.RunID] = true
 			// Removal changes array offsets; the stable identity cursor must not skip.
-			if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+			if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -184,7 +184,7 @@ func TestPendingRemoteMutationsUseTheirIndexedRowAndRollbackQuota(t *testing.T) 
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
 	gotRows, after = usageRows(t, f)
@@ -286,7 +286,7 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 		}
 		link := page.Links[0]
 		seen[link.RunID] = true
-		if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+		if _, err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 			t.Fatal(err)
 		}
 		if page.Next == "" {
@@ -302,7 +302,7 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 		t.Fatalf("other target lost: %+v %v", other, err)
 	}
 	for _, link := range other.Links {
-		if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+		if _, err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -352,14 +352,14 @@ func TestPendingRemoteCancellationAndQuotaRollback(t *testing.T) {
 		t.Fatalf("failed boot binding changed authority: %+v %v", page, err)
 	}
 	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, bytes, engine.ScopeID(f.scope))
-	if err = f.core.ResolveRemoteRun(ctx, link); err == nil {
+	if _, err = f.core.ResolveRemoteRun(ctx, link); err == nil {
 		t.Fatal("canceled resolve succeeded")
 	}
 	page, err = f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
 	if err != nil || len(page.Links) != 1 {
 		t.Fatalf("canceled resolve removed relation: %+v %v", page, err)
 	}
-	if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
 	gotRows, gotBytes = usageRows(t, f)
@@ -453,7 +453,7 @@ func TestPendingRemoteTargetPagesAcrossOwnerCapacityAndReopen(t *testing.T) {
 				t.Fatalf("duplicate or foreign link: %+v", link)
 			}
 			seen[key] = true
-			if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+			if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -494,7 +494,7 @@ func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); <-start; bindErr = f.core.ReserveRemoteRun(f.ctx, bound) }()
-		go func() { defer wg.Done(); <-start; resolveErr = f.core.ResolveRemoteRun(f.ctx, unbound) }()
+		go func() { defer wg.Done(); <-start; _, resolveErr = f.core.ResolveRemoteRun(f.ctx, unbound) }()
 		close(start)
 		wg.Wait()
 		if bindErr != nil || resolveErr != nil && errCode(resolveErr) != "failed_precondition" {
@@ -504,7 +504,7 @@ func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
 		if err != nil || len(page.Links) != 1 || page.Links[0] != bound {
 			t.Fatalf("old resolve erased bound child: %+v %v", page, err)
 		}
-		if err := f.core.ResolveRemoteRun(f.ctx, bound); err != nil {
+		if _, err := f.core.ResolveRemoteRun(f.ctx, bound); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -531,7 +531,7 @@ func TestPendingRemoteMissingRootStillProtectsOwner(t *testing.T) {
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatalf("missing root permitted owner retirement: %+v %v", pruned, err)
 	}
-	if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+	if _, err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})

@@ -304,6 +304,14 @@ func (s *Store) scope(scope api.Scope) (api.Namespace, error) {
 	return n, nil
 }
 
+// DatabaseID is the immutable identity loaded when this owner opened.
+func (s *Store) DatabaseID() string {
+	if s == nil {
+		return ""
+	}
+	return s.dbid
+}
+
 // CheckScope reports whether scope names a registered namespace and a valid
 // user and workspace.
 func (s *Store) CheckScope(scope api.Scope) error {

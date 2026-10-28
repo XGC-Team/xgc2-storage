@@ -13,19 +13,28 @@ import (
 	"modernc.org/sqlite"
 )
 
-// The wrapper delegates all SQL to real SQLite. Only BEGIN/ROLLBACK completion
-// can be paused, so the test can reproduce ownership handoff deterministically.
+// The wrapper delegates all SQL to real SQLite. Transaction boundaries can be
+// paused so the test can reproduce ownership handoff deterministically.
 type transactionControl struct {
 	began                             chan context.Context
 	beforeBegin, continueBegin        chan struct{}
 	rollbackEntered, continueRollback chan struct{}
+	commitEntered, continueCommit     chan struct{}
 	rollbackOnce                      sync.Once
+	commitOnce                        sync.Once
 }
-type controlledConnector struct{ control *transactionControl }
+type controlledConnector struct {
+	control *transactionControl
+	dsn     string
+}
 
 func (c controlledConnector) Driver() driver.Driver { return &sqlite.Driver{} }
 func (c controlledConnector) Connect(context.Context) (driver.Conn, error) {
-	inner, err := c.Driver().Open("file::memory:?_txlock=immediate&_pragma=busy_timeout(0)")
+	dsn := c.dsn
+	if dsn == "" {
+		dsn = "file::memory:?_txlock=immediate&_pragma=busy_timeout(0)"
+	}
+	inner, err := c.Driver().Open(dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -64,12 +73,53 @@ type controlledTransaction struct {
 	control *transactionControl
 }
 
+func (tx controlledTransaction) Commit() error {
+	if tx.control.commitEntered != nil {
+		tx.control.commitOnce.Do(func() {
+			close(tx.control.commitEntered)
+			<-tx.control.continueCommit
+		})
+	}
+	return tx.Tx.Commit()
+}
+
 func (tx controlledTransaction) Rollback() error {
 	if tx.control.rollbackEntered != nil {
 		tx.control.rollbackOnce.Do(func() { close(tx.control.rollbackEntered) })
 		<-tx.control.continueRollback
 	}
 	return tx.Tx.Rollback()
+}
+
+func TestCancellationAfterCommitStartsPreservesCommittedResult(t *testing.T) {
+	control := &transactionControl{began: make(chan context.Context, 1), commitEntered: make(chan struct{}), continueCommit: make(chan struct{})}
+	s := controlledWriter(t, control)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	committedValue := ""
+	go func() {
+		done <- s.transact(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO work VALUES('committed')"); err != nil {
+				return err
+			}
+			committedValue = "the committed fact"
+			return nil
+		})
+	}()
+	<-control.commitEntered
+	cancel()
+	close(control.continueCommit)
+	if err := <-done; err != nil || committedValue != "the committed fact" {
+		t.Fatalf("successful commit lost its result on cancellation: value=%q err=%v", committedValue, err)
+	}
+	var count int
+	if err := s.writer.QueryRowContext(t.Context(), "SELECT count(*) FROM work WHERE id='committed'").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("successful result did not commit: count=%d err=%v", count, err)
+	}
+	if s.durable.Load() != 1 {
+		t.Fatalf("committed result was not counted: %d", s.durable.Load())
+	}
 }
 
 func controlledWriter(t *testing.T, control *transactionControl) *Store {
@@ -85,6 +135,39 @@ func controlledWriter(t *testing.T, control *transactionControl) *Store {
 		t.Fatal(err)
 	}
 	return &Store{writer: conn}
+}
+
+// GateNextCommitForModuleTest installs the same SQLite-delegating test driver on an
+// already-open isolated owner, after taking its actual writer admission. It is
+// exported only from test code so an external module test can pause its real
+// transaction after COMMIT begins without adding a production hook.
+func GateNextCommitForModuleTest(t *testing.T, s *Store) (<-chan struct{}, func()) {
+	t.Helper()
+	_, release, err := s.admit(t.Context(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if err := s.writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.wdb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	control := &transactionControl{began: make(chan context.Context, 1), commitEntered: make(chan struct{}), continueCommit: make(chan struct{})}
+	db := sql.OpenDB(controlledConnector{control: control, dsn: s.writerDSN(s.owner)})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	s.wdb, s.writer, s.synchronous = db, conn, Durable
+	var once sync.Once
+	allow := func() { once.Do(func() { close(control.continueCommit) }) }
+	t.Cleanup(allow)
+	return control.commitEntered, allow
 }
 
 func TestCanceledWriterWaitsForRealRollbackBeforeReturning(t *testing.T) {

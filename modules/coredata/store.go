@@ -14,8 +14,9 @@ import (
 // transaction: it either commits all of its effects or none. Writes that
 // Core must not lose on a crash are Durable; the others say so.
 type Store struct {
-	db    *engine.Store
-	scope string
+	db                *engine.Store
+	scope             string
+	agentLinkIdentity model.AgentLinkIdentity
 }
 
 // New binds the Core data module to a scope whose namespace names it.
@@ -29,7 +30,11 @@ func New(db *engine.Store, scope api.Scope) (*Store, error) {
 	if !db.HasModule(scope, model.Module) {
 		return nil, failure("invalid_argument", "namespace does not use the Core data module")
 	}
-	return &Store{db: db, scope: engine.ScopeID(scope)}, nil
+	identity := model.AgentLinkIdentity{DatabaseID: db.DatabaseID(), Scope: scope, ModuleSchemaVersion: SchemaVersion}
+	if identity.DatabaseID == "" {
+		return nil, failure("failed_precondition", "storage owner identity unavailable")
+	}
+	return &Store{db: db, scope: engine.ScopeID(scope), agentLinkIdentity: identity}, nil
 }
 
 func write[T any](ctx context.Context, s *Store, d engine.Durability, fn func(context.Context, *sql.Tx, string) (T, error)) (out T, err error) {

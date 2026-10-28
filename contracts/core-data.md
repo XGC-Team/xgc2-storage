@@ -14,6 +14,18 @@ owner's call budget. No savepoint, receipt or JSON envelope is involved. Revisio
 and counts that can exceed 2^53 are canonical decimal **strings**; Run and Session revisions
 are int64.
 
+## AgentLink enrollment
+
+`ListAgentLinks` reads the static enrollment projection and its database, complete scope,
+and admitted module identity in one transaction. `WriteAgentLink` checks that identity,
+the exact Agent ID and its acknowledged row version, and nonempty fingerprint ownership
+in one durable transaction. `"0"` expects an absent Agent; a stale version conflicts even
+when the proposed facts match. A nullable fingerprint permits multiple unpinned Known
+records while the scoped unique index retains pinned and revoked ownership. CreatedAt is
+stable. A matching no-op returns the existing guarded row without a durable commit. Live
+presence, peer boots and epochs are not stored here. The independent enrollment quota is
+2048 rows, 64 MiB including record keys, and 256 KiB per canonical record.
+
 ## Configuration
 
 Resources with branches, immutable commits and CAS heads, kept exactly as they were:
@@ -100,6 +112,12 @@ call node and optional boot. Boot may bind once; conflicting or downgraded resol
 cannot join a different process. `ResolveRemoteRun` requires exact identity and is called
 only after definitive unsent/rejection or authoritative terminal join, never Stop acceptance.
 These are Durable owner transactions, with idempotent bytes and exact quota release.
+Resolution returns `RemoteRunResolveResult`: the validated `RootRunID`, whether the exact
+relation changed, and whether that deletion released the last pending relation of its root.
+The last-release result also includes root presence, the root's exact finish time, and the
+owner's exact finish time. A missing root differs from a live root; a zero finish time means
+live. A duplicate returns no changed or last-release edge. The result is committed with the
+deletion; a later reservation may protect the root again, so pruning rechecks protection.
 
 Age/count/all-closed pruning excludes each unresolved owner and its local root in the same
 transaction. Other finished development history remains eligible. Close/reopen preserves
@@ -113,7 +131,7 @@ An empty page with a nonempty advancing cursor is legitimate. Each owner holds a
 
 ## Current schema admission
 
-The Core data schema is version5 and is the only admitted layout. No Core legacy probe,
+The Core data schema is version10 and is the only admitted layout. No Core legacy probe,
 historical decoder or migration ships. Older/newer stores fail closed without changing
 accepted data or creating a migration backup. The embedding product host disables even
 the engine's optional generic migration path. Development storage is initialized explicitly;

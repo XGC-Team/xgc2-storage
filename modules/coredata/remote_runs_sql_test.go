@@ -33,7 +33,7 @@ func TestPendingRemoteTargetSQLReadsOnlySelectedRelations(t *testing.T) {
 	add := func(owner, target, child string) {
 		t.Helper()
 		link := model.RemoteRunLink{OwnerRunID: owner, RootRunID: owner, TargetID: target, RunID: child, CallNodeID: "call", BootID: "boot"}
-		if _, err := changeRemoteRun(ctx, tx, testScope, link, false); err != nil {
+		if _, err := changeRemoteRun(ctx, tx, testScope, link, false, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
