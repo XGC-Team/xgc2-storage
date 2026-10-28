@@ -23,8 +23,9 @@ func configurationResource(ctx context.Context, tx *sql.Tx, scope, domain, id st
 	if err != nil {
 		return out, err
 	}
-	if json.Unmarshal(body, &out) != nil || out.ID != row.ID || out.NamespaceID != row.NamespaceID || out.Name != row.Name || out.NameKey != row.NameKey || out.Revision != row.Revision || out.MainCommitID != row.MainCommitID || out.OriginResourceID != row.OriginResourceID || out.OriginCommitID != row.OriginCommitID || !positiveRevision(out.NextVersion) || archived != (out.ArchivedAt != "") {
-		return out, failure("data_loss", "resource metadata disagrees with relational identity")
+	out, err = configurationDecodeResourceRow(row, archived, body)
+	if err != nil {
+		return out, err
 	}
 	if archived && !includeArchived {
 		return out, failure("not_found", "live resource not found")
@@ -41,10 +42,7 @@ func configurationBranch(ctx context.Context, tx *sql.Tx, scope, domain, id stri
 	if err != nil {
 		return out, err
 	}
-	if json.Unmarshal(body, &out) != nil || out.ID != row.ID || out.ResourceID != row.ResourceID || out.NameKey != row.NameKey || out.HeadCommitID != row.HeadCommitID || out.Revision != row.Revision || !positiveRevision(out.Revision) {
-		return out, failure("data_loss", "branch metadata disagrees with relational identity")
-	}
-	return out, nil
+	return configurationDecodeBranchRow(row, body)
 }
 func configurationBranchNamed(ctx context.Context, tx *sql.Tx, scope, domain, resource, name string, includeArchived ...bool) (model.ConfigurationBranch, error) {
 	var id string
@@ -81,8 +79,9 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	if !branchResource.Valid || branchResource.String != row.ResourceID {
 		return out, failure("data_loss", "immutable snapshot branch belongs to another resource")
 	}
-	if json.Unmarshal(body, &out.Head.Commit) != nil || out.Head.Commit.ID != row.ID || out.Head.Commit.ResourceID != row.ResourceID || out.Head.Commit.BranchID != row.BranchID || out.Head.Commit.Version != row.Version || out.Head.Commit.SourceCommitID != row.SourceCommitID || out.Head.Commit.ContentDigest != row.ContentDigest || !positiveRevision(row.Version) || out.Head.Commit.SchemaVersion < 1 || !sha256Hex(out.Head.Commit.RootDigest) {
-		return out, failure("data_loss", "immutable commit metadata disagrees")
+	out.Head.Commit, err = configurationDecodeCommitRow(row, body)
+	if err != nil {
+		return out, err
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT slot,target_domain,target_resource_id,target_commit_id,body FROM core_references WHERE scope=? AND domain=? AND commit_id=? ORDER BY slot LIMIT 4097", scope, domain, id)
 	if err != nil {
@@ -289,21 +288,7 @@ func configurationRead(ctx context.Context, tx *sql.Tx, scope string, q model.Co
 	if err != nil {
 		return out, err
 	}
-	manifest, e := model.DecodeConfigurationManifest(out.Manifest)
-	if e != nil || manifest.RootDigest != out.Head.Commit.RootDigest {
-		return out, failure("data_loss", "stored generic manifest disagrees")
-	}
-	metadata := out
-	metadata.Payload, metadata.Manifest, metadata.CurrentMain.Identity = nil, nil, nil
-	body, e := encode(metadata)
-	if e != nil {
-		return out, e
-	}
-	budget := model.ConfigurationBudget{PayloadBytes: int64(len(out.Payload)), ManifestBytes: int64(len(out.Manifest)), ManifestNodes: int64(len(manifest.Nodes)), References: int64(len(out.References)), MainIdentityBytes: int64(len(out.CurrentMain.Identity)), DecodedBytes: int64(len(out.Payload) + len(out.Manifest) + len(body) + len(out.CurrentMain.Identity))}
-	if err = budget.Validate(); err != nil {
-		return out, failure("resource_exhausted", err.Error())
-	}
-	return out, nil
+	return out, configurationSnapshotBounds(out)
 }
 func configurationNamespaceGuard(ctx context.Context, tx *sql.Tx, scope, domain string, g model.ConfigurationNamespaceGuard) error {
 	if g.ID == "" {

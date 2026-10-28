@@ -117,46 +117,6 @@ func TestRunPayloadRejectsCorruptionAndDecodedOverflow(t *testing.T) {
 	}
 }
 
-func TestMigrateRunPayloadsPreservesFactsAndRecountsUsage(t *testing.T) {
-	db, ctx := fixture(t)
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback()
-	raw := []byte(` {"configuration":"` + strings.Repeat("robot ", 1000) + `","integer":9007199254740993} `)
-	for _, scope := range []string{testScope, "second-scope"} {
-		q := model.NewRun{ID: "historical", TargetID: "local", WorkflowResourceID: "workflow", WorkflowCommitID: "commit", DefinitionDigest: strings.Repeat("a", 64), ActionID: "run", Inputs: raw, Trigger: raw}
-		r, _, err := createRun(ctx, tx, scope, q)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Install the exact schema-2 representation, including all JSON columns.
-		r.Error, r.Result, r.Nodes, r.CleanupErrors = raw, raw, raw, raw
-		if _, err = tx.ExecContext(ctx, "UPDATE runs SET inputs_json=?,trigger_json=?,error_json=?,result_json=?,nodes_json=?,cleanup_errors_json=?,bytes=?,status='failed',finished_at=1,revision=4 WHERE scope=?", raw, raw, raw, raw, raw, raw, runBytes(r), scope); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err = tx.ExecContext(ctx, "UPDATE core_data_usage SET bytes=?", MaxScopeBytes+1); err != nil {
-		t.Fatal(err)
-	}
-	if err = migrate2(ctx, tx, nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, scope := range []string{testScope, "second-scope"} {
-		r, err := getRun(ctx, tx, scope, "historical")
-		if err != nil || r.Revision != 4 || r.Status != model.RunFailed {
-			t.Fatalf("history identity changed: %v", err)
-		}
-		for _, field := range []json.RawMessage{r.Inputs, r.Trigger, r.Error, r.Result, r.Nodes, r.CleanupErrors} {
-			if !bytes.Equal(field, raw) {
-				t.Fatal("historical JSON bytes changed")
-			}
-		}
-		assertRunUsage(t, ctx, tx, scope)
-	}
-}
-
 func assertRunUsage(t *testing.T, ctx context.Context, tx *sql.Tx, scope string) {
 	t.Helper()
 	var stored, quota int64

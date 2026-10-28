@@ -41,14 +41,13 @@ var SchemaSQL string
 //go:embed records.sql
 var RecordsSQL string
 
-// SchemaVersion is the current schema version of the Core data module. Version
-// 1 also held the workflow engine's tables; 3 stores Run JSON compressed.
-const SchemaVersion = 3
+// SchemaVersion is the only admitted Core data layout. Development storage is
+// initialized explicitly; this module never migrates or scrubs older facts.
+const SchemaVersion = 4
 
 // Module registers the Core data module with the storage engine.
 func Module() engine.Module {
-	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize, Legacy: legacy,
-		Migrations: []engine.Migration{{From: 1, Apply: migrate1}, {From: 2, Apply: migrate2}}}
+	return engine.Module{ID: model.Module, Version: SchemaVersion, Install: Initialize}
 }
 
 // Initialize creates the current schema in a database that has none.

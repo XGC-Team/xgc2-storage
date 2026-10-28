@@ -92,41 +92,10 @@ the limit with `resource_exhausted`, while the first `FinishRun` of an admitted 
 records its outcome even when the quota is already full. A same-outcome `FinishRun`
 does not charge quota again. Core prunes with `PruneRuns` on its own schedule.
 
-## Schema version and migration
+## Current schema admission
 
-The module's schema version is an integer, currently 2. Opening a database with the same
-version succeeds whatever the code; an older one is migrated in one transaction after a
-consistent backup next to the database (`<db>.before-<module>-v<from>.<unix>.db`, mode 0600);
-a newer one is refused with an error that names the component. `storage-admin` never migrates.
-
-Version 1, which also held the workflow engine's data, is recognized by its complete set of
-tables (a partial set is refused as an unrecognized layout) and migrated in place:
-
-- **kept byte for byte**: namespaces, resources, branches, snapshots (commits), references,
-  changes, the accepted domain catalog and the product mutation receipts; every document
-  collection that is not retired below (credentials, settings, audit rows, Lichtblick documents,
-  Agent-runtime conversations) with its versions, tombstones, indexes and receipts; the
-  database identity;
-- **dropped**: the workflow engine's document collections (Run ledger and its relations,
-  Sessions, triggers, schedules, robot operations, process instances, Jobs, interactions,
-  frozen run configurations and bundles, fleet environments, MCP connections, the adapter
-  runtime ledger, the App Store) in the namespaces that name the module, so a same-named
-  collection of another namespace is untouched; the command ledger, the event log, event offsets
-  and sequences, the execution identity, sealed child-run groups and their views; the namespace
-  `core-panel-state` wholesale;
-- **created empty**: `runs`, `sessions`, `recordings`;
-- **recomputed**: the live quota counter `core_data_usage` (version 1 also charged events and
-  commands and never gave anything back) and the engine's usage and receipt counters;
-- the engine's own schema moves from 1 to 2 in the same transaction: the manifest hash and the
-  Named results disappear.
-
-The new manifest of Core must therefore not declare the retired collections or the panel-state
-namespace. `TestProductionDatabaseMigratesKeepingConfigurationAndDroppingExecutionData` migrates
-a database that the previous release wrote (`testdata/production/storage.db`: two domains,
-folders, resources with a second commit, a branch, a tracking reference, an archived and a
-protected resource, credentials and audit documents with tombstones, workflow-engine documents
-in 25 collections, a command with its events, a sealed child-run group, panel state, Lichtblick
-documents, an Agent-runtime conversation and receipts), compares the digest of every kept
-table and document before and after, checks that nothing of the execution data is left, that
-the pre-migration product receipts still replay, that the rebuilt indexes enforce uniqueness,
-and that a second open migrates and backs up nothing.
+The Core data schema is version4 and is the only admitted layout. No Core legacy probe,
+historical decoder or migration ships. Older/newer stores fail closed without changing
+accepted data or creating a migration backup. The embedding product host disables even
+the engine's optional generic migration path. Development storage is initialized explicitly;
+normal startup never clears history or unresolved remote relations.

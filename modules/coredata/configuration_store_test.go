@@ -35,7 +35,7 @@ func coreManifest() api.Manifest {
 		Collections: []api.Collection{{ID: "marker", MaxRecordBytes: 4096, MaxRecords: 100, MaxBytes: 1 << 20, Retention: "test point", Recovery: "test backup"}}}}}
 }
 
-func openStore(t *testing.T) *store {
+func openStore(t *testing.T, configure ...func(*engine.Config)) *store {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	t.Cleanup(cancel)
@@ -46,6 +46,9 @@ func openStore(t *testing.T) *store {
 	f := &store{ctx: ctx, scope: api.Scope{Namespace: "core", User: "operator", Workspace: "station"},
 		domain: model.ConfigurationDomainGuard{Key: "test", SchemaIdentity: "catalog-v1", SchemaVersion: 1, RegistryDigest: strings.Repeat("a", 64)}}
 	f.config = engine.Config{Path: filepath.Join(dir, "store.db"), Create: true, Manifest: coreManifest(), Modules: []engine.Module{coredata.Module()}}
+	for _, apply := range configure {
+		apply(&f.config)
+	}
 	f.open(t)
 	err := coredata.DeclareConfigurationDomains(ctx, f.db, []model.ConfigurationDomainDeclaration{{Key: f.domain.Key, SchemaIdentity: f.domain.SchemaIdentity, SchemaVersion: 1, RegistryDigest: f.domain.RegistryDigest, MainVisibility: true}})
 	if err != nil {

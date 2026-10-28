@@ -6,6 +6,8 @@ CREATE TABLE core_resources(scope TEXT NOT NULL,domain TEXT NOT NULL,id TEXT NOT
 CREATE UNIQUE INDEX core_resource_names ON core_resources(scope,domain,coalesce(namespace_id,''),name_key) WHERE archived=0;
 CREATE UNIQUE INDEX core_resource_system_keys ON core_resources(scope,domain,json_extract(CAST(body AS TEXT),'$.system_key')) WHERE json_extract(CAST(body AS TEXT),'$.system')=1 AND json_extract(CAST(body AS TEXT),'$.system_key')<>'';
 CREATE INDEX core_resources_namespace ON core_resources(scope,domain,namespace_id,id) WHERE archived=0;
+CREATE INDEX core_resources_namespace_all ON core_resources(scope,domain,namespace_id,id);
+CREATE INDEX core_resources_live_catalog ON core_resources(scope,domain,id) WHERE archived=0;
 CREATE TABLE core_branches(scope TEXT NOT NULL,domain TEXT NOT NULL,id TEXT NOT NULL,resource_id TEXT NOT NULL,name_key TEXT NOT NULL,head_commit_id TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>0),body BLOB NOT NULL,PRIMARY KEY(scope,domain,id),FOREIGN KEY(scope,domain,resource_id) REFERENCES core_resources(scope,domain,id));
 CREATE UNIQUE INDEX core_branch_live_names ON core_branches(scope,domain,resource_id,name_key) WHERE coalesce(json_extract(CAST(body AS TEXT),'$.archived_at'),'')='';
 CREATE INDEX core_branch_heads ON core_branches(scope,domain,resource_id,head_commit_id,id);

@@ -93,18 +93,15 @@ Quotas count **live** rows and bytes: deleting frees them at once. Document coll
 bounded number of tombstones for compare-and-set, oldest dropped first. Receipt counts are
 counters maintained with the revision, expired by a timer set for the next expiry.
 
-## Schema versions and migrations
+## Current schema admission
 
-The engine and each data module store an integer schema version and ship forward migrations.
-Opening a database with the same version succeeds whatever the code. An older schema is
-migrated in one transaction after a consistent private backup next to the database
-(`<db>.before-<module>-v<from>.<time>.db`); a newer schema is refused with an error naming the
-component. The manifest is configuration, not an identity: new collections, new limits and
-changed indexes (rebuilt from the records) take effect at the next open.
-
-The Core data module migrates the database written by its first version: configuration data is
-kept byte for byte, the workflow engine's collections, command ledger, event log and panel
-state are dropped, and the Run, Session and recording tables are created empty.
+The embedded host admits the current schema only. Older and newer databases are
+refused before serving or changing accepted facts. Core data ships no historic
+decoder or migrator. Fresh development storage is initialized explicitly; opening
+an existing store never deletes its history or unresolved remote ownership.
+The low-level engine retains its generic module migration API for independently
+embedded modules; the product host disables that path. The manifest controls
+current collections, limits and indexes, not permission to convert old schemas.
 
 ## Optional XRPC exposure and the daemon
 
