@@ -179,13 +179,26 @@ func seedTree(t *testing.T, db *sql.DB, ctx context.Context) {
 		id, commit, branch := fmt.Sprintf("resource-%d", i), fmt.Sprintf("commit-%d", i), fmt.Sprintf("branch-%d", i)
 		payload, manifest := json.RawMessage(`{"typed_name":"Source","kind":"robot","private":"preserved"}`), json.RawMessage(`{"root_digest":"root","nodes":[{"id":"root"}]}`)
 		refs := []model.Reference{{Slot: "configuration", TargetDomain: "robot", TargetResourceID: "reference-target", TargetCommitID: "reference-pin", Body: json.RawMessage(`{"mode":"pinned","component":"action","schema":2}`)}}
-		pin, err := model.SnapshotDigest(payload, manifest, refs)
+		identity, summary := []byte(`{}`), []byte(`{}`)
+		pin, err := model.SnapshotDigest(payload, manifest, identity, summary, refs, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
 		execSQL(t, db, ctx, "INSERT INTO core_resources VALUES(?,?,?,?,?,?,5,?,0,'','', '{}')", testScope, "robot", id, namespace, id, id, commit)
 		execSQL(t, db, ctx, "INSERT INTO core_branches VALUES(?,?,?,?,'main',?,4,'{}')", testScope, "robot", branch, id, commit)
-		execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,7,'',?,?,?,?)", testScope, "robot", commit, id, branch, pin, []byte(payload), []byte(manifest), []byte(`{"actor":"original"}`))
+		catalogDigest, err := model.ConfigurationCatalogDigest(pin, identity, summary)
+		if err != nil {
+			t.Fatal(err)
+		}
+		associationDigest, err := model.ConfigurationAssociationDigest(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		commitBody, err := json.Marshal(model.ConfigurationCommit{ID: commit, ResourceID: id, BranchID: branch, Version: "7", RootDigest: strings.Repeat("a", 64), ContentDigest: pin, CatalogDigest: catalogDigest, AssociationDigest: associationDigest, SchemaVersion: 1, Actor: "original"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,7,'',?,?,?,?,?,?)", testScope, "robot", commit, id, branch, pin, []byte(payload), []byte(manifest), identity, summary, commitBody)
 		for _, f := range refs {
 			execSQL(t, db, ctx, "INSERT INTO core_references VALUES(?,?,?,?,?,?,?,?)", testScope, "robot", commit, f.Slot, f.TargetDomain, f.TargetResourceID, f.TargetCommitID, []byte(f.Body))
 		}

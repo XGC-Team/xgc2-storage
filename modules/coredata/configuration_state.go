@@ -27,14 +27,14 @@ func configurationStateReceipt(ctx context.Context, tx *sql.Tx, scope, op string
 	return configurationReceipt(ctx, tx, scope, model.ConfigurationReceipt{Domain: d, Key: m.Key, IntentDigest: m.IntentDigest, Operations: []string{op}})
 }
 
-func configurationStateFinish(ctx context.Context, tx *sql.Tx, scope, op string, d model.ConfigurationDomainGuard, m model.ConfigurationMutation, plan, disposition string, h model.ConfigurationHead, changed bool) (out model.ConfigurationMutationResult, err error) {
+func configurationStateFinish(ctx context.Context, tx *sql.Tx, scope, op string, d model.ConfigurationDomainGuard, m model.ConfigurationMutation, plan, disposition string, h model.ConfigurationHead, changed bool, affected []string) (out model.ConfigurationMutationResult, err error) {
 	if changed {
 		c := model.ConfigurationChange{ID: digest(struct{ Domain, Key string }{d.Key, m.Key}), Summary: op, Nodes: []model.ConfigurationNodeChange{}}
 		if err = configurationChange(ctx, tx, scope, d.Key, h.Resource.ID, h.Commit.ID, op, m, c, "", ""); err != nil {
 			return out, err
 		}
 	}
-	out = model.ConfigurationMutationResult{Found: true, Key: m.Key, Domain: d.Key, Operation: op, IntentDigest: m.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: disposition, Head: h}}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: m.Key, Domain: d.Key, Operation: op, IntentDigest: m.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: disposition, Head: h}}
 	err = configurationSaveReceipt(ctx, tx, scope, out)
 	return
 }
@@ -123,7 +123,7 @@ func configurationBranchCreate(ctx context.Context, tx *sql.Tx, scope string, q 
 	if e != nil {
 		return out, e
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, "created", model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, true)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, "created", model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, true, nil)
 }
 
 func configurationBranchArchive(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationBranchArchive) (out model.ConfigurationMutationResult, err error) {
@@ -186,7 +186,7 @@ func configurationBranchArchive(ctx context.Context, tx *sql.Tx, scope string, q
 	if changed {
 		disposition = "archived"
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, changed)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: b, Commit: source.Head.Commit}, changed, nil)
 }
 
 func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceState) (out model.ConfigurationMutationResult, err error) {
@@ -229,6 +229,13 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 		return out, failure("failed_precondition", "system resource is protected")
 	}
 	changed := q.Archived != (r.ArchivedAt != "")
+	var affectedBefore []string
+	if changed {
+		affectedBefore, e = configurationAffectedAgents(ctx, tx, scope, q.Domain.Key, r.ID)
+		if e != nil {
+			return out, e
+		}
+	}
 	if changed {
 		if q.Archived {
 			if e = configurationArchiveBlocked(ctx, tx, scope, q.Domain.Key, r.ID, ""); e != nil {
@@ -305,7 +312,13 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 				if e != nil {
 					return out, e
 				}
-				size += len(s.Payload) + len(s.Manifest)
+				metadata := s
+				metadata.Payload, metadata.Manifest, metadata.Identity, metadata.CatalogSummary = nil, nil, nil, nil
+				control, e := encode(metadata)
+				if e != nil {
+					return out, e
+				}
+				size += len(s.Payload) + len(s.Manifest) + len(s.Identity) + len(s.CatalogSummary) + len(control)
 				if size > model.MaxConfigurationDecodedBytes {
 					return out, failure("resource_exhausted", "restore head materialization bound exceeded")
 				}
@@ -330,5 +343,16 @@ func configurationResourceState(ctx context.Context, tx *sql.Tx, scope string, q
 			disposition = "archived"
 		}
 	}
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: source.Head.Commit}, changed)
+	var affected []string
+	if changed {
+		affectedAfter, e := configurationAffectedAgents(ctx, tx, scope, q.Domain.Key, r.ID)
+		if e != nil {
+			return out, e
+		}
+		affected, e = mergeAffectedAgents(affectedBefore, affectedAfter)
+		if e != nil {
+			return out, e
+		}
+	}
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: source.Head.Commit}, changed, affected)
 }

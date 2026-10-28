@@ -46,7 +46,7 @@ func TestResourceHeadersOwnerPagesAndUnusedPayloadCorruption(t *testing.T) {
 			expected[id] = f.read(t, id, "main", "").Head
 		}
 	}
-	read := func(parent *string, limit, offset int, archived bool) []model.ConfigurationHead {
+	read := func(parent *string, limit, offset int, archived bool) []model.ConfigurationResourceHeader {
 		t.Helper()
 		before, _ := f.db.Stats()
 		rows, err := f.core.ReadResourceHeaders(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ParentID: parent, Limit: limit, Offset: offset, IncludeArchived: archived})
@@ -58,13 +58,13 @@ func TestResourceHeadersOwnerPagesAndUnusedPayloadCorruption(t *testing.T) {
 			t.Fatalf("%d admissions for %d headers", after.Calls-before.Calls, len(rows))
 		}
 		for i, row := range rows {
-			if !reflect.DeepEqual(row, expected[row.Resource.ID]) {
+			if !reflect.DeepEqual(row.Head, expected[row.Head.Resource.ID]) {
 				t.Fatalf("header differs from exact owner read: %+v", row)
 			}
-			if i > 0 && rows[i-1].Resource.ID >= row.Resource.ID {
+			if i > 0 && rows[i-1].Head.Resource.ID >= row.Head.Resource.ID {
 				t.Fatal("unstable resource-ID ordering")
 			}
-			if parent != nil && row.Resource.NamespaceID != *parent {
+			if parent != nil && row.Head.Resource.NamespaceID != *parent {
 				t.Fatal("namespace selection escaped")
 			}
 		}
@@ -126,7 +126,7 @@ func TestResourceHeadersOwnerPagesAndUnusedPayloadCorruption(t *testing.T) {
 }
 
 func TestResourceHeadersRejectBrokenRelations(t *testing.T) {
-	for _, scenario := range []string{"main", "resource", "foreign-branch", "missing-commit"} {
+	for _, scenario := range []string{"main", "resource", "foreign-branch", "missing-commit", "identity", "summary"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := openStore(t)
 			for _, id := range []string{"first", "second"} {
@@ -143,6 +143,10 @@ func TestResourceHeadersRejectBrokenRelations(t *testing.T) {
 				f.exec(t, `UPDATE core_snapshots SET branch_id='first-main',body=json_set(CAST(body AS TEXT),'$.branch_id','first-main') WHERE id='second-v1'`)
 			case "missing-commit":
 				f.exec(t, `UPDATE core_resources SET main_commit_id='absent',body=json_set(CAST(body AS TEXT),'$.main_commit_id','absent') WHERE id='second'`)
+			case "identity":
+				f.exec(t, `UPDATE core_snapshots SET identity_json=? WHERE id='second-v1'`, []byte(`{"active":false}`))
+			case "summary":
+				f.exec(t, `UPDATE core_snapshots SET catalog_summary_json=? WHERE id='second-v1'`, []byte(`{"label":"changed"}`))
 			}
 			rows, err := f.core.ReadResourceHeaders(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain})
 			requireCode(t, err, "data_loss")
@@ -150,5 +154,34 @@ func TestResourceHeadersRejectBrokenRelations(t *testing.T) {
 				t.Fatal("broken relation leaked a successful prefix")
 			}
 		})
+	}
+}
+
+func TestHistoricalReadUsesCurrentMainProjectionWithoutOpeningItsPayload(t *testing.T) {
+	f := openStore(t)
+	create := f.create(t, "historical")
+	if _, err := f.core.CreateResource(f.ctx, create); err != nil {
+		t.Fatal(err)
+	}
+	initial := f.read(t, "historical", "main", "")
+	commit := f.commit(t, initial, "next", "b")
+	if _, err := f.core.CommitResource(f.ctx, commit); err != nil {
+		t.Fatal(err)
+	}
+	f.exec(t, `UPDATE core_snapshots SET payload=? WHERE id=?`, []byte(`not valid JSON`), commit.CommitID)
+	historical, err := f.core.ReadResource(f.ctx, model.ConfigurationResourceRead{Domain: f.domain, ResourceID: "historical", CommitID: create.CommitID})
+	if err != nil || historical.Head.Commit.ID != create.CommitID || historical.CurrentMain.Branch.CommitID != commit.CommitID || string(historical.CurrentMain.Identity) != string(commit.Snapshot.Identity) {
+		t.Fatalf("historical read opened unrelated main payload: %+v %v", historical.CurrentMain, err)
+	}
+	if _, err = f.core.ReadResource(f.ctx, model.ConfigurationResourceRead{Domain: f.domain, ResourceID: "historical", Branch: "main"}); err == nil {
+		t.Fatal("exact main detail accepted a corrupt body")
+	}
+	f.exec(t, `UPDATE core_snapshots SET payload=? WHERE id=?`, []byte(`also corrupt`), create.CommitID)
+	identity, err := f.core.ReadCommitIdentity(f.ctx, f.domain, create.CommitID)
+	if err != nil || identity.Commit.ID != create.CommitID || string(identity.Identity) != string(create.Snapshot.Identity) || identity.CurrentMain.Branch.CommitID != commit.CommitID {
+		t.Fatalf("identity point opened a frozen payload: %+v %v", identity, err)
+	}
+	if _, err = f.core.ReadResource(f.ctx, model.ConfigurationResourceRead{Domain: f.domain, ResourceID: "historical", CommitID: create.CommitID}); err == nil {
+		t.Fatal("exact historical detail accepted a corrupt body")
 	}
 }

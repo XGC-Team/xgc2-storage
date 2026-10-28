@@ -43,6 +43,7 @@ type Run struct {
 	Depth              int             `json:"depth"`
 	SessionID          string          `json:"session_id,omitempty"`
 	IdempotencyKey     string          `json:"idempotency_key,omitempty"`
+	PredecessorRunID   string          `json:"predecessor_run_id,omitempty"`
 	WorkflowResourceID string          `json:"workflow_resource_id"`
 	WorkflowCommitID   string          `json:"workflow_commit_id"`
 	DefinitionDigest   string          `json:"definition_digest"`
@@ -80,6 +81,7 @@ type NewRun struct {
 	Depth              int
 	SessionID          string
 	IdempotencyKey     string
+	PredecessorRunID   string
 	WorkflowResourceID string
 	WorkflowCommitID   string
 	DefinitionDigest   string
@@ -171,6 +173,7 @@ type RunRetention struct {
 type SessionStatus string
 
 const (
+	SessionQueued   SessionStatus = "queued"
 	SessionOpen     SessionStatus = "open"
 	SessionStopping SessionStatus = "stopping"
 	SessionClosed   SessionStatus = "closed"
@@ -178,7 +181,9 @@ const (
 	SessionInterrupted SessionStatus = "interrupted"
 )
 
-func (s SessionStatus) Live() bool { return s == SessionOpen || s == SessionStopping }
+func (s SessionStatus) Live() bool {
+	return s == SessionQueued || s == SessionOpen || s == SessionStopping
+}
 
 // SessionOutcome records how a Session was closed.
 type SessionOutcome string
@@ -193,6 +198,7 @@ const (
 type Session struct {
 	ID                   string          `json:"id"`
 	TargetID             string          `json:"target_id"`
+	PredecessorSessionID string          `json:"predecessor_session_id,omitempty"`
 	ExperimentResourceID string          `json:"experiment_resource_id"`
 	ExperimentCommitID   string          `json:"experiment_commit_id"`
 	RunMode              string          `json:"run_mode"`
@@ -212,6 +218,7 @@ type Session struct {
 type NewSession struct {
 	ID                   string
 	TargetID             string
+	PredecessorSessionID string
 	ExperimentResourceID string
 	ExperimentCommitID   string
 	RunMode              string

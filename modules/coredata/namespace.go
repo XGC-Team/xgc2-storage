@@ -3,6 +3,7 @@ package coredata
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 	"strconv"
@@ -38,7 +39,7 @@ func readNamespaces(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 			return nil, err
 		}
 		n.Body = body
-		bytes += len(body) + len(n.ID) + len(n.ParentID) + len(n.Name) + len(n.NameKey)
+		bytes += len(body) + len(n.ID) + len(n.ParentID) + len(n.Name) + len(n.NameKey) + len(n.Revision)
 		if bytes > MaxResponseBytes {
 			return nil, failure("resource_exhausted", "namespace data byte limit exceeded")
 		}
@@ -68,7 +69,7 @@ func readNamespaces(ctx context.Context, tx *sql.Tx, scope string, r model.Names
 func readResources(ctx context.Context, tx *sql.Tx, scope string, r model.NamespaceRead, bodies bool) (out []model.ResourceSnapshot, err error) {
 	columns := "r.id,r.namespace_id,r.name,r.name_key,r.revision,r.main_commit_id,b.id,b.revision,s.content_digest"
 	if bodies {
-		columns += ",r.body,b.body,s.body,s.payload,s.manifest"
+		columns += ",r.body,b.body,s.body,s.payload,s.manifest,s.identity_json,s.catalog_summary_json"
 	}
 	args := append(treeArgs(scope, r), scope, r.Domain)
 	rows, err := tx.QueryContext(ctx, treeSQL+"SELECT "+columns+` FROM tree JOIN core_resources r ON r.namespace_id=tree.id
@@ -82,12 +83,12 @@ func readResources(ctx context.Context, tx *sql.Tx, scope string, r model.Namesp
 	bytes := 0
 	for rows.Next() {
 		var v model.ResourceSnapshot
-		var body, branchBody, commitBody, payload, manifest []byte
+		var body, branchBody, commitBody, payload, manifest, identity, summary []byte
 		var branch, content sql.NullString
 		var revision sql.NullInt64
 		values := []any{&v.ID, &v.NamespaceID, &v.Name, &v.NameKey, &v.Revision, &v.CommitID, &branch, &revision, &content}
 		if bodies {
-			values = append(values, &body, &branchBody, &commitBody, &payload, &manifest)
+			values = append(values, &body, &branchBody, &commitBody, &payload, &manifest, &identity, &summary)
 		}
 		if err = rows.Scan(values...); err != nil {
 			return nil, err
@@ -97,7 +98,11 @@ func readResources(ctx context.Context, tx *sql.Tx, scope string, r model.Namesp
 		}
 		v.BranchID, v.BranchRevision, v.ContentDigest = branch.String, strconv.FormatInt(revision.Int64, 10), content.String
 		v.Body, v.BranchBody, v.CommitBody, v.Payload, v.Manifest = body, branchBody, commitBody, payload, manifest
-		bytes += len(v.Body) + len(v.BranchBody) + len(v.CommitBody) + len(v.Payload) + len(v.Manifest)
+		v.Identity, v.CatalogSummary = identity, summary
+		if bodies {
+			v.Associations = []model.ConfigurationAgentAssociation{}
+		}
+		bytes += len(v.ID) + len(v.NamespaceID) + len(v.Name) + len(v.NameKey) + len(v.Revision) + len(v.CommitID) + len(v.BranchID) + len(v.BranchRevision) + len(v.ContentDigest) + len(v.Body) + len(v.BranchBody) + len(v.CommitBody) + len(v.Payload) + len(v.Manifest) + len(identity) + len(summary)
 		if bytes > MaxResponseBytes {
 			return nil, failure("resource_exhausted", "namespace snapshot byte limit exceeded")
 		}
@@ -133,6 +138,15 @@ func namespaceSnapshot(ctx context.Context, tx *sql.Tx, scope string, r model.Na
 	}
 	defer rows.Close()
 	count, bytes := 0, 0
+	for _, n := range out.Namespaces {
+		bytes += len(n.ID) + len(n.ParentID) + len(n.Name) + len(n.NameKey) + len(n.Revision) + len(n.Body)
+	}
+	for _, v := range out.Resources {
+		bytes += len(v.ID) + len(v.NamespaceID) + len(v.Name) + len(v.NameKey) + len(v.Revision) + len(v.CommitID) + len(v.BranchID) + len(v.BranchRevision) + len(v.ContentDigest) + len(v.Body) + len(v.BranchBody) + len(v.CommitBody) + len(v.Payload) + len(v.Manifest) + len(v.Identity) + len(v.CatalogSummary)
+	}
+	if bytes > MaxResponseBytes {
+		return out, failure("resource_exhausted", "namespace tree byte limit exceeded")
+	}
 	for rows.Next() {
 		var commit string
 		var f model.Reference
@@ -142,7 +156,7 @@ func namespaceSnapshot(ctx context.Context, tx *sql.Tx, scope string, r model.Na
 		}
 		f.Body = body
 		count++
-		bytes += len(f.Body)
+		bytes += len(commit) + len(f.Slot) + len(f.TargetDomain) + len(f.TargetResourceID) + len(f.TargetCommitID) + len(f.Body)
 		if count > MaxReferences || bytes > MaxResponseBytes {
 			return out, failure("resource_exhausted", "namespace reference bound exceeded")
 		}
@@ -155,8 +169,53 @@ func namespaceSnapshot(ctx context.Context, tx *sql.Tx, scope string, r model.Na
 	if err = rows.Err(); err != nil {
 		return out, err
 	}
+	if err = rows.Close(); err != nil {
+		return out, err
+	}
+	associations, err := tx.QueryContext(ctx, treeSQL+`SELECT f.commit_id,f.kind,f.agent_id,f.slot_id,f.related_robot_resource_id FROM tree
+ JOIN core_resources r ON r.namespace_id=tree.id
+ JOIN core_configuration_agent_index f ON f.scope=r.scope AND f.domain=r.domain AND f.commit_id=r.main_commit_id
+ WHERE r.scope=? AND r.domain=? AND r.archived=0 ORDER BY f.commit_id,f.kind,f.agent_id,f.slot_id,f.related_robot_resource_id LIMIT ?`, append(args, model.MaxConfigurationCloneAssociations+1)...)
+	if err != nil {
+		return out, err
+	}
+	defer associations.Close()
+	associationCount := 0
+	for associations.Next() {
+		var commit string
+		var fact model.ConfigurationAgentAssociation
+		if err = associations.Scan(&commit, &fact.Kind, &fact.AgentID, &fact.SlotID, &fact.RobotResourceID); err != nil {
+			return out, err
+		}
+		associationCount++
+		bytes += len(commit) + len(fact.Kind) + len(fact.AgentID) + len(fact.SlotID) + len(fact.RobotResourceID)
+		if associationCount > model.MaxConfigurationCloneAssociations || bytes > MaxResponseBytes {
+			return out, failure("resource_exhausted", "namespace association bound exceeded")
+		}
+		i, ok := byCommit[commit]
+		if !ok {
+			return out, failure("data_loss", "association has no current source snapshot")
+		}
+		if len(out.Resources[i].Associations) == model.MaxConfigurationAssociations {
+			return out, failure("resource_exhausted", "snapshot association bound exceeded")
+		}
+		out.Resources[i].Associations = append(out.Resources[i].Associations, fact)
+	}
+	if err = associations.Err(); err != nil {
+		return out, err
+	}
 	for _, v := range out.Resources {
-		pin, e := model.SnapshotDigest(v.Payload, v.Manifest, v.References)
+		var commit model.ConfigurationCommit
+		if json.Unmarshal(v.CommitBody, &commit) != nil || commit.ID != v.CommitID || commit.ResourceID != v.ID || commit.BranchID != v.BranchID || commit.ContentDigest != v.ContentDigest || !sha256Hex(commit.AssociationDigest) || commit.AssociationCount < 0 || commit.AssociationCount > model.MaxConfigurationAssociations {
+			return out, failure("data_loss", "namespace snapshot metadata disagrees")
+		}
+		if e := configurationAssociationIntegrity(commit, v.Associations); e != nil {
+			return out, e
+		}
+		if e := configurationProjection(commit, v.Identity, v.CatalogSummary); e != nil {
+			return out, e
+		}
+		pin, e := model.SnapshotDigest(v.Payload, v.Manifest, v.Identity, v.CatalogSummary, v.References, v.Associations)
 		if e != nil || pin != v.ContentDigest {
 			return out, failure("failed_precondition", "current main content digest changed")
 		}

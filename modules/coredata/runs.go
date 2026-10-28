@@ -115,19 +115,19 @@ func pageLimit(limit int) (int, error) {
 
 type scanner interface{ Scan(dest ...any) error }
 
-const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
+const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
 
 // runSummaryColumns replaces the large JSON columns by empty values.
-const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,x'',x'',0"
+const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,x'',x'',0"
 
-const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,error_summary_json,x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
+const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,error_summary_json,x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
 
 func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) {
 	var r model.Run
 	var status string
 	var inputs, trigger, errored, result, nodes, cleanup []byte
 	var created, started, finished int64
-	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult, &r.SourceObservation, &r.ErrorSummary, &r.CleanupFailed); err != nil {
+	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.PredecessorRunID, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult, &r.SourceObservation, &r.ErrorSummary, &r.CleanupFailed); err != nil {
 		return r, err
 	}
 	r.Status = model.RunStatus(status)
@@ -179,7 +179,7 @@ const rowOverhead = 256
 
 func runBytes(r model.Run) int64 {
 	n := rowOverhead
-	for _, s := range []string{r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.SessionID, r.IdempotencyKey, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID, r.Termination} {
+	for _, s := range []string{r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.SessionID, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID, r.Termination} {
 		n += len(s)
 	}
 	return int64(n + len(r.Inputs) + len(r.Trigger) + len(r.Error) + len(r.Result) + len(r.Nodes) + len(r.CleanupErrors) + len(r.SourceObservation) + len(r.ErrorSummary))
@@ -189,7 +189,7 @@ func validateNewRun(q *model.NewRun) error {
 	if !textKey(q.ID) || !textKey(q.TargetID) || !textKey(q.WorkflowResourceID) || !textKey(q.WorkflowCommitID) || !textKey(q.DefinitionDigest) || !textKey(q.ActionID) {
 		return failure("invalid_argument", "run, target, workflow resource, commit, definition digest and action identities are required")
 	}
-	for name, value := range map[string]string{"parent run": q.ParentRunID, "call node": q.CallNodeID, "session": q.SessionID, "idempotency key": q.IdempotencyKey} {
+	for name, value := range map[string]string{"parent run": q.ParentRunID, "call node": q.CallNodeID, "session": q.SessionID, "idempotency key": q.IdempotencyKey, "predecessor run": q.PredecessorRunID} {
 		if err := optionalKey(name, value); err != nil {
 			return err
 		}
@@ -203,6 +203,9 @@ func validateNewRun(q *model.NewRun) error {
 	// A root Run is its own root at depth 0; a child has a parent, another root and depth > 0.
 	if (q.ParentRunID == "") != (q.RootRunID == q.ID) || (q.ParentRunID == "") != (q.Depth == 0) {
 		return failure("invalid_argument", "run lineage is inconsistent: a root has no parent, is its own root and has depth 0")
+	}
+	if q.PredecessorRunID != "" && (q.PredecessorRunID == q.ID || q.ParentRunID != "" || q.Depth != 0) {
+		return failure("invalid_argument", "a restart predecessor must be a different root Run")
 	}
 	switch q.Status {
 	case "":
@@ -222,6 +225,9 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if err != nil {
 		return model.Run{}, false, err
 	}
+	if q.ParentRunID != "" && len(q.Trigger) > model.MaxRunCallTriggerBytes {
+		return model.Run{}, false, failure("resource_exhausted", "child Run trigger exceeds its byte limit")
+	}
 	trigger, err := jsonField("trigger", q.Trigger, model.MaxRunTriggerBytes, true, true)
 	if err != nil {
 		return model.Run{}, false, err
@@ -239,6 +245,18 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 			return model.Run{}, false, err
 		}
 	}
+	// Return the already accepted successor so one conflicting create cannot
+	// roll back unrelated journal work in the same durable batch. The execution
+	// owner compares the complete intent and rejects a different call identity.
+	if q.PredecessorRunID != "" {
+		existing, err := selectRun(ctx, tx, scope, "target_id=? AND predecessor_run_id=? AND predecessor_run_id<>''", q.TargetID, q.PredecessorRunID)
+		if err == nil {
+			return existing, false, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return model.Run{}, false, err
+		}
+	}
 	var taken bool
 	if err = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM runs WHERE scope=? AND id=?)", scope, q.ID).Scan(&taken); err != nil {
 		return model.Run{}, false, err
@@ -248,7 +266,7 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	}
 	at := nowOr(q.At)
 	r := model.Run{ID: q.ID, TargetID: q.TargetID, RootRunID: q.RootRunID, ParentRunID: q.ParentRunID, CallNodeID: q.CallNodeID, Depth: q.Depth, SessionID: q.SessionID,
-		IdempotencyKey: q.IdempotencyKey, WorkflowResourceID: q.WorkflowResourceID, WorkflowCommitID: q.WorkflowCommitID, DefinitionDigest: q.DefinitionDigest, ActionID: q.ActionID,
+		IdempotencyKey: q.IdempotencyKey, PredecessorRunID: q.PredecessorRunID, WorkflowResourceID: q.WorkflowResourceID, WorkflowCommitID: q.WorkflowCommitID, DefinitionDigest: q.DefinitionDigest, ActionID: q.ActionID,
 		Inputs: inputs, Trigger: trigger, SourceObservation: source, Status: q.Status, CreatedAt: at, Revision: 1}
 	if r.Status == model.RunRunning {
 		r.StartedAt = at
@@ -265,8 +283,8 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
-		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, r.IdempotencyKey, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
+		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
 		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
 	return r, true, err
 }
@@ -519,7 +537,7 @@ const (
 	interruptOpen = "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')"
 
 	// A finished Run is only eligible for pruning when its root is finished too.
-	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.root_run_id=r.id AND p.pending_remote_count>0)"
+	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.root_run_id=r.id AND p.pending_remote_count>0) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
 	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
 	pruneOldest  = "SELECT finished_at FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at,id LIMIT 1"
 	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"

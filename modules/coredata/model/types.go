@@ -19,21 +19,24 @@ type Reference struct {
 	Body             json.RawMessage `json:"body"`
 }
 type ResourceSnapshot struct {
-	ID             string          `json:"id"`
-	NamespaceID    string          `json:"namespace_id"`
-	Name           string          `json:"name"`
-	NameKey        string          `json:"name_key"`
-	Revision       string          `json:"revision"`
-	CommitID       string          `json:"commit_id"`
-	BranchID       string          `json:"branch_id"`
-	BranchRevision string          `json:"branch_revision"`
-	ContentDigest  string          `json:"content_digest"`
-	Body           json.RawMessage `json:"body"`
-	BranchBody     json.RawMessage `json:"branch_body"`
-	CommitBody     json.RawMessage `json:"commit_body"`
-	Payload        []byte          `json:"payload"`
-	Manifest       []byte          `json:"manifest"`
-	References     []Reference     `json:"references"`
+	ID             string                          `json:"id"`
+	NamespaceID    string                          `json:"namespace_id"`
+	Name           string                          `json:"name"`
+	NameKey        string                          `json:"name_key"`
+	Revision       string                          `json:"revision"`
+	CommitID       string                          `json:"commit_id"`
+	BranchID       string                          `json:"branch_id"`
+	BranchRevision string                          `json:"branch_revision"`
+	ContentDigest  string                          `json:"content_digest"`
+	Body           json.RawMessage                 `json:"body"`
+	BranchBody     json.RawMessage                 `json:"branch_body"`
+	CommitBody     json.RawMessage                 `json:"commit_body"`
+	Payload        []byte                          `json:"payload"`
+	Manifest       []byte                          `json:"manifest"`
+	Identity       []byte                          `json:"identity"`
+	CatalogSummary []byte                          `json:"catalog_summary"`
+	Associations   []ConfigurationAgentAssociation `json:"associations"`
+	References     []Reference                     `json:"references"`
 }
 type NamespaceRead struct {
 	Domain string `json:"domain"`

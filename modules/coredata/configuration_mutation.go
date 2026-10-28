@@ -1,6 +1,7 @@
 package coredata
 
 import (
+	"bytes"
 	"context"
 
 	"database/sql"
@@ -45,7 +46,7 @@ func configurationPrepared(s model.PreparedConfigurationSnapshot, control any) (
 	if v.RootDigest != s.RootDigest {
 		return zero, "", failure("invalid_argument", "business root disagrees with generic manifest")
 	}
-	pin, e := model.ConfigurationContentDigest(s.Payload, s.Manifest, s.References)
+	pin, e := model.ConfigurationContentDigest(s.Payload, s.Manifest, s.Identity, s.CatalogSummary, s.References, s.Associations)
 	if e != nil {
 		return zero, "", failure("invalid_argument", e.Error())
 	}
@@ -53,8 +54,19 @@ func configurationPrepared(s model.PreparedConfigurationSnapshot, control any) (
 }
 
 func configurationPlanBound(s model.PreparedConfigurationSnapshot, control any, extra int) error {
-	if len(s.Payload) > model.MaxConfigurationPayloadBytes || len(s.Manifest) > model.MaxConfigurationManifestBytes || len(s.References) > model.MaxConfigurationReferences || len(s.Change.Nodes) > model.MaxConfigurationNodeChanges {
+	if len(s.Payload) > model.MaxConfigurationPayloadBytes || len(s.Manifest) > model.MaxConfigurationManifestBytes || len(s.Identity) > model.MaxConfigurationIdentityBytes || len(s.CatalogSummary) > model.MaxConfigurationCatalogSummaryBytes || len(s.References) > model.MaxConfigurationReferences || len(s.Associations) > model.MaxConfigurationAssociations || len(s.Change.Nodes) > model.MaxConfigurationNodeChanges {
 		return failure("resource_exhausted", "configuration plan bound exceeded")
+	}
+	identity, err := configurationIdentity(s.Payload)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(identity, s.Identity) || model.ValidateConfigurationCatalogProjection(s.Identity, s.CatalogSummary) != nil {
+		return failure("invalid_argument", "identity must match the frozen envelope and catalog summary must be an object")
+	}
+	canonical, err := model.CanonicalConfigurationAssociations(s.Associations)
+	if s.Associations == nil || err != nil || !reflect.DeepEqual(canonical, s.Associations) {
+		return failure("invalid_argument", "explicit sorted unique agent association projection required")
 	}
 	for _, ref := range s.References {
 		if e := model.ValidateConfigurationReferenceMode(ref); e != nil {
@@ -65,7 +77,7 @@ func configurationPlanBound(s model.PreparedConfigurationSnapshot, control any, 
 	if e != nil {
 		return e
 	}
-	if len(b)+len(s.Payload)+len(s.Manifest)+extra > model.MaxConfigurationDecodedBytes {
+	if len(b)+len(s.Payload)+len(s.Manifest)+len(s.Identity)+len(s.CatalogSummary)+extra > model.MaxConfigurationDecodedBytes {
 		return failure("resource_exhausted", "complete decoded plan/audit/receipt exceeds12MiB")
 	}
 	return nil
@@ -170,6 +182,8 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	control := q
 	control.Snapshot.Payload = nil
 	control.Snapshot.Manifest = nil
+	control.Snapshot.Identity = nil
+	control.Snapshot.CatalogSummary = nil
 	manifest, pin, err := configurationPrepared(q.Snapshot, control)
 	if err != nil {
 		return out, err
@@ -184,7 +198,15 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 		r.OriginCommitID = q.Source.CommitID
 	}
 	b := model.ConfigurationBranch{ID: q.BranchID, ResourceID: r.ID, Name: "main", NameKey: "main", Revision: "1", HeadCommitID: q.CommitID, CreatedAt: now, UpdatedAt: now}
-	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: "1", BranchRevision: "1", RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	catalogDigest, err := model.ConfigurationCatalogDigest(pin, q.Snapshot.Identity, q.Snapshot.CatalogSummary)
+	if err != nil {
+		return out, failure("invalid_argument", err.Error())
+	}
+	associationDigest, err := model.ConfigurationAssociationDigest(q.Snapshot.Associations)
+	if err != nil {
+		return out, failure("invalid_argument", err.Error())
+	}
+	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: "1", BranchRevision: "1", RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, CatalogDigest: catalogDigest, AssociationDigest: associationDigest, AssociationCount: len(q.Snapshot.Associations), SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
 	if q.Source != nil {
 		c.SourceCommitID = q.Source.CommitID
 		b.CreatedFromCommitID = c.ID
@@ -209,11 +231,15 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, c.ID, model.ResourceCreateOperation, q.Mutation, q.Snapshot.Change, "", ""); err != nil {
 		return out, err
 	}
+	affected, err := configurationAffectedAgents(ctx, tx, scope, q.Domain.Key, r.ID)
+	if err != nil {
+		return out, err
+	}
 	plan, err := model.ConfigurationCreatePlanDigest(q)
 	if err != nil {
 		return out, err
 	}
-	out = model.ConfigurationMutationResult{Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCreateOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "created", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCreateOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "created", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
 	err = configurationFinishReceipt(ctx, tx, scope, out, q.Snapshot, control, 0)
 	return out, err
 }
@@ -308,6 +334,8 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	control := q
 	control.Snapshot.Payload = nil
 	control.Snapshot.Manifest = nil
+	control.Snapshot.Identity = nil
+	control.Snapshot.CatalogSummary = nil
 	if err = configurationPlanBound(q.Snapshot, control, mainBytes); err != nil {
 		return out, err
 	}
@@ -390,6 +418,18 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = configurationIncoming(ctx, tx, scope, q.Domain.Key, r.ID, b, manifest); err != nil {
 		return out, err
 	}
+	// Domains may carry a private, immutable digest of only the values that
+	// influence Agent workflow selection. Equal digests suppress needless
+	// post-commit synchronization for unrelated authoring changes. Generic
+	// domains without this projection remain conservatively observable.
+	affectsAgents := b.NameKey == "main" && configurationAgentSynchronizationChanged(base.CatalogSummary, q.Snapshot.CatalogSummary)
+	var affectedBefore []string
+	if affectsAgents {
+		affectedBefore, err = configurationAffectedAgents(ctx, tx, scope, q.Domain.Key, r.ID)
+		if err != nil {
+			return out, err
+		}
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	version := r.NextVersion
 	r.NextVersion, err = configurationBump(r.NextVersion)
@@ -413,7 +453,15 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	r.UpdatedAt = now
 	b.HeadCommitID = q.CommitID
 	b.UpdatedAt = now
-	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: version, BranchRevision: b.Revision, ParentCommitID: base.Head.Commit.ID, RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
+	catalogDigest, err := model.ConfigurationCatalogDigest(pin, q.Snapshot.Identity, q.Snapshot.CatalogSummary)
+	if err != nil {
+		return out, failure("invalid_argument", err.Error())
+	}
+	associationDigest, err := model.ConfigurationAssociationDigest(q.Snapshot.Associations)
+	if err != nil {
+		return out, failure("invalid_argument", err.Error())
+	}
+	c := model.ConfigurationCommit{ID: q.CommitID, ResourceID: r.ID, BranchID: b.ID, Version: version, BranchRevision: b.Revision, ParentCommitID: base.Head.Commit.ID, RootDigest: q.Snapshot.RootDigest, ContentDigest: pin, CatalogDigest: catalogDigest, AssociationDigest: associationDigest, AssociationCount: len(q.Snapshot.Associations), SchemaVersion: d.SchemaVersion, Actor: q.Mutation.Actor, Reason: q.Mutation.Reason, ChangeSummary: q.Snapshot.Change.Summary, CreatedAt: now}
 	if q.Source != nil {
 		c.SourceCommitID = q.Source.CommitID
 	}
@@ -437,7 +485,18 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = configurationChange(ctx, tx, scope, q.Domain.Key, r.ID, c.ID, model.ResourceCommitOperation, q.Mutation, q.Snapshot.Change, "", ""); err != nil {
 		return out, err
 	}
-	out = model.ConfigurationMutationResult{Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCommitOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "committed", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
+	var affected []string
+	if affectsAgents {
+		affectedAfter, e := configurationAffectedAgents(ctx, tx, scope, q.Domain.Key, r.ID)
+		if e != nil {
+			return out, e
+		}
+		affected, err = mergeAffectedAgents(affectedBefore, affectedAfter)
+		if err != nil {
+			return out, err
+		}
+	}
+	out = model.ConfigurationMutationResult{AffectedAgentIDs: affected, Found: true, Key: q.Mutation.Key, Domain: q.Domain.Key, Operation: model.ResourceCommitOperation, IntentDigest: q.Mutation.IntentDigest, PlanDigest: plan, Result: model.ConfigurationPublished{Disposition: "committed", Head: model.ConfigurationHead{Resource: r, Branch: b, Commit: c}}}
 	err = configurationFinishReceipt(ctx, tx, scope, out, q.Snapshot, control, mainBytes)
 	return out, err
 }
@@ -446,7 +505,7 @@ func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain 
 	if e != nil {
 		return e
 	}
-	size := len(cb) + len(s.Payload) + len(s.Manifest)
+	size := len(cb) + len(s.Payload) + len(s.Manifest) + len(s.Identity) + len(s.CatalogSummary)
 	bodies := make([]json.RawMessage, len(s.References))
 	for i, ref := range s.References {
 		b, e := encode(ref)
@@ -456,10 +515,13 @@ func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain 
 		bodies[i] = b
 		size += len(b)
 	}
-	if e = reserve(ctx, tx, scope, int64(1+len(s.References)), int64(size)); e != nil {
+	for _, fact := range s.Associations {
+		size += len(fact.Kind) + len(fact.AgentID) + len(fact.SlotID) + len(fact.RobotResourceID)
+	}
+	if e = reserve(ctx, tx, scope, int64(1+len(s.References)+len(s.Associations)), int64(size)); e != nil {
 		return e
 	}
-	if _, e = tx.ExecContext(ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)", scope, domain, c.ID, c.ResourceID, c.BranchID, c.Version, c.SourceCommitID, c.ContentDigest, s.Payload, s.Manifest, []byte(cb)); e != nil {
+	if _, e = tx.ExecContext(ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", scope, domain, c.ID, c.ResourceID, c.BranchID, c.Version, c.SourceCommitID, c.ContentDigest, s.Payload, s.Manifest, s.Identity, s.CatalogSummary, []byte(cb)); e != nil {
 		return e
 	}
 	stmt, e := tx.PrepareContext(ctx, "INSERT INTO core_references VALUES(?,?,?,?,?,?,?,?)")
@@ -469,6 +531,11 @@ func configurationInsertSnapshot(ctx context.Context, tx *sql.Tx, scope, domain 
 	defer stmt.Close()
 	for i, ref := range s.References {
 		if _, e = stmt.ExecContext(ctx, scope, domain, c.ID, ref.Slot, ref.TargetDomain, ref.TargetResourceID, ref.TargetCommitID, []byte(bodies[i])); e != nil {
+			return e
+		}
+	}
+	for _, fact := range s.Associations {
+		if _, e = tx.ExecContext(ctx, "INSERT INTO core_configuration_agent_index VALUES(?,?,?,?,?,?,?)", scope, domain, c.ID, fact.Kind, fact.AgentID, fact.SlotID, fact.RobotResourceID); e != nil {
 			return e
 		}
 	}
@@ -509,6 +576,8 @@ func configurationChange(ctx context.Context, tx *sql.Tx, scope, domain, resourc
 	if e = reserve(ctx, tx, scope, 1, int64(len(body))); e != nil {
 		return e
 	}
-	_, e = tx.ExecContext(ctx, "INSERT INTO core_changes VALUES(?,?,?,?,?)", scope, c.ID, domain, resource, []byte(body))
-	return e
+	if _, e = tx.ExecContext(ctx, "INSERT INTO core_changes VALUES(?,?,?,?,?)", scope, c.ID, domain, resource, []byte(body)); e != nil {
+		return e
+	}
+	return bumpConfigurationGeneration(ctx, tx, scope)
 }

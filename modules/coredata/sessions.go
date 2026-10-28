@@ -13,14 +13,14 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-const sessionColumns = "id,target_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision"
+const sessionColumns = "id,target_id,predecessor_session_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision"
 
 func scanSession(row scanner) (model.Session, error) {
 	var v model.Session
 	var status, outcome string
 	var intent, errored []byte
 	var opened, closed int64
-	if err := row.Scan(&v.ID, &v.TargetID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RunMode, &v.ExperimentName, &v.RootRunID, &status, &intent, &outcome, &errored, &opened, &closed, &v.Revision); err != nil {
+	if err := row.Scan(&v.ID, &v.TargetID, &v.PredecessorSessionID, &v.ExperimentResourceID, &v.ExperimentCommitID, &v.RunMode, &v.ExperimentName, &v.RootRunID, &status, &intent, &outcome, &errored, &opened, &closed, &v.Revision); err != nil {
 		return v, err
 	}
 	v.Status, v.Outcome = model.SessionStatus(status), model.SessionOutcome(outcome)
@@ -34,7 +34,7 @@ func selectSession(ctx context.Context, tx *sql.Tx, scope, where string, args ..
 }
 
 func sessionBytes(v model.Session) int64 {
-	return int64(rowOverhead + len(v.ID) + len(v.TargetID) + len(v.ExperimentResourceID) + len(v.ExperimentCommitID) + len(v.RunMode) + len(v.ExperimentName) + len(v.RootRunID) + len(v.StopIntent) + len(v.Outcome) + len(v.Error))
+	return int64(rowOverhead + len(v.ID) + len(v.TargetID) + len(v.PredecessorSessionID) + len(v.ExperimentResourceID) + len(v.ExperimentCommitID) + len(v.RunMode) + len(v.ExperimentName) + len(v.RootRunID) + len(v.StopIntent) + len(v.Outcome) + len(v.Error))
 }
 
 // liveSessionOfTarget is fixed text so that the plan test can run it as written.
@@ -71,6 +71,12 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 	case !errors.Is(err, sql.ErrNoRows):
 		return model.Session{}, false, err
 	}
+	var queued string
+	if err = tx.QueryRowContext(ctx, "SELECT id FROM sessions WHERE scope=? AND target_id=? AND status='queued'", scope, q.TargetID).Scan(&queued); err == nil {
+		return model.Session{}, false, failure("conflict", "target already has a queued session "+queued)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return model.Session{}, false, err
+	}
 	v := model.Session{ID: q.ID, TargetID: q.TargetID, ExperimentResourceID: q.ExperimentResourceID, ExperimentCommitID: q.ExperimentCommitID, RootRunID: q.RootRunID,
 		RunMode: q.RunMode, ExperimentName: q.ExperimentName,
 		Status: model.SessionOpen, OpenedAt: nowOr(q.At), Revision: 1}
@@ -78,7 +84,7 @@ func openSession(ctx context.Context, tx *sql.Tx, scope string, q model.NewSessi
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Session{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?,?,x'','',x'',?,0,1,?)", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RunMode, v.ExperimentName, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes)
+	_, err = tx.ExecContext(ctx, "INSERT INTO sessions(scope,id,target_id,predecessor_session_id,experiment_resource_id,experiment_commit_id,run_mode,experiment_name,root_run_id,status,stop_intent_json,outcome,error_json,opened_at,closed_at,revision,bytes) VALUES(?,?,?,'',?,?,?,?,?,?,x'','',x'',?,0,1,?)", scope, v.ID, v.TargetID, v.ExperimentResourceID, v.ExperimentCommitID, v.RunMode, v.ExperimentName, v.RootRunID, string(v.Status), nanos(v.OpenedAt), bytes)
 	return v, true, err
 }
 
@@ -110,7 +116,7 @@ func closeSession(ctx context.Context, tx *sql.Tx, scope, id string, close model
 	if err = charge(ctx, tx, scope, 0, grown); err != nil {
 		return v, err
 	}
-	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET status='closed',outcome=?,error_json=?,closed_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status IN ('open','stopping')", string(close.Outcome), []byte(close.Error), nanos(nowOr(close.At)), grown, scope, id); err != nil {
+	if _, err = tx.ExecContext(ctx, "UPDATE sessions SET status='closed',outcome=?,error_json=?,closed_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND id=? AND status IN ('queued','open','stopping')", string(close.Outcome), []byte(close.Error), nanos(nowOr(close.At)), grown, scope, id); err != nil {
 		return v, err
 	}
 	return getSession(ctx, tx, scope, id)
@@ -141,7 +147,7 @@ func sessionQuery(scope string, f model.SessionFilter) (query string, args []any
 	if len(f.Statuses) > 0 {
 		marks := make([]string, len(f.Statuses))
 		for i, s := range f.Statuses {
-			if s != model.SessionOpen && s != model.SessionStopping && s != model.SessionClosed && s != model.SessionInterrupted {
+			if s != model.SessionQueued && s != model.SessionOpen && s != model.SessionStopping && s != model.SessionClosed && s != model.SessionInterrupted {
 				return "", nil, 0, failure("invalid_argument", "unknown session status")
 			}
 			marks[i], args = "?", append(args, string(s))
@@ -185,7 +191,7 @@ func listSessions(ctx context.Context, tx *sql.Tx, scope string, f model.Session
 }
 
 func closeOpenSessions(ctx context.Context, tx *sql.Tx, scope string, at time.Time) (int, error) {
-	result, err := tx.ExecContext(ctx, "UPDATE sessions SET status='interrupted',closed_at=?,revision=revision+1 WHERE scope=? AND status IN ('open','stopping')", nanos(nowOr(at)), scope)
+	result, err := tx.ExecContext(ctx, "UPDATE sessions SET status='interrupted',closed_at=?,revision=revision+1 WHERE scope=? AND status IN ('queued','open','stopping')", nanos(nowOr(at)), scope)
 	if err != nil {
 		return 0, err
 	}

@@ -88,8 +88,8 @@ func TestConfigurationCatalogSQLWorkDoesNotMultiply(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(rows) < total || queries.Load() != 3 {
-			t.Fatalf("%d resources used %d SQL reads for %d rows; want domain + joined page + selected references", total, queries.Load(), len(rows))
+		if len(rows) < total || queries.Load() != 4 {
+			t.Fatalf("%d resources used %d SQL reads for %d rows; want domain + joined page + selected references and associations", total, queries.Load(), len(rows))
 		}
 	}
 }
@@ -160,7 +160,7 @@ func TestConfigurationCatalogBoundAndSelectorValidation(t *testing.T) {
 	const ids = `WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<4096) `
 	execSQL(t, db, ctx, ids+`INSERT INTO core_resources SELECT scope,domain,printf('r-%04d',n),NULL,printf('r-%04d',n),printf('r-%04d',n),revision,printf('c-%04d',n),archived,origin_resource_id,origin_commit_id,json_set(CAST(body AS TEXT),'$.id',printf('r-%04d',n),'$.name',printf('r-%04d',n),'$.name_key',printf('r-%04d',n),'$.main_commit_id',printf('c-%04d',n)) FROM core_resources CROSS JOIN ids WHERE id='template'`)
 	execSQL(t, db, ctx, ids+`INSERT INTO core_branches SELECT scope,domain,printf('b-%04d',n),printf('r-%04d',n),name_key,printf('c-%04d',n),revision,json_set(CAST(body AS TEXT),'$.id',printf('b-%04d',n),'$.resource_id',printf('r-%04d',n),'$.head_commit_id',printf('c-%04d',n)) FROM core_branches CROSS JOIN ids WHERE id='template-main'`)
-	execSQL(t, db, ctx, ids+`INSERT INTO core_snapshots SELECT scope,domain,printf('c-%04d',n),printf('r-%04d',n),printf('b-%04d',n),version,source_commit_id,content_digest,payload,manifest,json_set(CAST(body AS TEXT),'$.id',printf('c-%04d',n),'$.resource_id',printf('r-%04d',n),'$.branch_id',printf('b-%04d',n)) FROM core_snapshots CROSS JOIN ids WHERE id='template-v1'`)
+	execSQL(t, db, ctx, ids+`INSERT INTO core_snapshots SELECT scope,domain,printf('c-%04d',n),printf('r-%04d',n),printf('b-%04d',n),version,source_commit_id,content_digest,payload,manifest,identity_json,catalog_summary_json,json_set(CAST(body AS TEXT),'$.id',printf('c-%04d',n),'$.resource_id',printf('r-%04d',n),'$.branch_id',printf('b-%04d',n)) FROM core_snapshots CROSS JOIN ids WHERE id='template-v1'`)
 	for _, query := range []model.ConfigurationCatalogRead{
 		{Domain: domain}, {Domain: domain, Limit: -1}, {Domain: domain, Limit: 4097}, {Domain: domain, Offset: -1}, {Domain: domain, ID: " bad"},
 	} {
@@ -195,8 +195,9 @@ func TestConfigurationCatalogResponseAccountingMatchesEncodedSnapshots(t *testin
 	for range 257 {
 		snapshot := model.ConfigurationResourceSnapshot{
 			Payload: make([]byte, random.IntN(1024)), Manifest: make([]byte, random.IntN(1024)),
+			Identity: make([]byte, random.IntN(257)), CatalogSummary: make([]byte, random.IntN(257)),
 			CurrentMain: model.ConfigurationVisibilityPin{Identity: make([]byte, random.IntN(257))},
-			References:  []model.ConfigurationReference{},
+			References:  []model.ConfigurationReference{}, Associations: []model.ConfigurationAgentAssociation{},
 		}
 		snapshot.Head.Resource.Name = "A <readable> resource & one frozen main"
 		count, err := configurationSnapshotResponseBytes(snapshot)

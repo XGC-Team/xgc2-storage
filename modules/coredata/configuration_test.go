@@ -45,7 +45,7 @@ func configurationSnapshotForTest(t *testing.T, id, tag string, before model.Val
 	if e != nil {
 		t.Fatal(e)
 	}
-	return model.PreparedConfigurationSnapshot{RootDigest: v.RootDigest, Payload: []byte(fmt.Sprintf("{ \"identity\": {\"active\":true}, \"body\":{\"value\":\"%s\"} }", tag)), Manifest: manifest, References: refs, Change: model.ConfigurationChange{ID: id, Summary: summary, Nodes: changes}}
+	return model.PreparedConfigurationSnapshot{RootDigest: v.RootDigest, Payload: []byte(fmt.Sprintf("{ \"identity\": {\"active\":true}, \"body\":{\"value\":\"%s\"} }", tag)), Manifest: manifest, Identity: []byte(`{"active":true}`), CatalogSummary: []byte(`{"label":"fixture"}`), Associations: []model.ConfigurationAgentAssociation{}, References: refs, Change: model.ConfigurationChange{ID: id, Summary: summary, Nodes: changes}}
 }
 func configurationCreateForTest(t *testing.T, g model.ConfigurationDomainGuard, id string, refs []model.ConfigurationReference) model.ConfigurationResourceCreate {
 	return model.ConfigurationResourceCreate{Domain: g, Mutation: model.ConfigurationMutation{Key: "create-" + id, IntentDigest: strings.Repeat("a", 64), Actor: "tester"}, ResourceID: id, BranchID: id + "-main", CommitID: id + "-v1", Namespace: model.ConfigurationNamespaceGuard{ExpectedRevision: "0"}, Name: id, NameKey: id, Snapshot: configurationSnapshotForTest(t, id+"-change1", "a", model.ValidatedConfigurationManifest{}, true, refs)}
@@ -88,17 +88,20 @@ func configurationCounts(t *testing.T, db *sql.DB, ctx context.Context) string {
 	if e := db.QueryRowContext(ctx, "SELECT rows,bytes FROM core_data_usage WHERE scope=?", testScope).Scan(&rows, &bytes); e != nil && !errors.Is(e, sql.ErrNoRows) {
 		t.Fatal(e)
 	}
-	return fmt.Sprint(count(t, db, ctx, "core_resources"), count(t, db, ctx, "core_branches"), count(t, db, ctx, "core_snapshots"), count(t, db, ctx, "core_references"), count(t, db, ctx, "core_changes"), count(t, db, ctx, "core_configuration_receipts"), rows, bytes)
+	return fmt.Sprint(count(t, db, ctx, "core_resources"), count(t, db, ctx, "core_branches"), count(t, db, ctx, "core_snapshots"), count(t, db, ctx, "core_references"), count(t, db, ctx, "core_configuration_agent_index"), count(t, db, ctx, "core_changes"), count(t, db, ctx, "core_configuration_receipts"), rows, bytes)
 }
 func configurationQuotaBytes(t *testing.T, db *sql.DB, ctx context.Context) (charged, live int64) {
 	t.Helper()
 	if err := db.QueryRowContext(ctx, "SELECT bytes FROM core_data_usage WHERE scope=?", testScope).Scan(&charged); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"core_namespaces", "core_resources", "core_branches", "core_snapshots", "core_references", "core_changes", "core_configuration_receipts", "core_catalog_receipts"} {
+	for _, table := range []string{"core_namespaces", "core_resources", "core_branches", "core_snapshots", "core_references", "core_configuration_agent_index", "core_changes", "core_configuration_receipts", "core_catalog_receipts"} {
 		expression := "length(body)"
 		if table == "core_snapshots" {
-			expression += "+length(payload)+length(manifest)"
+			expression += "+length(payload)+length(manifest)+length(identity_json)+length(catalog_summary_json)"
+		}
+		if table == "core_configuration_agent_index" {
+			expression = "length(kind)+length(agent_id)+length(slot_id)+length(related_robot_resource_id)"
 		}
 		var bytes int64
 		if err := db.QueryRowContext(ctx, "SELECT coalesce(sum("+expression+"),0) FROM "+table+" WHERE scope=?", testScope).Scan(&bytes); err != nil {
@@ -158,6 +161,62 @@ func TestConfigurationAtomicReplayCASAndBytes(t *testing.T) {
 	configurationCode(t, e, "conflict")
 	if before != configurationCounts(t, db, ctx) {
 		t.Fatal("stale CAS drift")
+	}
+}
+
+func TestConfigurationProjectionRefusalHasNoEffect(t *testing.T) {
+	db, ctx, domain := configurationFixture(t)
+	q := configurationCreateForTest(t, domain, "valid", nil)
+	created := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
+	before := configurationCounts(t, db, ctx)
+	for _, scenario := range []struct {
+		name              string
+		identity, summary []byte
+		code              string
+	}{
+		{"missing identity", nil, []byte(`{}`), "invalid_argument"},
+		{"mismatched identity", []byte(`{"active":false}`), []byte(`{}`), "invalid_argument"},
+		{"missing summary", q.Snapshot.Identity, nil, "invalid_argument"},
+		{"nonobject summary", q.Snapshot.Identity, []byte(`[]`), "invalid_argument"},
+		{"oversized summary", q.Snapshot.Identity, []byte(`{"value":"` + strings.Repeat("x", model.MaxConfigurationCatalogSummaryBytes) + `"}`), "resource_exhausted"},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			create := configurationCreateForTest(t, domain, "bad-"+strings.ReplaceAll(scenario.name, " ", "-"), nil)
+			create.Snapshot.Identity, create.Snapshot.CatalogSummary = scenario.identity, scenario.summary
+			_, err := run(t, db, ctx, model.ResourceCreateOperation, create)
+			configurationCode(t, err, scenario.code)
+			noop := configurationCommitForTest(t, domain, created, "bad-noop-"+strings.ReplaceAll(scenario.name, " ", "-"), "a", true, nil, q.Snapshot.Manifest)
+			noop.Snapshot.Identity, noop.Snapshot.CatalogSummary = scenario.identity, scenario.summary
+			_, err = run(t, db, ctx, model.ResourceCommitOperation, noop)
+			configurationCode(t, err, scenario.code)
+			if before != configurationCounts(t, db, ctx) {
+				t.Fatal("rejected projection changed rows or quota")
+			}
+		})
+	}
+}
+
+func TestCloneAdmissionCountsCompleteControlAndProjectionBytes(t *testing.T) {
+	q := model.ConfigurationNamespaceClone{
+		Name: "Copy", Namespaces: []model.ConfigurationNamespaceMapping{{SourceID: "source", TargetID: "target", ExpectedRevision: "1"}},
+		Resources: []model.ConfigurationResourceCreate{{ResourceID: "r", Snapshot: model.PreparedConfigurationSnapshot{
+			Payload: []byte(`{"identity":{},"body":{}}`), Manifest: []byte(`{"nodes":[]}`), Identity: []byte(`{}`), CatalogSummary: []byte(`{"x":"value"}`),
+			References: []model.ConfigurationReference{{Slot: "s", TargetResourceID: "large-control"}},
+			Change:     model.ConfigurationChange{Summary: "control\nmetadata", Nodes: []model.ConfigurationNodeChange{{NodeID: "node", BeforePath: strings.Repeat("路径", 200)}}},
+		}}},
+	}
+	control := q
+	control.Resources = append([]model.ConfigurationResourceCreate(nil), q.Resources...)
+	p := &control.Resources[0].Snapshot
+	bytes := len(p.Payload) + len(p.Manifest) + len(p.Identity) + len(p.CatalogSummary)
+	p.Payload, p.Manifest, p.Identity, p.CatalogSummary = nil, nil, nil, nil
+	encoded, err := encode(control)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := cloneBytes(q)
+	if err != nil || got != len(encoded)+bytes || len(q.Resources[0].Snapshot.Identity) == 0 {
+		t.Fatalf("clone accounting=%d want=%d err=%v", got, len(encoded)+bytes, err)
 	}
 }
 func TestConfigurationC1NoopLocationAndLateReceiptRollback(t *testing.T) {
@@ -323,7 +382,7 @@ func TestConfigurationTrackingAndPinnedModeSeparation(t *testing.T) {
 	logical := model.ConfigurationReference{Slot: "self", Mode: "tracking", TargetDomain: g.Key, TargetResourceID: "resource", TargetBranch: "main", TargetComponentID: "x"}
 	q := configurationCreateForTest(t, g, "resource", []model.ConfigurationReference{logical})
 	first := configurationWrite(t, db, ctx, model.ResourceCreateOperation, q)
-	content, e := model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, q.Snapshot.References)
+	content, e := model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, q.Snapshot.Identity, q.Snapshot.CatalogSummary, q.Snapshot.References, q.Snapshot.Associations)
 	if e != nil || content != first.Result.Head.Commit.ContentDigest {
 		t.Fatal("logical references changed during resolution/hash", e)
 	}
@@ -367,7 +426,7 @@ func TestConfigurationTrackingAndPinnedModeSeparation(t *testing.T) {
 				t.Fatal("invalid tracking pin left rows or quota", key)
 			}
 		}
-		if _, e = model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, []model.ConfigurationReference{ref}); e == nil {
+		if _, e = model.ConfigurationContentDigest(q.Snapshot.Payload, q.Snapshot.Manifest, q.Snapshot.Identity, q.Snapshot.CatalogSummary, []model.ConfigurationReference{ref}, q.Snapshot.Associations); e == nil {
 			t.Fatal("shared content digest accepted tracking pin", fields)
 		}
 	}
@@ -564,7 +623,7 @@ func TestConfigurationSnapshotBranchAggregateAndExactContentGuard(t *testing.T) 
 	otherCommit.BranchID = first.Result.Head.Branch.ID
 	otherCommit.Version = "2"
 	body, _ = json.Marshal(otherCommit)
-	execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?)", testScope, g.Key, otherCommit.ID, otherCommit.ResourceID, otherCommit.BranchID, otherCommit.Version, "", otherCommit.ContentDigest, other.Snapshot.Payload, other.Snapshot.Manifest, body)
+	execSQL(t, db, ctx, "INSERT INTO core_snapshots VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", testScope, g.Key, otherCommit.ID, otherCommit.ResourceID, otherCommit.BranchID, otherCommit.Version, "", otherCommit.ContentDigest, other.Snapshot.Payload, other.Snapshot.Manifest, other.Snapshot.Identity, other.Snapshot.CatalogSummary, body)
 	_, e = run(t, db, ctx, resourceSnapshotOperation, model.ConfigurationResourceRead{Domain: g, ResourceID: q.ResourceID, CommitID: otherCommit.ID})
 	configurationCode(t, e, "data_loss")
 }

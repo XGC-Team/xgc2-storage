@@ -87,5 +87,5 @@ func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string
 	}
 	// The audit above includes the exact location change; do not append a second
 	// generic state audit when storing the one durable product receipt.
-	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: snapshot.Head.Commit}, false)
+	return configurationStateFinish(ctx, tx, scope, op, q.Domain, q.Mutation, plan, disposition, model.ConfigurationHead{Resource: r, Branch: main, Commit: snapshot.Head.Commit}, false, nil)
 }

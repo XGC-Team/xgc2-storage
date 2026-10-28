@@ -3,9 +3,12 @@ package model
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"unicode/utf8"
 )
 
 // Full plan identity includes operation and every typed payload field, including
@@ -62,7 +65,7 @@ func ValidateConfigurationReferenceMode(ref ConfigurationReference) error {
 // ConfigurationContentDigest shares the exact frozen-byte snapshot algorithm
 // with namespace operations. References are a complete set sorted by Slot;
 // caller slices are never mutated. This digest is distinct from business root.
-func ConfigurationContentDigest(payload, manifest []byte, refs []ConfigurationReference) (string, error) {
+func ConfigurationContentDigest(payload, manifest, identity, summary []byte, refs []ConfigurationReference, associations []ConfigurationAgentAssociation) (string, error) {
 	if len(payload) > MaxConfigurationPayloadBytes || len(manifest) > MaxConfigurationManifestBytes || len(refs) > MaxConfigurationReferences {
 		return "", fmt.Errorf("configuration snapshot bound exceeded")
 	}
@@ -84,5 +87,111 @@ func ConfigurationContentDigest(payload, manifest []byte, refs []ConfigurationRe
 		}
 		out = append(out, Reference{Slot: ref.Slot, TargetDomain: ref.TargetDomain, TargetResourceID: ref.TargetResourceID, TargetCommitID: ref.TargetCommitID, Body: bytes.TrimSuffix(b.Bytes(), []byte("\n"))})
 	}
-	return SnapshotDigest(payload, manifest, out)
+	return SnapshotDigest(payload, manifest, identity, summary, out, associations)
+}
+
+// CanonicalConfigurationAssociations validates and sorts the derived facts
+// without changing the caller's slice. Empty and nil are equivalent for hash
+// computation; write admission separately requires an explicit empty set.
+func CanonicalConfigurationAssociations(facts []ConfigurationAgentAssociation) ([]ConfigurationAgentAssociation, error) {
+	if len(facts) > MaxConfigurationAssociations {
+		return nil, fmt.Errorf("agent association count exceeded")
+	}
+	out := append([]ConfigurationAgentAssociation{}, facts...)
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Kind != b.Kind {
+			return a.Kind < b.Kind
+		}
+		if a.AgentID != b.AgentID {
+			return a.AgentID < b.AgentID
+		}
+		if a.SlotID != b.SlotID {
+			return a.SlotID < b.SlotID
+		}
+		return a.RobotResourceID < b.RobotResourceID
+	})
+	for i, fact := range out {
+		if len(fact.AgentID) == 0 || len(fact.AgentID) > 128 || !utf8.ValidString(fact.AgentID) || bytes.ContainsAny([]byte(fact.AgentID), "\x00\r\n") {
+			return nil, fmt.Errorf("invalid agent association identity")
+		}
+		switch fact.Kind {
+		case AgentAssociationRobotOwner, AgentAssociationWorld:
+			if fact.SlotID != "" || fact.RobotResourceID != "" {
+				return nil, fmt.Errorf("unexpected association target")
+			}
+		case AgentAssociationSlotHost:
+			if ValidateConfigurationIdentifier(fact.SlotID) != nil || fact.RobotResourceID != "" {
+				return nil, fmt.Errorf("invalid slot association")
+			}
+		case AgentAssociationOnboardSlot:
+			if ValidateConfigurationIdentifier(fact.SlotID) != nil || fact.RobotResourceID != "" && ValidateConfigurationIdentifier(fact.RobotResourceID) != nil {
+				return nil, fmt.Errorf("invalid onboard association")
+			}
+		default:
+			return nil, fmt.Errorf("unknown agent association kind")
+		}
+		if i > 0 && out[i-1] == fact {
+			return nil, fmt.Errorf("duplicate agent association")
+		}
+	}
+	return out, nil
+}
+
+func ConfigurationAssociationDigest(facts []ConfigurationAgentAssociation) (string, error) {
+	canonical, err := CanonicalConfigurationAssociations(facts)
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(canonical)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write([]byte("coredata.agent-associations.v1\x00"))
+	h.Write(raw)
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// The projection is bounded independently of the full frozen document.
+func ValidateConfigurationCatalogProjection(identity, summary []byte) error {
+	if len(identity) > MaxConfigurationIdentityBytes || len(summary) > MaxConfigurationCatalogSummaryBytes || !object(identity) || !object(summary) {
+		return fmt.Errorf("bounded identity and catalog summary JSON objects required")
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(summary, &fields); err != nil {
+		return fmt.Errorf("invalid catalog summary")
+	}
+	if raw, ok := fields["_agentSyncDigest"]; ok {
+		var digest string
+		if json.Unmarshal(raw, &digest) != nil {
+			return fmt.Errorf("invalid Agent synchronization digest")
+		}
+		decoded, err := hex.DecodeString(digest)
+		if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != digest {
+			return fmt.Errorf("invalid Agent synchronization digest")
+		}
+	}
+	return nil
+}
+
+// CatalogDigest lets a thin read verify its immutable projection without
+// reading the document. ContentDigest independently covers the same bytes.
+func ConfigurationCatalogDigest(contentDigest string, identity, summary []byte) (string, error) {
+	decoded, err := hex.DecodeString(contentDigest)
+	if err != nil || len(decoded) != sha256.Size || hex.EncodeToString(decoded) != contentDigest {
+		return "", fmt.Errorf("canonical content digest required")
+	}
+	if err := ValidateConfigurationCatalogProjection(identity, summary); err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	h.Write([]byte("coredata.catalog.projection.v1\x00"))
+	for _, part := range [][]byte{[]byte(contentDigest), identity, summary} {
+		var size [8]byte
+		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
+		h.Write(size[:])
+		h.Write(part)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

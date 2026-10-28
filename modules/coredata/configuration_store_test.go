@@ -147,7 +147,7 @@ func configPrepared(t *testing.T, id, tag string, before []byte) model.PreparedC
 		t.Fatal(e)
 	}
 	manifest, _ := json.Marshal(model.ConfigurationManifest{Nodes: v.Nodes})
-	return model.PreparedConfigurationSnapshot{RootDigest: v.RootDigest, Payload: []byte(`{ "identity":{"active":true},"body":{"value":"` + tag + `"} }`), Manifest: manifest, Change: model.ConfigurationChange{ID: id, Summary: summary, Nodes: d}}
+	return model.PreparedConfigurationSnapshot{RootDigest: v.RootDigest, Payload: []byte(`{ "identity":{"active":true},"body":{"value":"` + tag + `"} }`), Manifest: manifest, Identity: []byte(`{"active":true}`), CatalogSummary: []byte(`{"label":"fixture"}`), Associations: []model.ConfigurationAgentAssociation{}, Change: model.ConfigurationChange{ID: id, Summary: summary, Nodes: d}}
 }
 
 func (f *store) create(t *testing.T, id string) model.ConfigurationResourceCreate {
@@ -243,7 +243,7 @@ func TestSharedHeadTrackingBranchBlocksRemoval(t *testing.T) {
 		Domain: f.domain, Mutation: model.ConfigurationMutation{Key: "remove-x", IntentDigest: strings.Repeat("b", 64), Actor: "tester"},
 		ResourceID: h.Resource.ID, Branch: model.ConfigurationBranchGuard{ID: h.Branch.ID, ExpectedRevision: h.Branch.Revision, CommitID: h.Commit.ID, ContentDigest: h.Commit.ContentDigest}, Main: main.CurrentMain.Branch,
 		CommitID: "remove-x-commit", Name: h.Resource.Name, NameKey: h.Resource.NameKey,
-		Snapshot: model.PreparedConfigurationSnapshot{RootDigest: after.RootDigest, Payload: []byte(`{"identity":{"active":true},"body":{}}`), Manifest: manifestBytes, Change: model.ConfigurationChange{ID: "remove-x-change", Summary: summary, Nodes: changes}},
+		Snapshot: model.PreparedConfigurationSnapshot{RootDigest: after.RootDigest, Payload: []byte(`{"identity":{"active":true},"body":{}}`), Manifest: manifestBytes, Identity: []byte(`{"active":true}`), CatalogSummary: []byte(`{"label":"fixture"}`), Associations: []model.ConfigurationAgentAssociation{}, Change: model.ConfigurationChange{ID: "remove-x-change", Summary: summary, Nodes: changes}},
 	}
 	state := func() string {
 		out := ""
@@ -305,7 +305,11 @@ func TestConcurrentProductReceiptAndRestart(t *testing.T) {
 	if !receipt.Found || !receipt.Replayed || receipt.PlanDigest != one.PlanDigest || receipt.Result.Head != one.Result.Head {
 		t.Fatal("business receipt changed across restart")
 	}
-	f.read(t, winner, "main", "")
+	stored := f.read(t, winner, "main", "")
+	headers := must(f.core.ReadResourceHeaders(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ID: winner}))
+	if len(headers) != 1 || string(headers[0].Identity) != string(stored.Identity) || string(headers[0].CatalogSummary) != string(stored.CatalogSummary) || stored.Head.Commit.CatalogDigest == "" {
+		t.Fatal("reopen lost immutable catalog projection")
+	}
 	if e = f.db.Integrity(f.ctx); e != nil {
 		t.Fatal(e)
 	}
@@ -423,6 +427,10 @@ func TestBranchAndArchiveLifecycle(t *testing.T) {
 	if restored.Result.Head.Resource.ArchivedAt != "" || restored.Result.Head.Resource.Revision != "3" {
 		t.Fatal("restoration was not atomic")
 	}
+	restoredHeader := must(f.core.ReadResourceHeaders(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain, ID: "linked"}))
+	if len(restoredHeader) != 1 || string(restoredHeader[0].CatalogSummary) != string(current.CatalogSummary) || string(restoredHeader[0].Identity) != string(current.Identity) {
+		t.Fatal("restore changed the immutable projection")
+	}
 }
 
 func TestFailedOperationRollsBackEveryFact(t *testing.T) {
@@ -498,6 +506,9 @@ func TestEveryConfigurationFunctionIsWired(t *testing.T) {
 	tree := must(f.core.NamespaceTree(f.ctx, model.NamespaceRead{Domain: f.domain.Key, ID: "copy-ns"}))
 	if len(tree.Namespaces) != 1 || len(tree.Resources) != 1 || tree.Resources[0].ID != "copy-r" {
 		t.Fatalf("tree: %+v", tree)
+	}
+	if string(tree.Resources[0].Identity) != string(copyOf.Snapshot.Identity) || string(tree.Resources[0].CatalogSummary) != string(copyOf.Snapshot.CatalogSummary) {
+		t.Fatal("namespace clone lost its prepared projection")
 	}
 	namespaces := must(f.core.Namespaces(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain}))
 	resources := must(f.core.Resources(f.ctx, model.ConfigurationCatalogRead{Domain: f.domain}))

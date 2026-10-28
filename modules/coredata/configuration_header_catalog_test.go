@@ -128,6 +128,27 @@ func TestConfigurationHeadersSQLReadDoesNotSelectFrozenBodies(t *testing.T) {
 				t.Fatalf("header query selected frozen data: %s", query)
 			}
 		}
+		rec.statements, rec.bytes = nil, 0
+		tx, err = db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = configurationCommitIdentity(ctx, tx, testScope, g, fmt.Sprintf("resource-%02d-%02d-v1", total, 0))
+		tx.Rollback()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, statement := range rec.statements {
+			query := strings.ToLower(statement)
+			for _, forbidden := range []string{"s.payload", "s.manifest", "core_references", "json_extract(cast(s.payload"} {
+				if strings.Contains(query, forbidden) {
+					t.Fatalf("identity point selected frozen data: %s", query)
+				}
+			}
+		}
+		if rec.bytes > 8192 {
+			t.Fatalf("identity point selected %d bytes of unrelated data", rec.bytes)
+		}
 	}
 }
 
@@ -184,7 +205,7 @@ func TestConfigurationHeadersRejectRowAndByteOverflowWithoutPrefix(t *testing.T)
 	const ids = `WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<4096) `
 	execSQL(t, db, ctx, ids+`INSERT INTO core_resources SELECT scope,domain,printf('r-%04d',n),NULL,printf('r-%04d',n),printf('r-%04d',n),revision,printf('c-%04d',n),archived,origin_resource_id,origin_commit_id,json_set(CAST(body AS TEXT),'$.id',printf('r-%04d',n),'$.name',printf('r-%04d',n),'$.name_key',printf('r-%04d',n),'$.main_commit_id',printf('c-%04d',n)) FROM core_resources CROSS JOIN ids WHERE id='template'`)
 	execSQL(t, db, ctx, ids+`INSERT INTO core_branches SELECT scope,domain,printf('b-%04d',n),printf('r-%04d',n),name_key,printf('c-%04d',n),revision,json_set(CAST(body AS TEXT),'$.id',printf('b-%04d',n),'$.resource_id',printf('r-%04d',n),'$.head_commit_id',printf('c-%04d',n)) FROM core_branches CROSS JOIN ids WHERE id='template-main'`)
-	execSQL(t, db, ctx, ids+`INSERT INTO core_snapshots SELECT scope,domain,printf('c-%04d',n),printf('r-%04d',n),printf('b-%04d',n),version,source_commit_id,content_digest,payload,manifest,json_set(CAST(body AS TEXT),'$.id',printf('c-%04d',n),'$.resource_id',printf('r-%04d',n),'$.branch_id',printf('b-%04d',n)) FROM core_snapshots CROSS JOIN ids WHERE id='template-v1'`)
+	execSQL(t, db, ctx, ids+`INSERT INTO core_snapshots SELECT scope,domain,printf('c-%04d',n),printf('r-%04d',n),printf('b-%04d',n),version,source_commit_id,content_digest,payload,manifest,identity_json,catalog_summary_json,json_set(CAST(body AS TEXT),'$.id',printf('c-%04d',n),'$.resource_id',printf('r-%04d',n),'$.branch_id',printf('b-%04d',n)) FROM core_snapshots CROSS JOIN ids WHERE id='template-v1'`)
 	for _, q := range []model.ConfigurationCatalogRead{{Domain: domain}, {Domain: domain, Limit: -1}, {Domain: domain, Limit: 4097}, {Domain: domain, Offset: -1}} {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
@@ -207,20 +228,20 @@ func TestConfigurationHeadersRejectRowAndByteOverflowWithoutPrefix(t *testing.T)
 	}
 	rows, err := configurationResourceHeaders(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 2, Offset: 4095})
 	tx.Rollback()
-	if err != nil || len(rows) != 2 || rows[1].Resource.ID != "template" {
+	if err != nil || len(rows) != 2 || rows[1].Head.Resource.ID != "template" {
 		t.Fatalf("last page changed membership: %d / %v", len(rows), err)
 	}
 	// Corrupt unused metadata with enormous unknown fields to verify the byte
 	// bound independently of the row bound and without returning earlier rows.
-	padding := strings.Repeat("x", 6<<20)
-	if _, err := db.ExecContext(ctx, `UPDATE core_resources SET body=json_set(CAST(body AS TEXT),'$.padding',?) WHERE id IN ('r-0001','r-0002','r-0003')`, padding); err != nil {
+	padding := strings.Repeat("x", 240<<10)
+	if _, err := db.ExecContext(ctx, `UPDATE core_resources SET body=json_set(CAST(body AS TEXT),'$.padding',?) WHERE id >= 'r-0001' AND id <= 'r-0080'`, padding); err != nil {
 		t.Fatal(err)
 	}
 	tx, err = db.BeginTx(ctx, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	rows, err = configurationResourceHeaders(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 3})
+	rows, err = configurationResourceHeaders(ctx, tx, testScope, model.ConfigurationCatalogRead{Domain: domain, Limit: 80})
 	tx.Rollback()
 	configurationCode(t, err, "resource_exhausted")
 	if rows != nil {

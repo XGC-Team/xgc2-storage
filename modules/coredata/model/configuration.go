@@ -58,6 +58,22 @@ type ConfigurationReference struct {
 	TargetRootDigest  string `json:"target_root_digest"`
 }
 
+// ConfigurationAgentAssociation is an immutable, write-derived discovery
+// fact. It is not an Agent resource or a separate configuration authority.
+type ConfigurationAgentAssociation struct {
+	Kind            string `json:"kind"`
+	AgentID         string `json:"agentId"`
+	SlotID          string `json:"slotId"`
+	RobotResourceID string `json:"robotResourceId"`
+}
+
+const (
+	AgentAssociationRobotOwner  = "robot-owner"
+	AgentAssociationWorld       = "world"
+	AgentAssociationSlotHost    = "slot-host"
+	AgentAssociationOnboardSlot = "onboard-slot"
+)
+
 type ConfigurationNodeChange struct {
 	Operation    string `json:"operation"`
 	NodeID       string `json:"node_id"`
@@ -80,11 +96,14 @@ type ConfigurationChange struct {
 // payload is a domain-owned frozen codec object, not a SQL row or opaque ID list.
 // A robot extension codec uses byte[] for its raw JSON member to retain bytes.
 type PreparedConfigurationSnapshot struct {
-	RootDigest string                   `json:"root_digest"`
-	Payload    []byte                   `json:"payload"`
-	Manifest   []byte                   `json:"manifest"`
-	References []ConfigurationReference `json:"references"`
-	Change     ConfigurationChange      `json:"change"`
+	RootDigest     string                          `json:"root_digest"`
+	Payload        []byte                          `json:"payload"`
+	Manifest       []byte                          `json:"manifest"`
+	Identity       []byte                          `json:"identity"`
+	CatalogSummary []byte                          `json:"catalog_summary"`
+	Associations   []ConfigurationAgentAssociation `json:"associations"`
+	References     []ConfigurationReference        `json:"references"`
+	Change         ConfigurationChange             `json:"change"`
 }
 
 type ConfigurationSourcePin struct {
@@ -169,25 +188,59 @@ type ConfigurationBranch struct {
 	ArchivedAt          string `json:"archived_at"`
 }
 type ConfigurationCommit struct {
-	ID             string `json:"id"`
-	ResourceID     string `json:"resource_id"`
-	BranchID       string `json:"branch_id"`
-	Version        string `json:"version"`
-	BranchRevision string `json:"branch_revision"`
-	ParentCommitID string `json:"parent_commit_id"`
-	SourceCommitID string `json:"source_commit_id"`
-	RootDigest     string `json:"root_digest"`
-	ContentDigest  string `json:"content_digest"`
-	SchemaVersion  int    `json:"schema_version"`
-	Actor          string `json:"actor"`
-	Reason         string `json:"reason"`
-	ChangeSummary  string `json:"change_summary"`
-	CreatedAt      string `json:"created_at"`
+	ID                string `json:"id"`
+	ResourceID        string `json:"resource_id"`
+	BranchID          string `json:"branch_id"`
+	Version           string `json:"version"`
+	BranchRevision    string `json:"branch_revision"`
+	ParentCommitID    string `json:"parent_commit_id"`
+	SourceCommitID    string `json:"source_commit_id"`
+	RootDigest        string `json:"root_digest"`
+	ContentDigest     string `json:"content_digest"`
+	CatalogDigest     string `json:"catalog_digest"`
+	AssociationDigest string `json:"association_digest"`
+	AssociationCount  int    `json:"association_count"`
+	SchemaVersion     int    `json:"schema_version"`
+	Actor             string `json:"actor"`
+	Reason            string `json:"reason"`
+	ChangeSummary     string `json:"change_summary"`
+	CreatedAt         string `json:"created_at"`
 }
 type ConfigurationHead struct {
 	Resource ConfigurationResource `json:"resource"`
 	Branch   ConfigurationBranch   `json:"branch"`
 	Commit   ConfigurationCommit   `json:"commit"`
+}
+
+// ConfigurationResourceHeader is the immutable current-main catalog projection.
+// Identity is admitted by the owning domain's visibility policy before use.
+type ConfigurationResourceHeader struct {
+	Head           ConfigurationHead `json:"head"`
+	Identity       []byte            `json:"identity"`
+	CatalogSummary []byte            `json:"catalog_summary"`
+}
+
+// ConfigurationCommitIdentity is a selected immutable visibility projection
+// with the current-main fence established in the same reader snapshot.
+type ConfigurationCommitIdentity struct {
+	Branch      ConfigurationBranch        `json:"branch"`
+	Commit      ConfigurationCommit        `json:"commit"`
+	Identity    []byte                     `json:"identity"`
+	CurrentMain ConfigurationVisibilityPin `json:"current_main"`
+}
+
+// ConfigurationCommitCatalog contains one resource's selected immutable page
+// and the same-reader current-main visibility fence.
+type ConfigurationCommitCatalog struct {
+	Resource    ConfigurationResource       `json:"resource"`
+	CurrentMain ConfigurationVisibilityPin  `json:"current_main"`
+	Items       []ConfigurationCommitHeader `json:"items"`
+}
+type ConfigurationCommitHeader struct {
+	Commit         ConfigurationCommit `json:"commit"`
+	Branch         ConfigurationBranch `json:"branch"`
+	Identity       []byte              `json:"identity"`
+	CatalogSummary []byte              `json:"catalog_summary"`
 }
 type ConfigurationPublished struct {
 	// created | committed | noop | identity-only; persisted facts only.
@@ -207,14 +260,16 @@ type ConfigurationReceipt struct {
 	Operations []string `json:"operations"`
 }
 type ConfigurationMutationResult struct {
-	Found        bool                   `json:"found"`
-	Replayed     bool                   `json:"replayed"`
-	Key          string                 `json:"key"`
-	Domain       string                 `json:"domain"`
-	Operation    string                 `json:"operation"`
-	IntentDigest string                 `json:"intent_digest"`
-	PlanDigest   string                 `json:"plan_digest"`
-	Result       ConfigurationPublished `json:"result"`
+	// AffectedAgentIDs is the bounded exact-identity union from the before and after transaction views.
+	AffectedAgentIDs []string               `json:"affected_agent_ids"`
+	Found            bool                   `json:"found"`
+	Replayed         bool                   `json:"replayed"`
+	Key              string                 `json:"key"`
+	Domain           string                 `json:"domain"`
+	Operation        string                 `json:"operation"`
+	IntentDigest     string                 `json:"intent_digest"`
+	PlanDigest       string                 `json:"plan_digest"`
+	Result           ConfigurationPublished `json:"result"`
 }
 
 // Exactly one selector: resource+branch, resource+commit, or namespace+name_key.
@@ -232,11 +287,14 @@ type ConfigurationResourceRead struct {
 	IncludeArchived bool                     `json:"include_archived"`
 }
 type ConfigurationResourceSnapshot struct {
-	Head        ConfigurationHead          `json:"head"`
-	CurrentMain ConfigurationVisibilityPin `json:"current_main"`
-	Payload     []byte                     `json:"payload"`
-	Manifest    []byte                     `json:"manifest"`
-	References  []ConfigurationReference   `json:"references"`
+	Head           ConfigurationHead               `json:"head"`
+	CurrentMain    ConfigurationVisibilityPin      `json:"current_main"`
+	Payload        []byte                          `json:"payload"`
+	Manifest       []byte                          `json:"manifest"`
+	Identity       []byte                          `json:"identity"`
+	CatalogSummary []byte                          `json:"catalog_summary"`
+	Associations   []ConfigurationAgentAssociation `json:"associations"`
+	References     []ConfigurationReference        `json:"references"`
 }
 
 // Generic manifests use Configuration's existing NodeDraft JSON field names.

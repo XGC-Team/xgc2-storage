@@ -31,24 +31,34 @@ func TestConfigurationCommonNamesManifestAndExactDigests(t *testing.T) {
 	manifest, _ := json.Marshal(good)
 	refs := []ConfigurationReference{{Slot: "z", Mode: "tracking", TargetDomain: "d", TargetResourceID: "r", TargetBranch: "main"}, {Slot: "a", Mode: "tracking", TargetDomain: "d", TargetResourceID: "r", TargetBranch: "main"}}
 	payload := []byte(`{ "identity":{}, "body":{"number":9007199254740993,"precision":1.0} }`)
-	a, e := ConfigurationContentDigest(payload, manifest, refs)
+	identity, summary := []byte(`{}`), []byte(`{"label":"fixture"}`)
+	a, e := ConfigurationContentDigest(payload, manifest, identity, summary, refs, nil)
 	if e != nil {
 		t.Fatal(e)
 	}
-	b, e := ConfigurationContentDigest([]byte(strings.Replace(string(payload), "1.0", "1", 1)), manifest, refs)
+	b, e := ConfigurationContentDigest([]byte(strings.Replace(string(payload), "1.0", "1", 1)), manifest, identity, summary, refs, nil)
 	if e != nil || a == b {
 		t.Fatal("exact numeric frozen bytes normalized")
 	}
-	b, _ = ConfigurationContentDigest([]byte(strings.Replace(string(payload), "{ ", "{", 1)), manifest, refs)
+	b, _ = ConfigurationContentDigest([]byte(strings.Replace(string(payload), "{ ", "{", 1)), manifest, identity, summary, refs, nil)
 	if a == b {
 		t.Fatal("frozen whitespace not pinned")
 	}
 	reversed := []ConfigurationReference{refs[1], refs[0]}
-	b, _ = ConfigurationContentDigest(payload, manifest, reversed)
+	b, _ = ConfigurationContentDigest(payload, manifest, identity, summary, reversed, nil)
 	if a != b || refs[0].Slot != "z" {
 		t.Fatal("reference order changed pin or caller slice")
 	}
-	q := ConfigurationResourceCreate{ResourceID: "r", Snapshot: PreparedConfigurationSnapshot{Payload: payload, Manifest: manifest, References: refs, RootDigest: v.RootDigest}}
+	changed, err := ConfigurationContentDigest(payload, manifest, identity, []byte(`{"label":"changed"}`), refs, nil)
+	if err != nil || changed == a {
+		t.Fatal("catalog summary is not part of the immutable content pin")
+	}
+	projection, err := ConfigurationCatalogDigest(a, identity, summary)
+	changedProjection, err2 := ConfigurationCatalogDigest(a, identity, []byte(`{"label":"changed"}`))
+	if err != nil || err2 != nil || projection == changedProjection {
+		t.Fatal("thin projection is not pinned")
+	}
+	q := ConfigurationResourceCreate{ResourceID: "r", Snapshot: PreparedConfigurationSnapshot{Payload: payload, Manifest: manifest, Identity: identity, CatalogSummary: summary, References: refs, RootDigest: v.RootDigest}}
 	p, _ := ConfigurationCreatePlanDigest(q)
 	q.Namespace.ExpectedRevision = "2"
 	p2, _ := ConfigurationCreatePlanDigest(q)
@@ -60,7 +70,7 @@ func TestConfigurationCommonNamesManifestAndExactDigests(t *testing.T) {
 		body, _ := json.Marshal(r)
 		generic = append(generic, Reference{Slot: r.Slot, TargetDomain: r.TargetDomain, TargetResourceID: r.TargetResourceID, TargetCommitID: r.TargetCommitID, Body: body})
 	}
-	same, e := SnapshotDigest(payload, manifest, generic)
+	same, e := SnapshotDigest(payload, manifest, identity, summary, generic, nil)
 	if e != nil || same != a {
 		t.Fatal("namespace and configuration content algorithms differ")
 	}

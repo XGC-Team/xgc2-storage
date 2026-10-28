@@ -10,14 +10,20 @@ import (
 // Every bound applies independently. Payload/manifest bytes are decoded sizes.
 // A finite atomic plan is never split.
 const (
-	MaxConfigurationPayloadBytes       = 10 << 20
-	MaxConfigurationManifestBytes      = 1 << 20
-	MaxConfigurationManifestNodes      = 4096
-	MaxConfigurationReferences         = 4096
-	MaxConfigurationNodeChanges        = 8192
-	MaxConfigurationDecodedBytes       = 12 << 20
-	MaxConfigurationReceiptResultBytes = 256 << 10
-	MaxConfigurationIdentityBytes      = 16 << 10
+	MaxConfigurationPayloadBytes        = 10 << 20
+	MaxConfigurationManifestBytes       = 1 << 20
+	MaxConfigurationManifestNodes       = 4096
+	MaxConfigurationReferences          = 4096
+	MaxConfigurationNodeChanges         = 8192
+	MaxConfigurationDecodedBytes        = 12 << 20
+	MaxConfigurationReceiptResultBytes  = 256 << 10
+	MaxConfigurationIdentityBytes       = 16 << 10
+	MaxConfigurationCatalogSummaryBytes = 16 << 10
+	MaxConfigurationAssociations        = 1024
+	// The 12 MiB decoded-plan and 16 MiB result bounds remain the tighter
+	// limits for ordinary facts; do not reduce valid clones simply because
+	// multiple slots reference the same Agent.
+	MaxConfigurationCloneAssociations  = 262144
 	MaxConfigurationCloneNamespaces    = 1024
 	MaxConfigurationCloneResources     = 4096
 	MaxConfigurationCloneReferences    = 16384
@@ -90,9 +96,9 @@ func ValidateConfigurationDecimal(value string, allowZero bool) error {
 // the current-main identity projection (even when it comes from selected main).
 // Validation does not measure or authorize a plan on a caller's behalf.
 type ConfigurationBudget struct {
-	PayloadBytes, ManifestBytes, ManifestNodes, References, NodeChanges int64
-	DecodedBytes, ReceiptResultBytes                                    int64
-	MainIdentityBytes                                                   int64
+	PayloadBytes, ManifestBytes, ManifestNodes, References, NodeChanges, Associations int64
+	DecodedBytes, ReceiptResultBytes                                                  int64
+	MainIdentityBytes, IdentityBytes, CatalogSummaryBytes                             int64
 }
 
 func (b ConfigurationBudget) Validate() error {
@@ -104,16 +110,19 @@ func (b ConfigurationBudget) Validate() error {
 		{"manifest bytes", b.ManifestBytes, MaxConfigurationManifestBytes},
 		{"manifest nodes", b.ManifestNodes, MaxConfigurationManifestNodes},
 		{"references", b.References, MaxConfigurationReferences},
+		{"agent associations", b.Associations, MaxConfigurationAssociations},
 		{"node changes", b.NodeChanges, MaxConfigurationNodeChanges},
 		{"decoded whole bytes", b.DecodedBytes, MaxConfigurationDecodedBytes},
 		{"receipt result bytes", b.ReceiptResultBytes, MaxConfigurationReceiptResultBytes},
 		{"current-main identity bytes", b.MainIdentityBytes, MaxConfigurationIdentityBytes},
+		{"snapshot identity bytes", b.IdentityBytes, MaxConfigurationIdentityBytes},
+		{"catalog summary bytes", b.CatalogSummaryBytes, MaxConfigurationCatalogSummaryBytes},
 	} {
 		if bound.value < 0 || bound.value > bound.max {
 			return fmt.Errorf("configuration: %s budget exceeded", bound.name)
 		}
 	}
-	if b.DecodedBytes < b.PayloadBytes+b.ManifestBytes+b.MainIdentityBytes {
+	if b.DecodedBytes < b.PayloadBytes+b.ManifestBytes+b.MainIdentityBytes+b.IdentityBytes+b.CatalogSummaryBytes {
 		return fmt.Errorf("configuration: whole byte counters omit decoded payload/manifest/main identity")
 	}
 	return nil
@@ -122,8 +131,8 @@ func (b ConfigurationBudget) Validate() error {
 // Clone has its own complete-closure counts. It still obeys the decoded
 // whole-plan bound; the individual maxima cannot all coexist.
 type ConfigurationCloneBudget struct {
-	Namespaces, Resources, References, ManifestNodes, NodeChangesAndSummary int64
-	NamespaceDepth, DecodedBytes                                            int64
+	Namespaces, Resources, References, Associations, ManifestNodes, NodeChangesAndSummary int64
+	NamespaceDepth, DecodedBytes                                                          int64
 }
 
 func (b ConfigurationCloneBudget) Validate() error {
@@ -134,6 +143,7 @@ func (b ConfigurationCloneBudget) Validate() error {
 		{"clone namespaces", b.Namespaces, MaxConfigurationCloneNamespaces},
 		{"clone resources", b.Resources, MaxConfigurationCloneResources},
 		{"clone references", b.References, MaxConfigurationCloneReferences},
+		{"clone agent associations", b.Associations, MaxConfigurationCloneAssociations},
 		{"clone manifest nodes", b.ManifestNodes, MaxConfigurationCloneManifestNodes},
 		{"clone node changes and summary", b.NodeChangesAndSummary, MaxConfigurationCloneChanges},
 		{"namespace depth", b.NamespaceDepth, MaxConfigurationNamespaceDepth},

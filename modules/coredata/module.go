@@ -43,7 +43,7 @@ var RecordsSQL string
 
 // SchemaVersion is the only admitted Core data layout. Development storage is
 // initialized explicitly; this module never migrates or scrubs older facts.
-const SchemaVersion = 5
+const SchemaVersion = 6
 
 // Module registers the Core data module with the storage engine.
 func Module() engine.Module {
@@ -100,7 +100,7 @@ func release(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) e
 // charge accounts rows and bytes without a limit check, for a change that
 // finishes work already admitted (a Run's outcome must be recorded).
 func charge(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
-	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage(scope,rows,bytes) VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=max(rows+?,0),bytes=max(bytes+?,0) WHERE scope=?", rows, bytes, scope)
@@ -108,7 +108,7 @@ func charge(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) er
 }
 
 func reserve(ctx context.Context, tx *sql.Tx, scope string, rows, bytes int64) error {
-	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO core_data_usage(scope,rows,bytes) VALUES(?,0,0) ON CONFLICT(scope) DO NOTHING", scope); err != nil {
 		return err
 	}
 	r, err := tx.ExecContext(ctx, "UPDATE core_data_usage SET rows=rows+?,bytes=bytes+? WHERE scope=? AND rows+?<=? AND bytes+?<=?", rows, bytes, scope, rows, MaxScopeRows, bytes, MaxScopeBytes)

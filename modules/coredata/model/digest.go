@@ -19,9 +19,13 @@ func object(raw json.RawMessage) bool {
 // product's typed schema.
 // Payload and manifest never enter a JSON encoder: their lengths and original
 // bytes go directly to the hash. Only reference control metadata is canonicalized.
-func SnapshotDigest(payload, manifest []byte, references []Reference) (string, error) {
-	if !object(payload) || !object(manifest) {
+func SnapshotDigest(payload, manifest, identity, summary []byte, references []Reference, associations []ConfigurationAgentAssociation) (string, error) {
+	if !object(payload) || !object(manifest) || ValidateConfigurationCatalogProjection(identity, summary) != nil {
 		return "", fmt.Errorf("invalid snapshot object")
+	}
+	associationDigest, err := ConfigurationAssociationDigest(associations)
+	if err != nil {
+		return "", err
 	}
 	references = append([]Reference{}, references...)
 	sort.Slice(references, func(i, j int) bool { return references[i].Slot < references[j].Slot })
@@ -52,8 +56,8 @@ func SnapshotDigest(payload, manifest []byte, references []Reference) (string, e
 		return "", err
 	}
 	h := sha256.New()
-	h.Write([]byte("coredata.snapshot.bytes.v1\x00"))
-	for _, part := range [][]byte{payload, manifest, bytes.TrimSuffix(b.Bytes(), []byte("\n"))} {
+	h.Write([]byte("coredata.snapshot.bytes.v3\x00"))
+	for _, part := range [][]byte{payload, manifest, identity, summary, bytes.TrimSuffix(b.Bytes(), []byte("\n")), []byte(associationDigest)} {
 		var size [8]byte
 		binary.BigEndian.PutUint64(size[:], uint64(len(part)))
 		h.Write(size[:])

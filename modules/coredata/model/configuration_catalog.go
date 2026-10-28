@@ -61,6 +61,7 @@ type ConfigurationNamespaceWrite struct {
 	Archived         bool                         `json:"archived"`
 }
 type ConfigurationNamespaceResult struct {
-	Namespace ConfigurationNamespace `json:"namespace"`
-	Replayed  bool                   `json:"replayed"`
+	AffectedAgentIDs []string               `json:"affected_agent_ids"`
+	Namespace        ConfigurationNamespace `json:"namespace"`
+	Replayed         bool                   `json:"replayed"`
 }

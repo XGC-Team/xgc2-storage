@@ -27,7 +27,7 @@ func configurationCloneReceipt(ctx context.Context, tx *sql.Tx, scope string, q 
 	if intent != q.Mutation.IntentDigest || op != model.ConfigurationNamespaceCloneOperation {
 		return out, failure("conflict", "mutation identity reused")
 	}
-	if json.Unmarshal(body, &out) != nil {
+	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || !validAffectedAgentIDs(out.AffectedAgentIDs) {
 		return out, failure("data_loss", "invalid namespace clone receipt")
 	}
 	out.Replayed = true
@@ -37,11 +37,22 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 	if out, err = configurationCloneReceipt(ctx, tx, scope, model.ConfigurationNamespaceCloneReceipt{Domain: q.Domain, Mutation: q.Mutation}); err != nil || out.Replayed {
 		return
 	}
-	if cloneBytes(q) > model.MaxConfigurationDecodedBytes {
-		return out, failure("resource_exhausted", "subtree clone exceeds the decoded plan bound")
-	}
 	if !positiveRevision(q.ExpectedRevision) || len(q.Namespaces) > MaxCloneNamespaces || len(q.Resources) > MaxCloneResources {
 		return out, failure("invalid_argument", "invalid bounded subtree clone")
+	}
+	associationCount := 0
+	for _, resource := range q.Resources {
+		associationCount += len(resource.Snapshot.Associations)
+		if associationCount > model.MaxConfigurationCloneAssociations {
+			return out, failure("resource_exhausted", "subtree clone association count exceeded")
+		}
+	}
+	size, err := cloneBytes(q)
+	if err != nil {
+		return out, err
+	}
+	if size > model.MaxConfigurationDecodedBytes {
+		return out, failure("resource_exhausted", "subtree clone exceeds the decoded plan bound")
 	}
 	if err = configurationNamespaceGuard(ctx, tx, scope, q.Domain.Key, q.TargetParent); err != nil {
 		return
@@ -131,13 +142,21 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 		p := plans[r.ID]
 		p.Mutation = q.Mutation
 		p.Mutation.Key = digest(struct{ Key, Kind, ID string }{q.Mutation.Key, "resource", r.ID})
-		if _, err = configurationCreate(ctx, tx, scope, p); err != nil {
+		created, createErr := configurationCreate(ctx, tx, scope, p)
+		if createErr != nil {
+			return out, createErr
+		}
+		out.AffectedAgentIDs, err = mergeAffectedAgents(out.AffectedAgentIDs, created.AffectedAgentIDs)
+		if err != nil {
 			return out, err
 		}
 	}
 	body, err := encode(out)
 	if err != nil {
 		return out, err
+	}
+	if len(body) > model.MaxConfigurationReceiptResultBytes {
+		return out, failure("resource_exhausted", "namespace clone receipt exceeds bound")
 	}
 	if err = reserve(ctx, tx, scope, 1, int64(len(body))); err != nil {
 		return out, err
@@ -147,14 +166,37 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 }
 
 // cloneBytes is the decoded size of everything the plan asks the transaction to copy.
-func cloneBytes(q model.ConfigurationNamespaceClone) int {
-	total := len(q.Name)
-	for _, r := range q.Resources {
-		total += len(r.Snapshot.Payload) + len(r.Snapshot.Manifest) + len(r.Snapshot.Change.Summary) + len(r.Name) + len(r.NameKey)
-		for _, ref := range r.Snapshot.References {
-			total += len(ref.Slot) + len(ref.TargetResourceID) + len(ref.TargetCommitID) + 64
-		}
-		total += 256 * len(r.Snapshot.Change.Nodes)
+func cloneBytes(q model.ConfigurationNamespaceClone) (int, error) {
+	control := q
+	control.Resources = nil
+	header, err := encode(control)
+	if err != nil {
+		return 0, err
 	}
-	return total + 128*len(q.Namespaces)
+	total := len(header)
+	if q.Resources != nil {
+		total -= 2
+	} // Replace JSON null with an array.
+	for i, r := range q.Resources {
+		total += len(r.Snapshot.Payload) + len(r.Snapshot.Manifest) + len(r.Snapshot.Identity) + len(r.Snapshot.CatalogSummary)
+		if total > model.MaxConfigurationDecodedBytes {
+			return total, nil
+		}
+		r.Snapshot.Payload = nil
+		r.Snapshot.Manifest = nil
+		r.Snapshot.Identity = nil
+		r.Snapshot.CatalogSummary = nil
+		encoded, err := encode(r)
+		if err != nil {
+			return 0, err
+		}
+		total += len(encoded)
+		if i != 0 {
+			total++
+		}
+		if total > model.MaxConfigurationDecodedBytes {
+			return total, nil
+		}
+	}
+	return total, nil
 }

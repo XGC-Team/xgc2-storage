@@ -67,9 +67,9 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	// A snapshot's resource FK and branch FK are independent. Bind the owning
 	// branch to that same aggregate in this indexed point read. Forked branches
 	// may share a head; its original branch need not be the selected live branch.
-	err = tx.QueryRowContext(ctx, `SELECT s.id,s.resource_id,s.branch_id,s.version,s.source_commit_id,s.content_digest,s.payload,s.manifest,s.body,b.resource_id
+	err = tx.QueryRowContext(ctx, `SELECT s.id,s.resource_id,s.branch_id,s.version,s.source_commit_id,s.content_digest,s.payload,s.manifest,s.identity_json,s.catalog_summary_json,s.body,b.resource_id
  FROM core_snapshots s LEFT JOIN core_branches b ON b.scope=s.scope AND b.domain=s.domain AND b.id=s.branch_id
- WHERE s.scope=? AND s.domain=? AND s.id=? AND s.resource_id=?`, scope, domain, id, resource).Scan(&row.ID, &row.ResourceID, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &out.Payload, &out.Manifest, &body, &branchResource)
+ WHERE s.scope=? AND s.domain=? AND s.id=? AND s.resource_id=?`, scope, domain, id, resource).Scan(&row.ID, &row.ResourceID, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &out.Payload, &out.Manifest, &out.Identity, &out.CatalogSummary, &body, &branchResource)
 	if errors.Is(err, sql.ErrNoRows) {
 		return out, failure("not_found", "owned immutable commit not found")
 	}
@@ -79,9 +79,19 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	if !branchResource.Valid || branchResource.String != row.ResourceID {
 		return out, failure("data_loss", "immutable snapshot branch belongs to another resource")
 	}
+	if len(out.Payload)+len(out.Manifest)+len(out.Identity)+len(out.CatalogSummary)+len(body) > model.MaxConfigurationDecodedBytes {
+		return out, failure("resource_exhausted", "immutable snapshot materialization bound exceeded")
+	}
 	out.Head.Commit, err = configurationDecodeCommitRow(row, body)
 	if err != nil {
 		return out, err
+	}
+	if err = configurationProjection(out.Head.Commit, out.Identity, out.CatalogSummary); err != nil {
+		return out, err
+	}
+	identity, identityErr := configurationIdentity(out.Payload)
+	if identityErr != nil || !bytes.Equal(identity, out.Identity) {
+		return out, failure("data_loss", "snapshot identity disagrees with its frozen envelope")
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT slot,target_domain,target_resource_id,target_commit_id,body FROM core_references WHERE scope=? AND domain=? AND commit_id=? ORDER BY slot LIMIT 4097", scope, domain, id)
 	if err != nil {
@@ -89,7 +99,7 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	}
 	defer rows.Close()
 	out.References = []model.ConfigurationReference{}
-	size := len(out.Payload) + len(out.Manifest) + len(body)
+	size := len(out.Payload) + len(out.Manifest) + len(out.Identity) + len(out.CatalogSummary) + len(body)
 	for rows.Next() {
 		var ref model.ConfigurationReference
 		var slot, td, tr, tc string
@@ -109,11 +119,32 @@ func configurationCommitRow(ctx context.Context, tx *sql.Tx, scope, domain, reso
 	if err = rows.Err(); err != nil {
 		return out, err
 	}
-	pin, e := model.ConfigurationContentDigest(out.Payload, out.Manifest, out.References)
+	if err = rows.Close(); err != nil {
+		return out, err
+	}
+	associations, associationBytes, e := configurationAssociations(ctx, tx, scope, domain, id)
+	if e != nil {
+		return out, e
+	}
+	out.Associations = associations
+	if size+associationBytes > model.MaxConfigurationDecodedBytes {
+		return out, failure("resource_exhausted", "immutable snapshot materialization bound exceeded")
+	}
+	if e = configurationAssociationIntegrity(out.Head.Commit, out.Associations); e != nil {
+		return out, e
+	}
+	pin, e := model.ConfigurationContentDigest(out.Payload, out.Manifest, out.Identity, out.CatalogSummary, out.References, out.Associations)
 	if e != nil || pin != row.ContentDigest {
 		return out, failure("data_loss", "immutable content digest mismatch")
 	}
 	return out, nil
+}
+func configurationProjection(commit model.ConfigurationCommit, identity, summary []byte) error {
+	pin, err := model.ConfigurationCatalogDigest(commit.ContentDigest, identity, summary)
+	if err != nil || pin != commit.CatalogDigest {
+		return failure("data_loss", "immutable catalog projection digest mismatch")
+	}
+	return nil
 }
 func configurationIdentity(payload []byte) ([]byte, error) {
 	if len(payload) > model.MaxConfigurationPayloadBytes {
@@ -156,42 +187,41 @@ func configurationCurrentMain(ctx context.Context, tx *sql.Tx, scope, domain str
 		return out, failure("data_loss", "current main relation disagrees")
 	}
 	var commit model.ConfigurationCommit
-	var payload []byte
 	var identity []byte
 	if selected != nil && selected.Head.Commit.ID == r.MainCommitID {
 		commit = selected.Head.Commit
-		payload = selected.Payload
+		identity = selected.Identity
+		if err = configurationProjection(commit, identity, selected.CatalogSummary); err != nil {
+			return out, err
+		}
 	} else {
-		var body []byte
-		var branchID, contentDigest string
+		var body, summary []byte
+		var row model.ConfigurationCommit
 		var branchResource sql.NullString
-		// Project only the generic member from the authoritative blob. Do not
-		// materialize a second full opaque payload for historical/nonmain reads.
-		err = tx.QueryRowContext(ctx, `SELECT s.body,json_extract(CAST(s.payload AS TEXT),'$.identity'),s.branch_id,s.content_digest,b.resource_id
+		// Identity and summary are bound to the same immutable snapshot, so a
+		// historical or named-branch read does not open current main's body.
+		err = tx.QueryRowContext(ctx, `SELECT s.id,s.resource_id,s.branch_id,s.version,s.source_commit_id,s.content_digest,CASE WHEN length(s.body)<=262144 THEN s.body ELSE X'' END,CASE WHEN length(s.identity_json)<=16384 THEN s.identity_json ELSE X'' END,CASE WHEN length(s.catalog_summary_json)<=16384 THEN s.catalog_summary_json ELSE X'' END,b.resource_id
  FROM core_snapshots s LEFT JOIN core_branches b ON b.scope=s.scope AND b.domain=s.domain AND b.id=s.branch_id
- WHERE s.scope=? AND s.domain=? AND s.resource_id=? AND s.id=?`, scope, domain, r.ID, r.MainCommitID).Scan(&body, &identity, &branchID, &contentDigest, &branchResource)
+ WHERE s.scope=? AND s.domain=? AND s.resource_id=? AND s.id=?`, scope, domain, r.ID, r.MainCommitID).Scan(&row.ID, &row.ResourceID, &row.BranchID, &row.Version, &row.SourceCommitID, &row.ContentDigest, &body, &identity, &summary, &branchResource)
 		if errors.Is(err, sql.ErrNoRows) {
 			return out, failure("data_loss", "current main commit is missing")
 		}
 		if err != nil {
 			return out, err
 		}
-		if json.Unmarshal(body, &commit) != nil || !branchResource.Valid || branchResource.String != r.ID || commit.BranchID != branchID || commit.ContentDigest != contentDigest {
+		if len(body)+len(identity)+len(summary) > model.MaxConfigurationDecodedBytes {
+			return out, failure("resource_exhausted", "current-main visibility projection exceeds bound")
+		}
+		commit, err = configurationDecodeCommitRow(row, body)
+		if err != nil || !branchResource.Valid || branchResource.String != r.ID {
 			return out, failure("data_loss", "current main metadata disagrees")
 		}
-		if !object(identity) || len(identity) > model.MaxConfigurationIdentityBytes {
-			return out, failure("data_loss", "invalid bounded current-main identity projection")
+		if err = configurationProjection(commit, identity, summary); err != nil {
+			return out, err
 		}
 	}
 	if commit.ID != r.MainCommitID || commit.ResourceID != r.ID || commit.BranchID != b.ID || commit.SchemaVersion < 1 || !sha256Hex(commit.ContentDigest) {
 		return out, failure("data_loss", "current main metadata disagrees")
-	}
-	if identity == nil {
-		var e error
-		identity, e = configurationIdentity(payload)
-		if e != nil {
-			return out, e
-		}
 	}
 	out = model.ConfigurationVisibilityPin{Branch: model.ConfigurationBranchGuard{ID: b.ID, ExpectedRevision: b.Revision, CommitID: commit.ID, ContentDigest: commit.ContentDigest}, SchemaVersion: commit.SchemaVersion, Identity: identity}
 	return out, nil
@@ -281,9 +311,6 @@ func configurationRead(ctx context.Context, tx *sql.Tx, scope string, q model.Co
 	}
 	out.Head.Resource = r
 	out.Head.Branch = b
-	if _, err = configurationIdentity(out.Payload); err != nil {
-		return out, err
-	}
 	out.CurrentMain, err = configurationCurrentMain(ctx, tx, scope, q.Domain.Key, r, &out)
 	if err != nil {
 		return out, err
@@ -338,7 +365,7 @@ func configurationReceipt(ctx context.Context, tx *sql.Tx, scope string, q model
 	if intent != q.IntentDigest || !allowed {
 		return out, failure("conflict", "product mutation identity reused")
 	}
-	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || out.Key != q.Key || out.Domain != q.Domain.Key || out.Operation != op || out.IntentDigest != intent || !out.Found {
+	if len(body) > model.MaxConfigurationReceiptResultBytes || json.Unmarshal(body, &out) != nil || out.Key != q.Key || out.Domain != q.Domain.Key || out.Operation != op || out.IntentDigest != intent || !out.Found || !validAffectedAgentIDs(out.AffectedAgentIDs) {
 		return out, failure("data_loss", "invalid durable product receipt")
 	}
 	out.Replayed = true
