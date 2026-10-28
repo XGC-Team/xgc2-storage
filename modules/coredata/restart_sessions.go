@@ -88,7 +88,7 @@ func (s *Store) ActivateRestartSession(ctx context.Context, id string) (model.Se
 			return model.Session{}, failure("failed_precondition", "predecessor Session did not close cleanly")
 		}
 		var unsafe bool
-		if e = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM runs WHERE scope=? AND session_id=? AND (pending_remote_count>0 OR cleanup_failed>0 OR finished_at=0))", scope, old.ID).Scan(&unsafe); e != nil {
+		if e = tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM runs r WHERE r.scope=? AND r.session_id=? AND (r.pending_remote_count>0 OR r.cleanup_failed>0 OR r.finished_at=0 OR EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id)))", scope, old.ID).Scan(&unsafe); e != nil {
 			return model.Session{}, e
 		}
 		if unsafe {

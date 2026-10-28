@@ -51,7 +51,8 @@ type Run struct {
 	Inputs             json.RawMessage `json:"inputs,omitempty"`
 	Trigger            json.RawMessage `json:"trigger,omitempty"`
 	// SourceObservation is a bounded projection supplied by the execution owner
-	// when the Run is accepted. Storage never reinterprets opaque Trigger JSON.
+	// when the Run is accepted. The separate Session Action selector is derived
+	// from the accepted Trigger and is not execution authority.
 	SourceObservation json.RawMessage `json:"source_observation,omitempty"`
 	Status            RunStatus       `json:"status"`
 	Termination       string          `json:"termination,omitempty"`
@@ -134,12 +135,15 @@ type RunFilter struct {
 	// These select accepted Experiment invocation identity from the same-row source projection.
 	ExperimentResourceID string
 	WorkflowInstanceID   string
-	ID                   string
-	TargetID             string
-	RootRunID            string
-	SessionID            string
-	WorkflowResourceID   string
-	Statuses             []RunStatus
+	// SessionInstanceID selects the accepted Session Action's trigger identity.
+	// SessionID must also be specified. It is independent of WorkflowInstanceID.
+	SessionInstanceID  string
+	ID                 string
+	TargetID           string
+	RootRunID          string
+	SessionID          string
+	WorkflowResourceID string
+	Statuses           []RunStatus
 	// Since is inclusive and Until exclusive, both on the creation time.
 	Since, Until time.Time
 	// Limit defaults to 100 and is at most 1000.

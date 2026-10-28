@@ -14,7 +14,7 @@ func (s *Store) HasPendingRemoteRoot(ctx context.Context, root string) (bool, er
 	}
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (bool, error) {
 		var pending bool
-		err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM runs WHERE scope=? AND root_run_id=? AND pending_remote_count>0)", scope, root).Scan(&pending)
+		err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM run_remote_pending INDEXED BY run_remote_pending_root WHERE scope=? AND root_run_id=?)", scope, root).Scan(&pending)
 		return pending, err
 	})
 }

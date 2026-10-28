@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
@@ -217,6 +218,33 @@ func validateNewRun(q *model.NewRun) error {
 	return nil
 }
 
+// Session Action instances are normalized by the execution owner to at most
+// 128 Unicode code points. The byte bound also permits four-byte code points.
+func sessionInstanceKey(id string) bool {
+	return id != "" && len(id) <= 512 && utf8.ValidString(id) && strings.TrimSpace(id) == id && !strings.ContainsAny(id, "\x00\r\n")
+}
+
+// sessionInstanceFromTrigger follows the execution owner's Session Action
+// trigger decoder. It is a derived selector, never an execution authority.
+func sessionInstanceFromTrigger(sessionID string, trigger []byte) (string, error) {
+	if sessionID == "" {
+		return "", nil
+	}
+	var action struct {
+		Kind       string `json:"kind"`
+		InstanceID string `json:"instanceId"`
+		PresetID   string `json:"presetId"`
+		ActionID   string `json:"actionId"`
+	}
+	if json.Unmarshal(trigger, &action) != nil || action.Kind != "session-action" || action.InstanceID == "" {
+		return "", nil
+	}
+	if !sessionInstanceKey(action.InstanceID) {
+		return "", failure("invalid_argument", "Session Action instance must be a bounded identifier")
+	}
+	return action.InstanceID, nil
+}
+
 func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (model.Run, bool, error) {
 	if err := validateNewRun(&q); err != nil {
 		return model.Run{}, false, err
@@ -264,6 +292,10 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if taken {
 		return model.Run{}, false, failure("conflict", "run identity already exists")
 	}
+	sessionInstance, err := sessionInstanceFromTrigger(q.SessionID, trigger)
+	if err != nil {
+		return model.Run{}, false, err
+	}
 	at := nowOr(q.At)
 	r := model.Run{ID: q.ID, TargetID: q.TargetID, RootRunID: q.RootRunID, ParentRunID: q.ParentRunID, CallNodeID: q.CallNodeID, Depth: q.Depth, SessionID: q.SessionID,
 		IdempotencyKey: q.IdempotencyKey, PredecessorRunID: q.PredecessorRunID, WorkflowResourceID: q.WorkflowResourceID, WorkflowCommitID: q.WorkflowCommitID, DefinitionDigest: q.DefinitionDigest, ActionID: q.ActionID,
@@ -279,12 +311,12 @@ func createRun(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun) (m
 	if err != nil {
 		return model.Run{}, false, err
 	}
-	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger))
+	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger)+len(sessionInstance))
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
-		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
+		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, sessionInstance, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
 		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
 	return r, true, err
 }
@@ -430,6 +462,12 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
+	if f.SessionInstanceID != "" {
+		if f.SessionID == "" || !sessionInstanceKey(f.SessionInstanceID) {
+			return "", nil, 0, failure("invalid_argument", "a Session instance filter requires a Session and a bounded instance identifier")
+		}
+		where, args = append(where, "session_instance_id=?"), append(args, f.SessionInstanceID)
+	}
 	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID, "source_experiment_id": f.ExperimentResourceID, "source_instance_id": f.WorkflowInstanceID} {
 		if value == "" {
 			continue
@@ -537,7 +575,7 @@ const (
 	interruptOpen = "UPDATE runs SET status='interrupted',termination='interrupted',finished_at=?,revision=revision+1,bytes=bytes+? WHERE scope=? AND status IN ('queued','running','stopping')"
 
 	// A finished Run is only eligible for pruning when its root is finished too.
-	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.root_run_id=r.id AND p.pending_remote_count>0) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
+	eligibleRuns = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
 	pruneByAge   = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " AND finished_at<? ORDER BY finished_at,id LIMIT ?"
 	pruneOldest  = "SELECT finished_at FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at,id LIMIT 1"
 	pruneByCount = "SELECT id,bytes FROM runs r WHERE " + eligibleRuns + " ORDER BY finished_at DESC,id DESC LIMIT ? OFFSET ?"

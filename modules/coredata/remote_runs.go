@@ -3,20 +3,17 @@ package coredata
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-	"sort"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
-
-// A page inspects at most 16 pending owner blobs (at most 8 MiB), independently
-// of matching link count. History and full execution payloads are never read.
-const remoteOwnerScanLimit = 16
 
 func validateRemoteLink(link model.RemoteRunLink) error {
 	for _, key := range []string{link.OwnerRunID, link.RootRunID, link.TargetID, link.RunID, link.CallNodeID} {
@@ -27,28 +24,11 @@ func validateRemoteLink(link model.RemoteRunLink) error {
 	return optionalKey("remote boot", link.BootID)
 }
 
-func remoteLinks(raw []byte, count int) ([]model.RemoteRunLink, error) {
-	if len(raw) == 0 && count == 0 {
-		return nil, nil
-	}
-	if len(raw) > model.MaxRemoteRunLinksBytes || count < 0 || count > model.MaxRemoteRunLinks {
-		return nil, failure("data_loss", "invalid remote ownership capacity")
-	}
-	var links []model.RemoteRunLink
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&links) != nil || len(links) != count || decoder.Decode(new(any)) != io.EOF {
-		return nil, failure("data_loss", "invalid remote ownership payload")
-	}
-	seen := map[string]bool{}
-	for _, link := range links {
-		key := link.TargetID + "\x00" + link.RunID
-		if validateRemoteLink(link) != nil || seen[key] {
-			return nil, failure("data_loss", "invalid or repeated remote ownership identity")
-		}
-		seen[key] = true
-	}
-	return links, nil
+// remoteLinkBytes preserves the existing encoded-array capacity contract even
+// though the durable relationship itself is stored as typed relational fields.
+func remoteLinkBytes(link model.RemoteRunLink) (int64, error) {
+	raw, err := json.Marshal(link)
+	return int64(len(raw)), err
 }
 
 // ReserveRemoteRun precedes a remote Start. A later reservation may bind an
@@ -68,170 +48,197 @@ func (s *Store) changeRemoteRun(ctx context.Context, link model.RemoteRunLink, r
 		return err
 	}
 	_, err := write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (bool, error) {
-		var root, target, status string
-		var raw []byte
-		var count int
-		err := tx.QueryRowContext(ctx, "SELECT root_run_id,target_id,status,pending_remote_json,pending_remote_count FROM runs WHERE scope=? AND id=?", scope, link.OwnerRunID).Scan(&root, &target, &status, &raw, &count)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false, failure("not_found", "remote control owner is unavailable")
-		}
-		if err != nil {
-			return false, err
-		}
-		if root != link.RootRunID || target == link.TargetID {
-			return false, failure("failed_precondition", "remote control owner lineage or target disagrees")
-		}
-		links, err := remoteLinks(raw, count)
-		if err != nil {
-			return false, err
-		}
-		found, changed := false, false
-		for i, current := range links {
-			if current.TargetID != link.TargetID || current.RunID != link.RunID {
-				continue
-			}
-			found = true
-			if current.OwnerRunID != link.OwnerRunID || current.RootRunID != link.RootRunID || current.CallNodeID != link.CallNodeID ||
-				(resolve && current.BootID != link.BootID) || (!resolve && current.BootID != "" && link.BootID != "" && current.BootID != link.BootID) {
-				return false, failure("failed_precondition", "remote control identity or boot conflicts")
-			}
-			if resolve {
-				links = append(links[:i], links[i+1:]...)
-				changed = true
-			} else if current.BootID == "" && link.BootID != "" {
-				links[i].BootID = link.BootID
-				changed = true
-			}
-			break
-		}
-		if !found && !resolve {
-			if !model.RunStatus(status).Open() {
-				return false, failure("failed_precondition", "closed owner cannot reserve a new remote Run")
-			}
-			links = append(links, link)
-			changed = true
-		}
-		if !changed {
-			return false, nil
-		}
-		sort.Slice(links, func(i, j int) bool {
-			if links[i].TargetID != links[j].TargetID {
-				return links[i].TargetID < links[j].TargetID
-			}
-			return links[i].RunID < links[j].RunID
-		})
-		var next []byte
-		if len(links) > 0 {
-			next, err = json.Marshal(links)
-		}
-		if err != nil {
-			return false, err
-		}
-		if len(links) > model.MaxRemoteRunLinks || len(next) > model.MaxRemoteRunLinksBytes {
-			return false, failure("resource_exhausted", "remote control owner capacity reached")
-		}
-		delta := int64(len(next) - len(raw))
-		if delta > 0 {
-			err = reserve(ctx, tx, scope, 0, delta)
-		} else if delta < 0 {
-			err = release(ctx, tx, scope, 0, -delta)
-		}
-		if err != nil {
-			return false, err
-		}
-		_, err = tx.ExecContext(ctx, "UPDATE runs SET pending_remote_json=?,pending_remote_count=?,bytes=bytes+? WHERE scope=? AND id=?", nonNilBytes(next), len(links), delta, scope, link.OwnerRunID)
-		return true, err
+		return changeRemoteRun(ctx, tx, scope, link, resolve)
 	})
 	return err
 }
 
-func nonNilBytes(raw []byte) []byte {
-	if raw == nil {
-		return []byte{}
+func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, resolve bool) (bool, error) {
+	if err := validateRemoteLink(link); err != nil {
+		return false, err
 	}
-	return raw
+	var root, target, status string
+	var count int
+	var total int64
+	err := tx.QueryRowContext(ctx, `SELECT root_run_id,target_id,status,pending_remote_count,pending_remote_bytes FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID).Scan(&root, &target, &status, &count, &total)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, failure("not_found", "remote control owner is unavailable")
+	}
+	if err != nil {
+		return false, err
+	}
+	if root != link.RootRunID || target == link.TargetID {
+		return false, failure("failed_precondition", "remote control owner lineage or target disagrees")
+	}
+	if count < 0 || count > model.MaxRemoteRunLinks || total < 0 || total > model.MaxRemoteRunLinksBytes || (count == 0) != (total == 0) {
+		return false, failure("data_loss", "invalid remote ownership capacity")
+	}
+	var existingRoot, existingCall, existingBoot string
+	var existingBytes int64
+	err = tx.QueryRowContext(ctx, `SELECT root_run_id,call_node_id,boot_id,encoded_bytes FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`, scope, link.OwnerRunID, link.TargetID, link.RunID).Scan(&existingRoot, &existingCall, &existingBoot, &existingBytes)
+	found := err == nil
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	}
+	if found {
+		current := link
+		current.RootRunID, current.CallNodeID, current.BootID = existingRoot, existingCall, existingBoot
+		encoded, e := remoteLinkBytes(current)
+		if e != nil || validateRemoteLink(current) != nil || encoded != existingBytes || count == 0 {
+			return false, failure("data_loss", "invalid remote ownership row")
+		}
+		if current.RootRunID != link.RootRunID || current.CallNodeID != link.CallNodeID ||
+			(resolve && current.BootID != link.BootID) || (!resolve && current.BootID != "" && link.BootID != "" && current.BootID != link.BootID) {
+			return false, failure("failed_precondition", "remote control identity or boot conflicts")
+		}
+		if resolve {
+			logical := existingBytes + 1 // comma
+			if count == 1 {
+				logical = existingBytes + 2 // enclosing brackets
+			}
+			if logical > total || count == 1 && logical != total {
+				return false, failure("data_loss", "remote ownership accounting disagrees")
+			}
+			if _, err = tx.ExecContext(ctx, `DELETE FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`, scope, link.OwnerRunID, link.TargetID, link.RunID); err != nil {
+				return false, err
+			}
+			if err = release(ctx, tx, scope, 1, logical+rowOverhead); err != nil {
+				return false, err
+			}
+			_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes-? WHERE scope=? AND id=?`, count-1, total-logical, logical+rowOverhead, scope, link.OwnerRunID)
+			return true, err
+		}
+		if current.BootID != "" || link.BootID == "" {
+			return false, nil
+		}
+		nextBytes, err := remoteLinkBytes(link)
+		if err != nil {
+			return false, err
+		}
+		delta := nextBytes - existingBytes
+		if delta <= 0 || total+delta > model.MaxRemoteRunLinksBytes {
+			return false, failure("resource_exhausted", "remote control owner capacity reached")
+		}
+		if err = reserve(ctx, tx, scope, 0, delta); err != nil {
+			return false, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE run_remote_pending SET boot_id=?,encoded_bytes=? WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`, link.BootID, nextBytes, scope, link.OwnerRunID, link.TargetID, link.RunID); err != nil {
+			return false, err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_bytes=?,bytes=bytes+? WHERE scope=? AND id=?`, total+delta, delta, scope, link.OwnerRunID)
+		return true, err
+	}
+	if resolve {
+		return false, nil
+	}
+	if !model.RunStatus(status).Open() {
+		return false, failure("failed_precondition", "closed owner cannot reserve a new remote Run")
+	}
+	encoded, err := remoteLinkBytes(link)
+	if err != nil {
+		return false, err
+	}
+	logical := encoded + 1
+	if count == 0 {
+		logical = encoded + 2
+	}
+	if count == model.MaxRemoteRunLinks || total+logical > model.MaxRemoteRunLinksBytes {
+		return false, failure("resource_exhausted", "remote control owner capacity reached")
+	}
+	if err = reserve(ctx, tx, scope, 1, logical+rowOverhead); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO run_remote_pending(scope,owner_run_id,root_run_id,target_id,child_run_id,call_node_id,boot_id,encoded_bytes) VALUES(?,?,?,?,?,?,?,?)`, scope, link.OwnerRunID, link.RootRunID, link.TargetID, link.RunID, link.CallNodeID, link.BootID, encoded); err != nil {
+		return false, err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes+? WHERE scope=? AND id=?`, count+1, total+logical, logical+rowOverhead, scope, link.OwnerRunID)
+	return true, err
 }
 
 type remoteRunCursor struct {
-	Target   string `json:"target"`
-	Owner    string `json:"owner"`
-	Run      string `json:"run,omitempty"`
-	Complete bool   `json:"complete,omitempty"`
+	Version int    `json:"v"`
+	Scope   string `json:"scope"`
+	Target  string `json:"target"`
+	Owner   string `json:"owner"`
+	Run     string `json:"run"`
 }
 
-func remotePageCursor(position remoteRunCursor) string {
-	raw, _ := json.Marshal(position)
+func remoteScope(scope string) string {
+	sum := sha256.Sum256([]byte(scope))
+	return hex.EncodeToString(sum[:])
+}
+
+func remotePageCursor(scope string, link model.RemoteRunLink) string {
+	raw, _ := json.Marshal(remoteRunCursor{Version: 1, Scope: remoteScope(scope), Target: link.TargetID, Owner: link.OwnerRunID, Run: link.RunID})
 	return base64.RawURLEncoding.EncodeToString(raw)
 }
+
+// The covering target index seeks directly to one target and keyset position.
+// The owner join validates immutable lineage only for selected relationships.
+const pendingRemoteTargetQuery = `SELECT p.owner_run_id,p.root_run_id,p.target_id,p.child_run_id,p.call_node_id,p.boot_id,p.encoded_bytes,r.root_run_id,r.target_id
+FROM run_remote_pending p INDEXED BY run_remote_pending_target
+JOIN runs r ON r.scope=p.scope AND r.id=p.owner_run_id
+WHERE p.scope=? AND p.target_id=? AND (p.owner_run_id,p.child_run_id)>(?,?)
+ORDER BY p.owner_run_id,p.child_run_id LIMIT ?`
 
 func (s *Store) ListPendingRemoteRuns(ctx context.Context, target, cursor string, limit int) (model.RemoteRunPage, error) {
 	if !textKey(target) || limit < 1 || limit > model.MaxRemoteRunPageSize {
 		return model.RemoteRunPage{}, failure("invalid_argument", "invalid pending remote page")
 	}
-	position := remoteRunCursor{Target: target}
+	var position remoteRunCursor
 	if cursor != "" {
 		if len(cursor) > 16384 {
 			return model.RemoteRunPage{}, failure("invalid_argument", "invalid pending remote cursor")
 		}
-		raw, err := base64.RawURLEncoding.DecodeString(cursor)
+		raw, err := base64.RawURLEncoding.Strict().DecodeString(cursor)
 		if err != nil || len(raw) > 8192 {
 			return model.RemoteRunPage{}, failure("invalid_argument", "invalid pending remote cursor")
 		}
 		decoder := json.NewDecoder(bytes.NewReader(raw))
 		decoder.DisallowUnknownFields()
-		if decoder.Decode(&position) != nil || decoder.Decode(new(any)) != io.EOF || position.Target != target || !textKey(position.Owner) || position.Complete && position.Run != "" || !position.Complete && !textKey(position.Run) {
+		if decoder.Decode(&position) != nil || decoder.Decode(new(any)) != io.EOF || position.Version != 1 || position.Target != target || !textKey(position.Owner) || !textKey(position.Run) || !sha256Hex(position.Scope) {
 			return model.RemoteRunPage{}, failure("invalid_argument", "pending remote cursor identity disagrees")
 		}
 	}
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.RemoteRunPage, error) {
-		comparison := ">="
-		if position.Complete {
-			comparison = ">"
-		}
-		rows, err := tx.QueryContext(ctx, "SELECT id,root_run_id,pending_remote_json,pending_remote_count FROM runs INDEXED BY runs_pending_remote WHERE scope=? AND pending_remote_count>0 AND id"+comparison+"? ORDER BY id LIMIT ?", scope, position.Owner, remoteOwnerScanLimit+1)
-		if err != nil {
-			return model.RemoteRunPage{}, err
-		}
-		defer rows.Close()
-		var matches []model.RemoteRunLink
-		lastOwner, moreOwners, scanned := "", false, 0
-		for rows.Next() {
-			if scanned == remoteOwnerScanLimit {
-				moreOwners = true
-				break
-			}
-			var owner, root string
-			var raw []byte
-			var count int
-			if err := rows.Scan(&owner, &root, &raw, &count); err != nil {
-				return model.RemoteRunPage{}, err
-			}
-			links, err := remoteLinks(raw, count)
-			if err != nil {
-				return model.RemoteRunPage{}, err
-			}
-			for _, link := range links {
-				if link.OwnerRunID != owner || link.RootRunID != root {
-					return model.RemoteRunPage{}, failure("data_loss", "remote control row lineage disagrees")
-				}
-				if link.TargetID == target && (owner != position.Owner || link.RunID > position.Run) {
-					matches = append(matches, link)
-				}
-			}
-			lastOwner = owner
-			scanned++
-		}
-		if err := rows.Err(); err != nil {
-			return model.RemoteRunPage{}, err
-		}
-		page := model.RemoteRunPage{Links: matches}
-		if len(matches) > limit {
-			page.Links = matches[:limit]
-			last := page.Links[len(page.Links)-1]
-			page.Next = remotePageCursor(remoteRunCursor{Target: target, Owner: last.OwnerRunID, Run: last.RunID})
-		} else if moreOwners {
-			page.Next = remotePageCursor(remoteRunCursor{Target: target, Owner: lastOwner, Complete: true})
-		}
-		return page, nil
+		return pendingRemotePage(ctx, tx, scope, target, cursor, limit, position)
 	})
+}
+
+func pendingRemotePage(ctx context.Context, tx *sql.Tx, scope, target, cursor string, limit int, position remoteRunCursor) (model.RemoteRunPage, error) {
+	if cursor != "" && position.Scope != remoteScope(scope) {
+		return model.RemoteRunPage{}, failure("invalid_argument", "pending remote cursor scope disagrees")
+	}
+	rows, err := tx.QueryContext(ctx, pendingRemoteTargetQuery, scope, target, position.Owner, position.Run, limit+1)
+	if err != nil {
+		return model.RemoteRunPage{}, err
+	}
+	defer rows.Close()
+	var links []model.RemoteRunLink
+	more := false
+	for rows.Next() {
+		var link model.RemoteRunLink
+		var ownerRoot, ownerTarget string
+		var encoded int64
+		if err := rows.Scan(&link.OwnerRunID, &link.RootRunID, &link.TargetID, &link.RunID, &link.CallNodeID, &link.BootID, &encoded, &ownerRoot, &ownerTarget); err != nil {
+			return model.RemoteRunPage{}, err
+		}
+		expected, e := remoteLinkBytes(link)
+		if e != nil || validateRemoteLink(link) != nil || link.TargetID != target || link.RootRunID != ownerRoot || link.TargetID == ownerTarget || encoded != expected {
+			return model.RemoteRunPage{}, failure("data_loss", "remote control row lineage disagrees")
+		}
+		if len(links) == limit {
+			more = true
+			break
+		}
+		links = append(links, link)
+	}
+	if err := rows.Err(); err != nil {
+		return model.RemoteRunPage{}, err
+	}
+	page := model.RemoteRunPage{Links: links}
+	if more {
+		page.Next = remotePageCursor(scope, links[len(links)-1])
+	}
+	return page, nil
 }

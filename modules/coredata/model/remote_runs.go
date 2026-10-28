@@ -1,7 +1,6 @@
 package model
 
-// RemoteRunLink is an unresolved control/join relation on its accepted owner's
-// existing Run row. It is not a mirror of the remote execution state.
+// RemoteRunLink is an unresolved control/join relation owned by its accepted Run. It is not a mirror of the remote execution state.
 type RemoteRunLink struct {
 	OwnerRunID string `json:"ownerRunId"`
 	RootRunID  string `json:"rootRunId"`
@@ -13,7 +12,7 @@ type RemoteRunLink struct {
 
 type RemoteRunPage struct {
 	Links []RemoteRunLink `json:"links"`
-	// Next can advance past unmatched pending owners even when Links is empty.
+	// Next continues after the last selected target relationship.
 	Next string `json:"next,omitempty"`
 }
 

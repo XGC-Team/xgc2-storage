@@ -3,13 +3,17 @@ package coredata_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
@@ -90,7 +94,7 @@ func TestPendingRemoteRunProtectsOwnerAndRootAcrossReopenUntilExactJoin(t *testi
 
 func TestPendingRemotePageAdvancesAcrossUnmatchedOwnersAndMutations(t *testing.T) {
 	f := openStore(t)
-	// More than one bounded owner window contains no requested target.
+	// Unrelated owners must not produce empty scans before the selected target.
 	for i := range 35 {
 		id := fmt.Sprintf("owner-%02d", i)
 		if _, _, err := f.core.CreateRun(f.ctx, newRun(id)); err != nil {
@@ -139,8 +143,8 @@ func TestPendingRemotePageAdvancesAcrossUnmatchedOwnersAndMutations(t *testing.T
 		}
 		cursor = page.Next
 	}
-	if len(seen) != 4 || emptyPages < 2 {
-		t.Fatalf("bounded unmatched scans lost matching links: %v %d", seen, emptyPages)
+	if len(seen) != 4 || emptyPages != 0 {
+		t.Fatalf("selected-only pages lost or scanned unrelated links: %v %d", seen, emptyPages)
 	}
 	for _, cursor := range []string{"bad", strings.Repeat("x", 17000)} {
 		if _, err := f.core.ListPendingRemoteRuns(f.ctx, "agent", cursor, 1); errCode(err) != "invalid_argument" {
@@ -189,8 +193,7 @@ func TestPendingRemoteMutationsUseTheirIndexedRowAndRollbackQuota(t *testing.T) 
 	}
 	if err := f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {
 		queries := map[string]string{
-			"runs_pending_remote":      "SELECT id,pending_remote_json,pending_remote_count FROM runs INDEXED BY runs_pending_remote WHERE scope=? AND pending_remote_count>0 AND id>=? ORDER BY id LIMIT 17",
-			"runs_pending_remote_root": "SELECT 1 FROM runs WHERE scope=? AND root_run_id=? AND pending_remote_count>0",
+			"run_remote_pending_root": "SELECT 1 FROM run_remote_pending INDEXED BY run_remote_pending_root WHERE scope=? AND root_run_id=?",
 		}
 		for index, query := range queries {
 			plans, err := tx.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, `{"namespace":"core","user":"operator","workspace":"station"}`, "owner")
@@ -220,5 +223,319 @@ func TestPendingRemoteMutationsUseTheirIndexedRowAndRollbackQuota(t *testing.T) 
 	page, err := f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 128)
 	if err != nil || !reflect.DeepEqual(page.Links, []model.RemoteRunLink(nil)) {
 		t.Fatal("joined relation still pending", err)
+	}
+}
+
+func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {
+		t.Fatal(err)
+	}
+	baseRows, baseBytes := usageRows(t, f)
+	links := []model.RemoteRunLink{
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a<1", CallNodeID: "call"},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-2", CallNodeID: "call", BootID: "boot"},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-3", CallNodeID: "call", BootID: "boot"},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-1", CallNodeID: "call", BootID: "boot"},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-2", CallNodeID: "call", BootID: "boot"},
+	}
+	for _, link := range links {
+		if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	encoded, err := json.Marshal(links)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, charged := usageRows(t, f)
+	if rows-baseRows != int64(len(links)) || charged-baseBytes != int64(len(encoded)+256*len(links)) {
+		t.Fatalf("reservation quota rows=%d bytes=%d encoded=%d", rows-baseRows, charged-baseBytes, len(encoded))
+	}
+	var count int
+	var logical int64
+	if err = f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT pending_remote_count,pending_remote_bytes FROM runs WHERE scope=? AND id=?`, engine.ScopeID(f.scope), "owner").Scan(&count, &logical)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != len(links) || logical != int64(len(encoded)) {
+		t.Fatalf("derived count/bytes=%d/%d want %d/%d", count, logical, len(links), len(encoded))
+	}
+	first, err := f.core.ListPendingRemoteRuns(f.ctx, "agent-a", "", 1)
+	if err != nil || len(first.Links) != 1 || first.Next == "" {
+		t.Fatalf("first=%+v err=%v", first, err)
+	}
+	otherScope, err := coredata.New(f.db, api.Scope{Namespace: "core", User: "another", Workspace: "station"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = otherScope.ListPendingRemoteRuns(f.ctx, "agent-a", first.Next, 1); errCode(err) != "invalid_argument" {
+		t.Fatalf("cursor crossed scope: %v", err)
+	}
+	f.reopen(t)
+	cursor := ""
+	seen := map[string]bool{}
+	for i := 0; i < 10; i++ {
+		page, err := f.core.ListPendingRemoteRuns(f.ctx, "agent-a", cursor, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(page.Links) != 1 || seen[page.Links[0].RunID] {
+			t.Fatalf("selected page=%+v", page)
+		}
+		link := page.Links[0]
+		seen[link.RunID] = true
+		if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+			t.Fatal(err)
+		}
+		if page.Next == "" {
+			break
+		}
+		cursor = page.Next
+	}
+	if len(seen) != 3 {
+		t.Fatalf("selected links=%v", seen)
+	}
+	other, err := f.core.ListPendingRemoteRuns(f.ctx, "agent-b", "", 10)
+	if err != nil || len(other.Links) != 2 || other.Next != "" {
+		t.Fatalf("other target lost: %+v %v", other, err)
+	}
+	for _, link := range other.Links {
+		if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, charged = usageRows(t, f)
+	if rows != baseRows || charged != baseBytes {
+		t.Fatalf("resolved quota rows=%d/%d bytes=%d/%d", rows, baseRows, charged, baseBytes)
+	}
+}
+
+func TestPendingRemoteCancellationAndQuotaRollback(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {
+		t.Fatal(err)
+	}
+	link := model.RemoteRunLink{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent", RunID: "child", CallNodeID: "call"}
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if err := f.core.ReserveRemoteRun(ctx, link); err == nil {
+		t.Fatal("canceled reserve succeeded")
+	}
+	page, err := f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
+	if err != nil || len(page.Links) != 0 {
+		t.Fatalf("canceled reserve left a relation: %+v %v", page, err)
+	}
+	rows, bytes := usageRows(t, f)
+	f.exec(t, `UPDATE core_data_usage SET rows=?,bytes=? WHERE scope=?`, coredata.MaxScopeRows, bytes, engine.ScopeID(f.scope))
+	if err = f.core.ReserveRemoteRun(f.ctx, link); errCode(err) != "resource_exhausted" {
+		t.Fatalf("row quota reserve: %v", err)
+	}
+	gotRows, gotBytes := usageRows(t, f)
+	if gotRows != coredata.MaxScopeRows || gotBytes != bytes {
+		t.Fatal("failed row quota changed counters")
+	}
+	f.exec(t, `UPDATE core_data_usage SET rows=?,bytes=? WHERE scope=?`, rows, bytes, engine.ScopeID(f.scope))
+	if err = f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	rows, bytes = usageRows(t, f)
+	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, coredata.MaxScopeBytes, engine.ScopeID(f.scope))
+	bound := link
+	bound.BootID = "boot"
+	if err = f.core.ReserveRemoteRun(f.ctx, bound); errCode(err) != "resource_exhausted" {
+		t.Fatalf("boot binding quota: %v", err)
+	}
+	page, err = f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
+	if err != nil || len(page.Links) != 1 || page.Links[0].BootID != "" {
+		t.Fatalf("failed boot binding changed authority: %+v %v", page, err)
+	}
+	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, bytes, engine.ScopeID(f.scope))
+	if err = f.core.ResolveRemoteRun(ctx, link); err == nil {
+		t.Fatal("canceled resolve succeeded")
+	}
+	page, err = f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
+	if err != nil || len(page.Links) != 1 {
+		t.Fatalf("canceled resolve removed relation: %+v %v", page, err)
+	}
+	if err = f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	gotRows, gotBytes = usageRows(t, f)
+	if gotRows != rows-1 || gotBytes >= bytes {
+		t.Fatalf("resolved quota not released: %d/%d %d/%d", gotRows, rows, gotBytes, bytes)
+	}
+}
+
+func TestPendingRemotePerOwnerCountAndByteLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		large bool
+	}{{"count", false}, {"bytes", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := openStore(t)
+			owner := "owner"
+			if tc.large {
+				owner = strings.Repeat("o", 240)
+			}
+			if _, _, err := f.core.CreateRun(f.ctx, newRun(owner)); err != nil {
+				t.Fatal(err)
+			}
+			target, call, boot := "agent", "call", "boot"
+			if tc.large {
+				target = strings.Repeat("t", 240)
+				call = strings.Repeat("c", 240)
+				boot = strings.Repeat("b", 240)
+			}
+			accepted := 0
+			for i := 0; i <= model.MaxRemoteRunLinks; i++ {
+				id := fmt.Sprintf("child-%04d", i)
+				if tc.large {
+					id = fmt.Sprintf("%04d-%s", i, strings.Repeat("r", 240))
+				}
+				link := model.RemoteRunLink{OwnerRunID: owner, RootRunID: owner, TargetID: target, RunID: id, CallNodeID: call, BootID: boot}
+				beforeRows, beforeBytes := usageRows(t, f)
+				err := f.core.ReserveRemoteRun(f.ctx, link)
+				if err != nil {
+					if errCode(err) != "resource_exhausted" {
+						t.Fatal(err)
+					}
+					afterRows, afterBytes := usageRows(t, f)
+					if beforeRows != afterRows || beforeBytes != afterBytes {
+						t.Fatal("failed capacity reservation changed quota")
+					}
+					break
+				}
+				accepted++
+			}
+			if tc.large && (accepted == 0 || accepted >= model.MaxRemoteRunLinks) || !tc.large && accepted != model.MaxRemoteRunLinks {
+				t.Fatalf("%s accepted=%d", tc.name, accepted)
+			}
+			page, err := f.core.ListPendingRemoteRuns(f.ctx, target, "", model.MaxRemoteRunPageSize)
+			if err != nil || len(page.Links) != model.MaxRemoteRunPageSize || page.Next == "" {
+				t.Fatalf("bounded page=%+v err=%v", page, err)
+			}
+		})
+	}
+}
+
+func TestPendingRemoteTargetPagesAcrossOwnerCapacityAndReopen(t *testing.T) {
+	f := openStore(t)
+	const owners, perOwner = 9, 128
+	for i := range owners {
+		owner := fmt.Sprintf("owner-%02d", i)
+		if _, _, err := f.core.CreateRun(f.ctx, newRun(owner)); err != nil {
+			t.Fatal(err)
+		}
+		for j := range perOwner {
+			link := model.RemoteRunLink{OwnerRunID: owner, RootRunID: owner, TargetID: "selected", RunID: fmt.Sprintf("remote-%03d", j), CallNodeID: "call", BootID: "boot"}
+			if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		other := model.RemoteRunLink{OwnerRunID: owner, RootRunID: owner, TargetID: "other", RunID: "other", CallNodeID: "other-call"}
+		if err := f.core.ReserveRemoteRun(f.ctx, other); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := make(map[string]bool)
+	cursor, pages := "", 0
+	for {
+		page, err := f.core.ListPendingRemoteRuns(f.ctx, "selected", cursor, 128)
+		if err != nil || len(page.Links) == 0 || len(page.Links) > 128 {
+			t.Fatalf("page %d: %+v %v", pages, page, err)
+		}
+		pages++
+		for _, link := range page.Links {
+			key := link.OwnerRunID + "/" + link.RunID
+			if seen[key] || link.TargetID != "selected" {
+				t.Fatalf("duplicate or foreign link: %+v", link)
+			}
+			seen[key] = true
+			if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if page.Next == "" {
+			break
+		}
+		if page.Next == cursor || pages > 20 {
+			t.Fatal("cursor failed to advance")
+		}
+		cursor = page.Next
+		if pages == 1 {
+			f.reopen(t)
+		}
+	}
+	if len(seen) != owners*perOwner || pages != 9 {
+		t.Fatalf("draining selected rows lost links: %d across %d pages", len(seen), pages)
+	}
+	other, err := f.core.ListPendingRemoteRuns(f.ctx, "other", "", 128)
+	if err != nil || len(other.Links) != owners || other.Next != "" {
+		t.Fatalf("draining selected target changed other targets: %+v %v", other, err)
+	}
+}
+
+func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 {
+		unbound := model.RemoteRunLink{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent", RunID: fmt.Sprintf("remote-%d", i), CallNodeID: "call"}
+		if err := f.core.ReserveRemoteRun(f.ctx, unbound); err != nil {
+			t.Fatal(err)
+		}
+		bound := unbound
+		bound.BootID = "boot"
+		start := make(chan struct{})
+		var bindErr, resolveErr error
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); <-start; bindErr = f.core.ReserveRemoteRun(f.ctx, bound) }()
+		go func() { defer wg.Done(); <-start; resolveErr = f.core.ResolveRemoteRun(f.ctx, unbound) }()
+		close(start)
+		wg.Wait()
+		if bindErr != nil || resolveErr != nil && errCode(resolveErr) != "failed_precondition" {
+			t.Fatalf("bind=%v resolve=%v", bindErr, resolveErr)
+		}
+		page, err := f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
+		if err != nil || len(page.Links) != 1 || page.Links[0] != bound {
+			t.Fatalf("old resolve erased bound child: %+v %v", page, err)
+		}
+		if err := f.core.ResolveRemoteRun(f.ctx, bound); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPendingRemoteMissingRootStillProtectsOwner(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, childRun("owner", "missing-root", "missing-root", 1)); err != nil {
+		t.Fatal(err)
+	}
+	link := model.RemoteRunLink{OwnerRunID: "owner", RootRunID: "missing-root", TargetID: "agent", RunID: "remote", CallNodeID: "call"}
+	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen(t)
+	pending, err := f.core.HasPendingRemoteRoot(f.ctx, "missing-root")
+	if err != nil || !pending {
+		t.Fatalf("missing root lost pending authority: %t %v", pending, err)
+	}
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "owner", Status: model.RunCanceled, At: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err := f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})
+	if err != nil || pruned.Deleted != 0 {
+		t.Fatalf("missing root permitted owner retirement: %+v %v", pruned, err)
+	}
+	if err := f.core.ResolveRemoteRun(f.ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})
+	if err != nil || pruned.Deleted != 1 {
+		t.Fatalf("joined missing-root owner not retired: %+v %v", pruned, err)
 	}
 }
