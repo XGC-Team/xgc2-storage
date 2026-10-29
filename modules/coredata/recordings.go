@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"path/filepath"
 	"strings"
 	"time"
@@ -186,15 +187,28 @@ func summaryBool(fields map[string]json.RawMessage, key string) bool {
 	return value
 }
 
-// summaryInstant accepts only RFC3339/RFC3339Nano. An absent, empty or
-// otherwise invalid value sorts at the registration's CreatedAt instead.
+// The stored sort_at and created_at are signed int64 nanoseconds. Instants
+// outside this inclusive range have no representable UnixNano and must not
+// become wrapped index keys.
+var (
+	minRecordingInstant = time.Unix(0, math.MinInt64).UTC()
+	maxRecordingInstant = time.Unix(0, math.MaxInt64).UTC()
+)
+
+func recordingInstantRepresentable(t time.Time) bool {
+	return !t.Before(minRecordingInstant) && !t.After(maxRecordingInstant)
+}
+
+// summaryInstant accepts only RFC3339/RFC3339Nano inside the signed
+// nanosecond range. An absent, empty, invalid or unrepresentable value is
+// projected as absent; sort_at then falls back to the registration's CreatedAt.
 func summaryInstant(fields map[string]json.RawMessage, key string) time.Time {
 	value := summaryText(fields, key)
 	if value == "" {
 		return time.Time{}
 	}
 	instant, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
+	if err != nil || !recordingInstantRepresentable(instant) {
 		return time.Time{}
 	}
 	return instant.UTC()

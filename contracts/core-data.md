@@ -171,6 +171,10 @@ supply it.
 | `GetRecordingForDeletion` | read | returns the selected full row and checks its exact owning Run lifecycle in the same read transaction. An open Run is a `conflict`; a pruned Run is allowed; a live Session does not block |
 | `DeleteRecording` | Durable | deletes exactly the guarded row from `RecordingDelete{ID, RunID, SessionID, Kind, Path, CreatedAt}`, rechecks the Run lifecycle, and releases the stored one-row/byte charge once. A changed or reused guard is a `conflict`; a missing row is `not_found`; physical files are the caller's responsibility |
 
+A metadata instant outside the signed int64 nanosecond range is projected as absent
+rather than stored as a wrapped index key. `startedAt` then falls back to `created_at`
+for sorting; `endedAt` and `finishedAt` follow the same representability rule.
+
 ## Quota and retention
 
 Rows and bytes of Core data are charged to a per-scope live total (1,000,000 rows, 512 MiB);
