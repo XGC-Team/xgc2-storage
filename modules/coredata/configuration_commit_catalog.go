@@ -13,7 +13,7 @@ import (
 func (s *Store) ReadCommitCatalog(ctx context.Context, q model.ConfigurationCatalogRead) (model.ConfigurationCommitCatalog, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationCommitCatalog, error) {
 		return configurationCommitCatalog(ctx, tx, scope, q)
-	})
+	}, func() { q = ownedCatalogRead(q) })
 }
 
 // ReadCommitCatalogPage reads and optionally fences exactly this resource's
@@ -21,6 +21,9 @@ func (s *Store) ReadCommitCatalog(ctx context.Context, q model.ConfigurationCata
 func (s *Store) ReadCommitCatalogPage(ctx context.Context, q model.ConfigurationCommitCatalogRead) (model.ConfigurationCommitCatalog, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationCommitCatalog, error) {
 		return configurationCommitCatalogFenced(ctx, tx, scope, q.Catalog, q.ExpectedFence)
+	}, func() {
+		q.Catalog = ownedCatalogRead(q.Catalog)
+		q.ExpectedFence = ownedPointer(q.ExpectedFence)
 	})
 }
 

@@ -27,7 +27,7 @@ func configurationNamespace(ctx context.Context, tx *sql.Tx, scope, domain, id s
 	return
 }
 
-func configurationNamespaceWrite(ctx context.Context, tx *sql.Tx, scope, operation string, q model.ConfigurationNamespaceWrite) (out model.ConfigurationNamespaceResult, err error) {
+func configurationNamespaceWrite(ctx context.Context, tx *sql.Tx, scope, operation string, q model.ConfigurationNamespaceWrite, own ...func(*model.ConfigurationNamespaceWrite) error) (out model.ConfigurationNamespaceResult, err error) {
 	if _, err = configurationDomain(ctx, tx, q.Domain); err != nil {
 		return out, err
 	}
@@ -55,6 +55,11 @@ func configurationNamespaceWrite(ctx context.Context, tx *sql.Tx, scope, operati
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return out, err
+	}
+	if len(own) != 0 {
+		if err = own[0](&q); err != nil {
+			return out, err
+		}
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var oldBody []byte

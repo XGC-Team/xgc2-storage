@@ -2,6 +2,7 @@ package engine_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,7 +14,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-func TestRemoteResolutionReturnsItsCommittedCutWhenCancellationRacesCommit(t *testing.T) {
+func TestRemoteResolutionCancellationRetainsExactCommitAttempt(t *testing.T) {
 	ctx := t.Context()
 	scope := api.Scope{Namespace: "core", User: "operator", Workspace: "station"}
 	manifest := api.Manifest{Format: "storage-v1", Namespaces: []api.Namespace{{ID: "core", Owner: "core", Schema: coredata.Schema, MaxScopes: 8, MaxReceipts: 100, ReceiptTTLSeconds: 3600, Modules: []string{model.Module}}}}
@@ -62,17 +63,25 @@ func TestRemoteResolutionReturnsItsCommittedCutWhenCancellationRacesCommit(t *te
 		t.Fatal("resolution did not reach COMMIT")
 	}
 	cancel()
-	release()
 	out := <-done
-	if out.err != nil || !out.result.Changed || !out.result.LastForRoot || !out.result.RootFound || out.result.RootRunID != "root" || !out.result.RootFinishedAt.Equal(finishedAt) || !out.result.OwnerFinishedAt.Equal(finishedAt) {
-		t.Fatalf("committed API result lost after cancellation: %+v %v", out.result, out.err)
+	var disposition *engine.WriteError
+	var resolution *coredata.RemoteRunResolveError
+	if !errors.As(out.err, &disposition) || disposition.Disposition != engine.WriteUnknown || disposition.Settled || !disposition.MayHaveCommitted || !errors.As(out.err, &resolution) || !resolution.ValidatedAttempt || resolution.AttemptedLink != link || out.result != (model.RemoteRunResolveResult{}) {
+		t.Fatalf("in-flight resolution lost its exact owner: %+v %v", out.result, out.err)
+	}
+	if pending, err := store.HasPendingRemoteRoot(ctx, "root"); err == nil || pending {
+		t.Fatalf("unjoined resolution allowed a revalidation: pending=%v %v", pending, err)
+	}
+	release()
+	if err := disposition.WaitSettlement(ctx); err != nil {
+		t.Fatalf("real COMMIT did not join: %v", err)
 	}
 	if pending, err := store.HasPendingRemoteRoot(ctx, "root"); err != nil || pending {
 		t.Fatalf("committed result disagrees with durable relation: pending=%v %v", pending, err)
 	}
 }
 
-func TestAgentLinkWriteReturnsItsCommittedGuardWhenCancellationRacesCommit(t *testing.T) {
+func TestAgentLinkCancellationRetainsExactCommitAttempt(t *testing.T) {
 	ctx := t.Context()
 	dir := t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
@@ -113,13 +122,17 @@ func TestAgentLinkWriteReturnsItsCommittedGuardWhenCancellationRacesCommit(t *te
 		t.Fatal("write did not reach COMMIT")
 	}
 	cancel()
-	release()
 	out := <-done
-	if out.err != nil || !out.result.Changed || out.result.Stored.Guard.Version != "1" || out.result.Stored.Guard.Identity != initial.Identity || out.result.Stored.Record.AgentID != "agent" {
-		t.Fatalf("committed enrollment acknowledgement lost: %+v %v", out.result, out.err)
+	var disposition *engine.WriteError
+	if !errors.As(out.err, &disposition) || disposition.Disposition != engine.WriteUnknown || disposition.Settled || !disposition.MayHaveCommitted || out.result.Changed {
+		t.Fatalf("in-flight enrollment was reported as committed: %+v %v", out.result, out.err)
+	}
+	release()
+	if err := disposition.WaitSettlement(ctx); err != nil {
+		t.Fatalf("real enrollment COMMIT did not join: %v", err)
 	}
 	after, err := store.ListAgentLinks(ctx)
-	if err != nil || len(after.Records) != 1 || after.Records[0].Guard != out.result.Stored.Guard {
-		t.Fatalf("committed acknowledgement disagrees with owner: %+v %v", after, err)
+	if err != nil || len(after.Records) != 1 || after.Records[0].Guard.Version != "1" || after.Records[0].Guard.Identity != initial.Identity {
+		t.Fatalf("joined current enrollment state: %+v %v", after, err)
 	}
 }

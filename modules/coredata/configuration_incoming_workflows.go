@@ -35,6 +35,10 @@ ORDER BY selected.target_resource_id,r.id`
 func (s *Store) ReadWorkflowRobotBindings(ctx context.Context, q model.ConfigurationWorkflowRobotRead) (model.ConfigurationWorkflowRobotResult, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationWorkflowRobotResult, error) {
 		return configurationWorkflowRobotBindings(ctx, tx, scope, q)
+	}, func() {
+		if len(q.WorkflowIDs) <= MaxWorkflowRobotTargets {
+			q.WorkflowIDs = append([]string(nil), q.WorkflowIDs...)
+		}
 	})
 }
 

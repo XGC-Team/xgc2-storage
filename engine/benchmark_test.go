@@ -42,10 +42,10 @@ func benchStore(b *testing.B) *Store {
 	return s
 }
 
-func reportSyncs(b *testing.B, s *Store, before Stats) {
+func reportDurabilityEstimates(b *testing.B, s *Store, before Stats) {
 	b.Helper()
 	after, _ := s.Stats()
-	b.ReportMetric(float64(after.Fsyncs-before.Fsyncs)/float64(b.N), "syncs/op")
+	b.ReportMetric(float64(after.DurabilityEstimates-before.DurabilityEstimates)/float64(b.N), "durability-estimates/op")
 }
 
 func benchCommit(b *testing.B, class Durability, rows int) {
@@ -66,7 +66,7 @@ func benchCommit(b *testing.B, class Durability, rows int) {
 		}
 	}
 	b.StopTimer()
-	reportSyncs(b, s, before)
+	reportDurabilityEstimates(b, s, before)
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "commits/s")
 	if rows > 1 {
 		b.ReportMetric(float64(b.N*rows)/b.Elapsed().Seconds(), "rows/s")
@@ -96,7 +96,7 @@ func benchParallel(b *testing.B, class Durability) {
 		}
 	})
 	b.StopTimer()
-	reportSyncs(b, s, before)
+	reportDurabilityEstimates(b, s, before)
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "commits/s")
 }
 
@@ -124,7 +124,7 @@ func benchDocument(b *testing.B, relaxed bool) {
 		token, version = receipt.Token, receipt.Token.Revision
 	}
 	b.StopTimer()
-	reportSyncs(b, s, before)
+	reportDurabilityEstimates(b, s, before)
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "commits/s")
 }
 

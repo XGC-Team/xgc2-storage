@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,13 +39,15 @@ type Stats struct {
 	// the total time they held a connection.
 	QueueWaitNS uint64 `json:"queue_wait_ns"`
 	SQLTimeNS   uint64 `json:"sql_time_ns"`
-	// Commits by class. Fsyncs counts the durability barriers the owner asked
-	// for: one per durable commit and two per checkpoint that moved frames.
-	// SQLite may add an internal sync for the first frame after a WAL reset.
-	CommitsDurable uint64 `json:"commits_durable"`
-	CommitsRelaxed uint64 `json:"commits_relaxed"`
-	Fsyncs         uint64 `json:"fsyncs"`
-	Checkpoints    uint64 `json:"checkpoints"`
+	// Commits by class. DurabilityEstimates counts logical durability operations:
+	// one per acknowledged durable COMMIT, including no-change transactions,
+	// and two per checkpoint that moved frames. It is not a
+	// count of fsync/fdatasync calls or physical barriers; SQLite and its VFS
+	// may skip, combine or add actual sync operations.
+	CommitsDurable      uint64 `json:"commits_durable"`
+	CommitsRelaxed      uint64 `json:"commits_relaxed"`
+	DurabilityEstimates uint64 `json:"durability_estimates"`
+	Checkpoints         uint64 `json:"checkpoints"`
 	// CheckpointPending is true while a checkpoint timer or request is armed.
 	// CheckpointRunning remains true through admission, execution and retry
 	// scheduling. Reading these flags performs no maintenance or database read.
@@ -69,7 +72,9 @@ type Stats struct {
 }
 
 func (s *Store) Stats() (Stats, error) {
-	s.lifecycle.RLock()
+	if !s.lifecycle.TryRLock() {
+		return Stats{}, fail("unavailable", "store is closing")
+	}
 	defer s.lifecycle.RUnlock()
 	if s.closed.Load() {
 		return Stats{}, fail("unavailable", "store closed")
@@ -80,14 +85,14 @@ func (s *Store) Stats() (Stats, error) {
 	}
 	out := Stats{DatabaseID: s.dbid, SQLiteVersion: s.engine, WritersQueued: len(s.queue), WriterCapacity: cap(s.queue), ReadersActive: len(s.reads), ReaderCapacity: cap(s.reads),
 		Calls: s.calls.Load(), Conflicts: s.conflicts.Load(), Timeouts: s.timeouts.Load(), QueueWaitNS: s.waitNS.Load(), SQLTimeNS: s.sqlNS.Load(),
-		CommitsDurable: s.durable.Load(), CommitsRelaxed: s.relaxed.Load(), Fsyncs: s.fsyncs.Load(), Checkpoints: s.checkpoints.Load(),
+		CommitsDurable: s.durable.Load(), CommitsRelaxed: s.relaxed.Load(), DurabilityEstimates: s.durabilityEstimates.Load(), Checkpoints: s.checkpoints.Load(),
 		ReceiptsPruned: s.receiptsPruned.Load(), MaintenanceErrors: s.maintenanceErrs.Load()}
 	out.MutationMetadataReads, out.MutationPayloadReads = s.mutationMetadataReads.Load(), s.mutationPayloadReads.Load()
 	out.MutationPayloadBytes, out.MutationOldDecodes = s.mutationPayloadBytes.Load(), s.mutationOldDecodes.Load()
 	out.SnapshotPayloadReads, out.SnapshotPayloadBytes = s.snapshotPayloadReads.Load(), s.snapshotPayloadBytes.Load()
 	out.SnapshotHeaderReads, out.SnapshotHeaderBytes = s.snapshotHeaderReads.Load(), s.snapshotHeaderBytes.Load()
 	if m != nil {
-		out.CheckpointPending = m.checkpointTimer != nil || m.work.Load()&workCheckpoint != 0
+		out.CheckpointPending = m.checkpointTimer != nil || m.work.Load()&workCheckpoint != 0 || m.faultCheckpoint
 		out.CheckpointRunning = m.checkpointRunning
 		m.mu.Unlock()
 	}
@@ -109,7 +114,7 @@ func (s *Store) Stats() (Stats, error) {
 func (s *Store) committed(d Durability) {
 	if d == Durable {
 		s.durable.Add(1)
-		s.fsyncs.Add(1)
+		s.durabilityEstimates.Add(1)
 	} else {
 		s.relaxed.Add(1)
 	}
@@ -130,23 +135,32 @@ func (s *Store) Checkpoint(ctx context.Context) (out CheckpointResult, err error
 	if err != nil {
 		return out, err
 	}
-	defer release()
-	err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
-	if err != nil {
-		return
-	}
-	s.checkpoints.Add(1)
-	if out.CheckpointedPages > 0 {
-		// The checkpoint syncs the WAL, copies the frames and syncs the database.
-		s.fsyncs.Add(2)
-	}
-	// PASSIVE backfills frames but leaves the allocated WAL file in place. At
-	// the physical admission watermark, that file would otherwise prevent the
-	// next writer from resetting it. Attempt one non-waiting reset under this
-	// same owner admission and deadline; a pinned reader leaves Busy set and
-	// preserves pressure until a later maintenance call can reclaim the file.
-	if s.walSize() >= s.config.MaxWALBytes {
-		err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&out.Busy, &out.LogPages, &out.CheckpointedPages)
+	defer func() { releaseWriterAfter(err, release) }()
+	var result CheckpointResult
+	err = s.waitPhysical(ctx, func() error {
+		e := s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&result.Busy, &result.LogPages, &result.CheckpointedPages)
+		if e == nil {
+			s.checkpoints.Add(1)
+			if result.CheckpointedPages > 0 {
+				// A moving checkpoint contributes two estimated durability operations.
+				s.durabilityEstimates.Add(2)
+			}
+			// An already allocated WAL may need one non-waiting reset.
+			if s.walSize() >= s.config.MaxWALBytes {
+				e = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&result.Busy, &result.LogPages, &result.CheckpointedPages)
+			}
+		}
+		if writerConnectionLost(e) {
+			settled, settleErr := s.settleFailedWriter(ctx)
+			return newWriteError(errors.Join(e, settleErr), WriteNotCommitted, settled)
+		}
+		if e != nil {
+			return newWriteError(e, WriteNotCommitted, true)
+		}
+		return e
+	}, nil, WriteNotCommitted, false)
+	if err == nil {
+		out = result
 	}
 	return
 }
@@ -181,7 +195,26 @@ func (s *Store) Backup(ctx context.Context, destination string) (receipt BackupR
 	if err != nil {
 		return receipt, err
 	}
-	defer release()
+	defer func() { releaseWriterAfter(err, release) }()
+	var result BackupReceipt
+	err = s.waitPhysical(ctx, func() error {
+		var e error
+		result, e = s.backupOwned(ctx, destination)
+		if writerConnectionLost(e) {
+			settled, settleErr := s.settleFailedWriter(ctx)
+			return newWriteError(errors.Join(e, settleErr), WriteNotCommitted, settled)
+		}
+		return e
+	}, nil, WriteUnknown, false)
+	if err == nil {
+		receipt = result
+	}
+	return receipt, err
+}
+
+// backupOwned retains the existing destination and temporary-file resources
+// until its actual writer operation and cleanup have finished.
+func (s *Store) backupOwned(ctx context.Context, destination string) (receipt BackupReceipt, err error) {
 	parent, e := openPrivateDirectory(filepath.Dir(destination))
 	if e != nil {
 		return receipt, e

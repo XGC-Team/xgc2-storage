@@ -24,11 +24,13 @@ const sessionUnsafeActivation = `SELECT CASE
 
 // QueueRestartSession durably reserves a successor without acquiring the live
 // target slot. An existing successor is returned for exact caller comparison.
-func (s *Store) QueueRestartSession(ctx context.Context, q model.NewSession) (session model.Session, created bool, err error) {
+func (s *Store) QueueRestartSession(ctx context.Context, q model.NewSession) (model.Session, bool, error) {
 	if !textKey(q.ID) || !textKey(q.TargetID) || !textKey(q.PredecessorSessionID) || q.ID == q.PredecessorSessionID || !textKey(q.ExperimentResourceID) || !textKey(q.ExperimentCommitID) || !textKey(q.RunMode) || len(q.RunMode) > 64 || len(q.ExperimentName) > 256 || !utf8.ValidString(q.ExperimentName) || strings.IndexFunc(q.ExperimentName, unicode.IsControl) >= 0 {
 		return model.Session{}, false, failure("invalid_argument", "invalid queued Session identity or frozen source")
 	}
-	err = s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+	var session model.Session
+	var created bool
+	err := s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
 		previous, e := selectSession(ctx, tx, s.scope, "id=?", q.ID)
 		if e == nil {
 			session = previous

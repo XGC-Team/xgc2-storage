@@ -47,10 +47,16 @@ type Host struct {
 	diagnostics *xrpc.Diagnostics
 	mu          sync.Mutex
 	servers     []*Server
-	closeOnce   sync.Once
-	closeDone   chan struct{}
-	closeErr    error
+	serving     sync.WaitGroup
+	close       *closeAttempt
+	serverErr   error
 	closed      atomic.Bool
+}
+
+type closeAttempt struct {
+	done     chan struct{}
+	err      error
+	storeErr error
 }
 
 // Open completes owner admission. ctx bounds startup only. Close owns
@@ -65,7 +71,7 @@ func Open(ctx context.Context, config Config) (_ *Host, err error) {
 	}
 	startup, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	h := &Host{manifest: config.Manifest, callBudget: config.CallBudget, diagnostics: config.Diagnostics, closeDone: make(chan struct{})}
+	h := &Host{manifest: config.Manifest, callBudget: config.CallBudget, diagnostics: config.Diagnostics}
 	if h.callBudget == 0 {
 		h.callBudget = 30 * time.Second
 	}
@@ -118,34 +124,63 @@ func (h *Host) Stats() (engine.Stats, error) { return h.store.Stats() }
 
 // Close stops every exposure, then the owner. Caller cancellation bounds
 // waiting, not ownership: the owner keeps its DB lease until admitted calls
-// quiesce, including after a shutdown timeout.
+// quiesce, including after a shutdown timeout. Concurrent calls join one
+// close attempt; after a physical Store-close failure, a later explicit call
+// retries the same retained owner and preserves the earlier caller's error.
 func (h *Host) Close(ctx context.Context) error {
 	if h == nil {
 		return nil
 	}
-	h.closeOnce.Do(func() {
+	h.mu.Lock()
+	attempt := h.close
+	first := attempt == nil
+	if attempt != nil {
+		select {
+		case <-attempt.done:
+			if attempt.storeErr == nil {
+				err := attempt.err
+				h.mu.Unlock()
+				return err
+			}
+			attempt = nil // an explicit later call retries the same Store owner
+		default:
+		}
+	}
+	if attempt == nil {
 		h.closed.Store(true)
-		go h.closeResources()
-	})
+		attempt = &closeAttempt{done: make(chan struct{})}
+		h.close = attempt
+		go h.closeResources(attempt, first)
+	}
+	h.mu.Unlock()
 	select {
-	case <-h.closeDone:
-		return h.closeErr
+	case <-attempt.done:
+		return attempt.err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (h *Host) closeResources() {
-	defer close(h.closeDone)
-	h.mu.Lock()
-	servers := append([]*Server(nil), h.servers...)
-	h.mu.Unlock()
-	for _, s := range servers {
-		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		h.closeErr = errors.Join(h.closeErr, s.Close(shutdown))
-		cancel()
+func (h *Host) closeResources(attempt *closeAttempt, first bool) {
+	if first {
+		// Serve registrations begin under mu before shutdown starts. Join them
+		// before taking the exposure snapshot so no late server escapes Close.
+		h.serving.Wait()
+		h.mu.Lock()
+		servers := append([]*Server(nil), h.servers...)
+		h.mu.Unlock()
+		for _, s := range servers {
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			h.serverErr = errors.Join(h.serverErr, s.Close(shutdown))
+			cancel()
+		}
 	}
-	h.closeErr = errors.Join(h.closeErr, h.store.Close())
+	storeErr := h.store.Close()
+	h.mu.Lock()
+	attempt.storeErr = storeErr
+	attempt.err = errors.Join(h.serverErr, storeErr)
+	close(attempt.done)
+	h.mu.Unlock()
 }
 
 // maintenanceFailed reports a failed background checkpoint or receipt expiry.

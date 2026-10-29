@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -31,18 +32,82 @@ func (s *Store) Snapshot(ctx context.Context, r api.SnapshotRequest) (out api.Sn
 		defer unlock()
 		defer func() { view.pin(out, err) }()
 	}
-	err = s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	var response api.SnapshotResponse
+	err = s.readWithInput(ctx, func(ctx context.Context, tx *sql.Tx, input *WriteInput) error {
+		if err := input.Own(ctx, func() { r = ownedSnapshotRequest(r) }); err != nil {
+			return err
+		}
 		var e error
-		out, e = s.snapshot(ctx, tx, n, r)
+		response, e = s.snapshot(ctx, tx, n, r, input)
 		return e
 	})
-	if err != nil {
-		out = api.SnapshotResponse{}
+	if err == nil {
+		out = response
 	}
 	return out, err
 }
 
-func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api.SnapshotRequest) (out api.SnapshotResponse, err error) {
+// The outer plan must survive caller return; each nested key/equality slice is
+// owned only when its validated query reaches the point that consumes it.
+func ownedSnapshotRequest(r api.SnapshotRequest) api.SnapshotRequest {
+	if r.At != nil {
+		at := *r.At
+		r.At = &at
+	}
+	r.Queries = append([]api.Query(nil), r.Queries...)
+	return r
+}
+
+// An accepted JSON string can use at most six source bytes per output byte
+// (for example, \u0061 for a). Numbers already have a tighter 128-byte
+// index bound. Strip only JSON whitespace before applying this bound, so
+// escaped scalars and arbitrarily padded valid values remain accepted.
+const maxIndexScalarSourceBytes = 6*maxIndexTupleBytes + 2
+
+type ownedEquality struct {
+	value any
+	kind  byte // oversized valid string, number, array or object
+}
+
+func ownSnapshotEquality(ctx context.Context, equal []json.RawMessage) ([]ownedEquality, error) {
+	owned := make([]ownedEquality, len(equal))
+	for i, raw := range equal {
+		start, end := 0, len(raw)
+		for start < end && jsonSpace(raw[start]) {
+			start++
+			if start&4095 == 0 && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		for start < end && jsonSpace(raw[end-1]) {
+			end--
+			if (len(raw)-end)&4095 == 0 && ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		}
+		if end-start > maxIndexScalarSourceBytes {
+			if err := validateLargeEqualityJSON(ctx, raw[start:end]); err != nil {
+				return nil, err
+			}
+			owned[i].kind = raw[start]
+		} else {
+			// Decode while the input owner still protects the borrowed bytes.
+			// An earlier syntax error must stop work before later large values.
+			d := json.NewDecoder(bytes.NewReader(raw[start:end]))
+			d.UseNumber()
+			if err := d.Decode(&owned[i].value); err != nil {
+				return nil, fail("invalid_argument", "invalid equality scalar")
+			}
+			var tail any
+			if err := d.Decode(&tail); err != io.EOF {
+				return nil, fail("invalid_argument", "one equality scalar required")
+			}
+		}
+	}
+	return owned, nil
+}
+
+func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api.SnapshotRequest, input *WriteInput) (out api.SnapshotResponse, err error) {
 	id := ScopeID(r.Scope)
 	var rev int64
 	err = tx.QueryRowContext(ctx, "SELECT revision FROM scopes WHERE scope=?", id).Scan(&rev)
@@ -73,7 +138,7 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 		return nil
 	}
 	for _, q := range r.Queries {
-		result, e := s.queryRecords(ctx, tx, id, n, q, appendRecord)
+		result, e := s.queryRecords(ctx, tx, id, n, q, input, appendRecord)
 		if e != nil {
 			return out, e
 		}
@@ -84,14 +149,14 @@ func (s *Store) snapshot(ctx context.Context, tx *sql.Tx, n api.Namespace, r api
 
 // queryRecords materializes one bounded data query in a caller-owned
 // transaction. appendRecord charges every record to the snapshot's budget.
-func (s *Store) queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q api.Query, appendRecord func(*api.QueryResult, api.Record) error) (result api.QueryResult, err error) {
+func (s *Store) queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.Namespace, q api.Query, input *WriteInput, appendRecord func(*api.QueryResult, api.Record) error) (result api.QueryResult, err error) {
 	result = api.QueryResult{Collection: q.Collection, Records: []api.Record{}}
 	c, e := collection(n, q.Collection)
 	if e != nil {
 		return result, e
 	}
 	if q.HeaderIndex != "" {
-		return s.queryRecordHeaders(ctx, tx, id, c, q, appendRecord)
+		return s.queryRecordHeaders(ctx, tx, id, c, q, input, appendRecord)
 	}
 	if q.After != "" && !key(q.After) {
 		return result, fail("invalid_argument", "invalid page key")
@@ -99,6 +164,9 @@ func (s *Store) queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.N
 	if len(q.Keys) > 0 {
 		if len(q.Keys) > api.MaxRows || q.Index != "" || len(q.Equal) > 0 || q.After != "" || q.Limit != 0 {
 			return result, fail("invalid_argument", "exact-key query cannot contain page/index fields")
+		}
+		if err := input.Own(ctx, func() { q.Keys = append([]string(nil), q.Keys...) }); err != nil {
+			return result, err
 		}
 		for _, k := range q.Keys {
 			if !key(k) {
@@ -146,18 +214,31 @@ func (s *Store) queryRecords(ctx context.Context, tx *sql.Tx, id string, n api.N
 			if idx == nil || len(q.Equal) != len(idx.Fields) || q.IncludeDeleted {
 				return result, fail("invalid_argument", "registered scalar equality index required")
 			}
+			var equal []ownedEquality
+			var ownErr error
+			if err := input.Own(ctx, func() { equal, ownErr = ownSnapshotEquality(ctx, q.Equal) }); err != nil {
+				return result, err
+			}
+			if ownErr != nil {
+				return result, ownErr
+			}
 			data := map[string]any{}
-			for i, v := range q.Equal {
-				d := json.NewDecoder(strings.NewReader(string(v)))
-				d.UseNumber()
+			for i, v := range equal {
 				var decoded any
-				if e = d.Decode(&decoded); e != nil {
-					return result, fail("invalid_argument", "invalid equality scalar")
+				// A large value's exact bytes cannot fit a stored tuple. These
+				// stand-ins preserve indexTuple's type/error ordering, and a
+				// later occurrence of the same field may still overwrite them.
+				switch v.kind {
+				case 0:
+					decoded = v.value
+				case '"':
+					decoded = strings.Repeat("x", maxIndexTupleBytes+1)
+				case '[', '{':
+					decoded = []any{}
+				default:
+					decoded = json.Number(strings.Repeat("1", maxIndexNumberBytes+1))
 				}
-				var tail any
-				if e = d.Decode(&tail); e != io.EOF {
-					return result, fail("invalid_argument", "one equality scalar required")
-				}
+				// Preserve the existing last-value semantics for repeated fields.
 				data[idx.Fields[i]] = decoded
 			}
 			value, _, e := indexTuple(data, *idx)

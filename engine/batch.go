@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
@@ -17,12 +19,12 @@ var errReplayed = &api.Error{Code: "replayed", Message: "request already committ
 // Batch applies one atomic compare-and-set group of document mutations. A
 // request with a RequestID is idempotent: its receipt is stored and a replay
 // of the same intent returns it. A request without one leaves no receipt.
-func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt, err error) {
+func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (response api.Receipt, err error) {
 	defer func() { err = classify(err) }()
+	var out api.Receipt // owned by the callback until the physical attempt joins
 	if viewOf(ctx) != nil {
 		return out, fail("failed_precondition", "mutation cannot use a read snapshot")
 	}
-	r.Mutations = append([]api.Mutation(nil), r.Mutations...)
 	n, err := s.scope(r.Scope)
 	if err != nil {
 		return out, err
@@ -32,24 +34,33 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.config.CallBudget)
 	defer cancel()
-	prepared, err := prepareMutations(ctx, n, r.Mutations, api.MaxOperations, api.MaxRequestBytes)
-	if err != nil {
-		return out, err
-	}
-	r.Mutations = prepared.mutations
 	id := ScopeID(r.Scope)
 	var digest string
-	if r.RequestID != "" {
+	var prepared preparedMutations
+	prepare := func(ctx context.Context) error {
+		var e error
+		prepared, e = prepareMutations(ctx, n, r.Mutations, api.MaxOperations, api.MaxRequestBytes)
+		if e != nil {
+			return e
+		}
+		r.Mutations = prepared.mutations
+		if r.RequestID == "" {
+			return nil
+		}
 		raw, e := json.Marshal(r)
 		if e != nil {
-			return out, e
+			return e
 		}
 		if len(raw) > api.MaxRequestBytes {
-			return out, fail("resource_exhausted", "batch byte limit exceeded")
+			return fail("resource_exhausted", "batch byte limit exceeded")
 		}
-		digest = hash(r)
+		sum := sha256.Sum256(raw)
+		digest = hex.EncodeToString(sum[:])
+		return nil
+	}
+	if r.RequestID != "" {
 		// Replays read durable facts before applying new-write disk admission.
-		replay, found, e := s.storedReceipt(ctx, id, r.RequestID, digest)
+		replay, found, e := s.storedReceipt(ctx, id, r.RequestID, &digest, prepare)
 		if e != nil {
 			return out, e
 		}
@@ -62,7 +73,14 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 		class = Relaxed
 	}
 	var expires int64
-	err = s.Write(ctx, class, func(ctx context.Context, tx *sql.Tx) error {
+	apply := func(ctx context.Context, tx *sql.Tx, input *WriteInput) error {
+		var prepErr error
+		if e := input.Own(ctx, func() { prepErr = prepare(ctx) }); e != nil {
+			return e
+		}
+		if prepErr != nil {
+			return prepErr
+		}
 		var rev, receipts int64
 		err := tx.QueryRowContext(ctx, "SELECT revision,receipts FROM scopes WHERE scope=?", id).Scan(&rev, &receipts)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -130,35 +148,41 @@ func (s *Store) Batch(ctx context.Context, r api.BatchRequest) (out api.Receipt,
 		}
 		_, err = tx.ExecContext(ctx, "UPDATE scopes SET revision=?,receipts=receipts+? WHERE scope=?", next, added, id)
 		return err
-	})
-	if errors.Is(err, errReplayed) {
+	}
+	input := &WriteInput{}
+	err = s.writeWithFaultProbe(ctx, class, true, func(ctx context.Context, tx *sql.Tx) error { return apply(ctx, tx, input) }, nil, input, &expires)
+	if errors.Is(err, errReplayed) && DefinitelyNotCommitted(err) {
 		return out, nil
 	}
 	if err != nil {
 		return api.Receipt{}, err
 	}
-	if expires != 0 && s.maintenance != nil {
-		s.maintenance.armExpiry(expires)
-	}
 	return out, nil
 }
 
 // storedReceipt returns an earlier outcome of the same request intent.
-func (s *Store) storedReceipt(ctx context.Context, scope, requestID, digest string) (out api.Receipt, found bool, err error) {
+func (s *Store) storedReceipt(ctx context.Context, scope, requestID string, digest *string, prepare func(context.Context) error) (api.Receipt, bool, error) {
+	var out api.Receipt
+	var found bool
 	var previous string
 	var body []byte
-	err = s.Read(ctx, func(ctx context.Context, tx *sql.Tx) error {
+	err := s.readWithInput(ctx, func(ctx context.Context, tx *sql.Tx, input *WriteInput) error {
 		err := tx.QueryRowContext(ctx, "SELECT digest,body FROM receipts WHERE scope=? AND request_id=?", scope, requestID).Scan(&previous, &body)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		found = err == nil
+		if found {
+			if e := input.Own(ctx, func() { err = prepare(ctx) }); e != nil {
+				return e
+			}
+		}
 		return err
 	})
 	if err != nil || !found {
 		return out, false, err
 	}
-	if previous != digest {
+	if previous != *digest {
 		return out, false, fail("conflict", "request identity reused with different plan")
 	}
 	return out, true, json.Unmarshal(body, &out)

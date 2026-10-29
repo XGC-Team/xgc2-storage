@@ -52,7 +52,7 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 		t.Fatal("rejected resolution changed quota")
 	}
 	first, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
-	if err != nil || first != (model.RemoteRunResolveResult{RootRunID: "root", Changed: true, Retention: model.RunRetentionEffect{EligibilityReleased: true}}) {
+	if err != nil || first != (model.RemoteRunResolveResult{RootRunID: "root", Changed: true, LastForOwner: true, Retention: model.RunRetentionEffect{EligibilityReleased: true}}) {
 		t.Fatalf("nonfinal owner: %+v %v", first, err)
 	}
 	rowsAfterFirst, bytesAfterFirst := usageRows(t, f)

@@ -13,7 +13,8 @@ type RemoteRunLink struct {
 }
 
 // RemoteRunResolveResult reports the committed transition of one exact
-// remote-control relation. LastForRoot is true only when this call removed
+// remote-control relation. LastForOwner is true only when this call removed
+// the final relation owned by OwnerRunID. LastForRoot independently reports
 // the final indexed relation for RootRunID. The root and owner finish facts
 // are meaningful only then; RootFound distinguishes a missing root from a
 // present but still-open root. A zero finish time means that Run is open.
@@ -22,6 +23,7 @@ type RemoteRunLink struct {
 type RemoteRunResolveResult struct {
 	RootRunID       string             `json:"rootRunId"`
 	Changed         bool               `json:"changed"`
+	LastForOwner    bool               `json:"lastForOwner"`
 	LastForRoot     bool               `json:"lastForRoot"`
 	RootFound       bool               `json:"rootFound"`
 	RootFinishedAt  time.Time          `json:"rootFinishedAt,omitzero"`

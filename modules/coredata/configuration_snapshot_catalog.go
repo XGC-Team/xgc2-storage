@@ -19,7 +19,7 @@ import (
 func (s *Store) ReadResourceCatalog(ctx context.Context, q model.ConfigurationCatalogRead) ([]model.ConfigurationResourceSnapshot, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) ([]model.ConfigurationResourceSnapshot, error) {
 		return configurationResourceCatalog(ctx, tx, scope, q)
-	})
+	}, func() { q = ownedCatalogRead(q) })
 }
 
 func configurationDecodeResourceRow(row model.ConfigurationResource, archived bool, body []byte) (out model.ConfigurationResource, err error) {

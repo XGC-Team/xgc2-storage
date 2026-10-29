@@ -30,7 +30,7 @@ ORDER BY q.ordinal`)
 	return query.String()
 }
 
-func (s *Store) queryRecordHeaders(ctx context.Context, tx *sql.Tx, scope string, collection api.Collection, query api.Query, appendRecord func(*api.QueryResult, api.Record) error) (api.QueryResult, error) {
+func (s *Store) queryRecordHeaders(ctx context.Context, tx *sql.Tx, scope string, collection api.Collection, query api.Query, input *WriteInput, appendRecord func(*api.QueryResult, api.Record) error) (api.QueryResult, error) {
 	result := api.QueryResult{Collection: collection.ID, Records: []api.Record{}}
 	if len(query.Keys) == 0 || len(query.Keys) > api.MaxRows || query.Index != "" || len(query.Equal) != 0 || query.After != "" || query.Limit != 0 {
 		return result, fail("invalid_argument", "record header projection requires bounded exact keys only")
@@ -44,6 +44,9 @@ func (s *Store) queryRecordHeaders(ctx context.Context, tx *sql.Tx, scope string
 	}
 	if index == nil {
 		return result, fail("invalid_argument", "record header projection requires a declared index")
+	}
+	if err := input.Own(ctx, func() { query.Keys = append([]string(nil), query.Keys...) }); err != nil {
+		return result, err
 	}
 	args := make([]any, 0, len(query.Keys)+3)
 	for _, recordKey := range query.Keys {
@@ -108,7 +111,7 @@ func (s *Store) queryRecordHeaders(ctx context.Context, tx *sql.Tx, scope string
 }
 
 func validStoredTuple(value string, fields int) bool {
-	if len(value) > 4096 {
+	if len(value) > maxIndexTupleBytes {
 		return false
 	}
 	var tuple []json.RawMessage

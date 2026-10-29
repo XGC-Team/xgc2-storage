@@ -16,7 +16,7 @@ const maxAgentSourcePage = 256
 func (s *Store) ReadAgentSources(ctx context.Context, q model.ConfigurationAgentSourceRead) (model.ConfigurationAgentSourcePage, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationAgentSourcePage, error) {
 		return configurationAgentSources(ctx, tx, scope, q)
-	})
+	}, func() { q.After = ownedPointer(q.After) })
 }
 
 const agentSourceJoin = ` JOIN core_snapshots s ON s.scope=a.scope AND s.domain=a.domain AND s.id=a.commit_id
@@ -150,7 +150,7 @@ func configurationAgentSources(ctx context.Context, tx *sql.Tx, scope string, q 
 func (s *Store) ReadRobotIncoming(ctx context.Context, q model.ConfigurationRobotIncomingRead) (model.ConfigurationRobotIncomingPage, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationRobotIncomingPage, error) {
 		return configurationRobotIncoming(ctx, tx, scope, q)
-	})
+	}, func() { q.After = ownedPointer(q.After) })
 }
 
 const robotIncomingQuery = `SELECT a.target_commit_id,a.commit_id,a.slot,` + configurationResourceHeaderColumns + `

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
@@ -19,7 +20,20 @@ func DeclareConfigurationDomains(ctx context.Context, db *engine.Store, domains 
 	if len(domains) == 0 || len(domains) > 256 {
 		return failure("invalid_argument", "bounded explicit domain declarations required")
 	}
-	return db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+	if err := canceledWrite(ctx); err != nil {
+		return err
+	}
+	return db.WriteWithInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) error {
+		if err := input.Own(ctx, func() {
+			domains = slices.Clone(domains)
+			for i := range domains {
+				if len(domains[i].Capabilities) <= 64 {
+					domains[i].Capabilities = slices.Clone(domains[i].Capabilities)
+				}
+			}
+		}); err != nil {
+			return err
+		}
 		return declareDomains(ctx, tx, domains)
 	})
 }

@@ -14,7 +14,7 @@ import (
 func (s *Store) ReadBranchCatalog(ctx context.Context, q model.ConfigurationCatalogRead) (model.ConfigurationBranchCatalog, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.ConfigurationBranchCatalog, error) {
 		return configurationBranchCatalog(ctx, tx, scope, q)
-	})
+	}, func() { q = ownedCatalogRead(q) })
 }
 
 const branchCatalogSQL = `SELECT b.id,b.resource_id,b.name_key,b.head_commit_id,b.revision,CASE WHEN length(b.body)<=262144 THEN b.body ELSE X'' END,

@@ -12,8 +12,9 @@ STORAGE_BENCH_DIR=/path/on/the/target/disk \
 ```
 
 `STORAGE_BENCH_DIR` selects the filesystem (default: the temporary directory). Every benchmark
-creates its own database below it and removes it. A durable commit costs one `fsync` of that
-filesystem, so the numbers only mean something for the disk they ran on: repeat them on the
+creates its own database below it and removes it. Durable commits that change pages can require
+a filesystem sync; SQLite and its VFS decide the actual calls, and an empty commit may issue none.
+The numbers only mean something for the disk they ran on: repeat them on the
 machine that will hold Core's database before choosing a class for a new write. `-benchtime
 1000x` keeps runs comparable; the benchmarks that read first seed a history of 5,000 Runs, and
 the batched one seeds 50,000, with durable commits. A full pass takes about six minutes on
@@ -29,9 +30,10 @@ What is timed:
   transaction and fifty), `FinishRun` (Durable), `GetRun` and `ListRuns` (a page of 50 of 5,000
   Runs of one target, with and without payloads). A Run carries about 2.3 KB of frozen inputs.
 
-`syncs/op` is the number of durability barriers the owner asked for per operation (`Stats().Fsyncs`):
-one per durable commit, none per relaxed commit, plus two per checkpoint that moved frames. A
-durable commit therefore shows 1.0 to 1.05.
+`durability-estimates/op` is the logical count reported by `Stats().DurabilityEstimates`: one per acknowledged
+durable commit, including an empty one, none per relaxed commit, plus two per moving checkpoint.
+It is not a count of actual `fsync` or `fdatasync` calls. The historical table below used the
+label `syncs/op` for this same logical count.
 
 ## Conditions of the numbers below
 
@@ -41,7 +43,7 @@ of memory, Linux 6.12, Go 1.26.5, SQLite 3.51.3 through `modernc.org/sqlite` 1.4
 was shared with other build and test jobs, with a load average between 7 and 14 while the three
 passes ran, so the 99th percentiles are pessimistic and differences below about 20% are noise.
 
-Three filesystems, because the cost of a durable commit is the cost of an `fsync` there. The
+Three filesystems, because the cost of durable writes depends on their sync behavior. The
 median `fsync` of a 4 KiB append, measured right after the runs with a separate probe:
 
 | Name in the tables | Directory | Median `fsync` | What it stands for |
@@ -98,9 +100,9 @@ Each cell is the median of three runs with the range (min-max) in parentheses.
 | ListRuns, page of 50, without payloads | 736 (708-740) | 740 (736-1,840) | 718 (684-749) |
 | ListRuns, page of 50, with payloads | 937 (899-1,000) | 2,860 (2,650-4,890) | 1,240 (1,140-1,850) |
 
-### Durability barriers per operation (workspace disk)
+### Durability estimates per operation (workspace disk)
 
-| Operation | Barriers per operation |
+| Operation | Estimates per operation |
 | --- | ---: |
 | Durable commit | 1.000 |
 | Durable commit of 100 rows | 1.006 |
@@ -115,8 +117,8 @@ Each cell is the median of three runs with the range (min-max) in parentheses.
 
 ## Reading the numbers
 
-**The write class is the `fsync`.** On the workspace disk a Durable commit costs one durability
-barrier (about 0.5 ms here) and runs at 1,450 commits per second; a Relaxed commit costs none
+**The write class changes durability work.** In this write benchmark a Durable commit required
+filesystem durability work (about 0.5 ms here) and ran at 1,450 commits per second; a Relaxed commit cost none
 and runs at 44,600, thirty-one times as many. On tmpfs, where the barrier is free, the two
 classes cost the same and Relaxed shows no advantage. Choose a class by what a power failure may take, never by speed
 on a development machine; measure on the disk that will hold the database.
@@ -147,8 +149,8 @@ saves. A listing by target, root, session, workflow, creation time or open statu
 an index in page order, so these figures do not grow with the length of the history
 (`TestRecordQueriesUseTheirIndexes`); the benchmark itself uses 5,000 Runs.
 
-**Barriers per operation.** A durable commit asks for exactly one barrier. `CreateRun` shows
-1.046 because a checkpoint, which costs two barriers when it moves frames, runs about every 45
+**Estimates per operation.** The counter adds one for each acknowledged durable COMMIT. `CreateRun` shows
+1.046 because a checkpoint that moves frames adds two estimates about every 45
 commits while Runs of this size stream in; relaxed commits show a few thousandths for the same
 reason. The checkpoint is also what makes relaxed commits durable: at most about a second after
 the first commit that follows the previous checkpoint.
@@ -156,7 +158,8 @@ the first commit that follows the previous checkpoint.
 ## What is not measured
 
 - Power loss. The machine cannot be cut off, so the durable class rests on SQLite's
-  `synchronous=FULL` contract and on the barrier count above. `tests/faults` kills a child process
+  `synchronous=FULL` contract. The estimate counter above does not measure physical syncs.
+  `tests/faults` kills a child process
   in the middle of a stream of commits; both classes survive that.
 - Histories much larger than 5,000 Runs, and databases larger than a few hundred megabytes.
 - More than one process: the database has one owner.

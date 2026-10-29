@@ -61,8 +61,8 @@ func TestACommitSchedulesOneCheckpointAfterTheDelay(t *testing.T) {
 	if after.Checkpoints-before.Checkpoints != 1 {
 		t.Fatalf("a burst should cost one checkpoint, got %d", after.Checkpoints-before.Checkpoints)
 	}
-	if after.Fsyncs <= before.Fsyncs {
-		t.Fatal("the checkpoint did not account its sync barriers")
+	if after.DurabilityEstimates <= before.DurabilityEstimates {
+		t.Fatal("the checkpoint did not account its durability estimates")
 	}
 }
 

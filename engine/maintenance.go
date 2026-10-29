@@ -35,6 +35,8 @@ type maintenance struct {
 	stopping          bool
 	expiryTimer       *time.Timer
 	expiryAt          int64 // Unix second the expiry timer is armed for; 0 when none
+	faultCheckpoint   bool
+	faultExpiry       int64
 }
 
 func (s *Store) startMaintenance(ctx context.Context) {
@@ -163,6 +165,13 @@ func (m *maintenance) checkpoint(ctx context.Context) error {
 func (m *maintenance) armExpiry(at int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.armExpiryLocked(at)
+}
+
+func (m *maintenance) armExpiryLocked(at int64) {
+	if m.stopping {
+		return
+	}
 	if m.expiryAt != 0 && at >= m.expiryAt {
 		return
 	}
@@ -172,6 +181,48 @@ func (m *maintenance) armExpiry(at int64) {
 	m.expiryAt = at
 	// A receipt is expired once its time is strictly in the past.
 	m.expiryTimer = time.AfterFunc(max(time.Until(time.Unix(at+1, 0)), 0), func() { m.request(workExpire) })
+}
+
+// A possible COMMIT needs one existing checkpoint/expiry opportunity, not a
+// synthetic commit count. An unjoined writer retains the need while fenced;
+// an explicit close/reopen re-establishes checkpoint and receipt expiry.
+func (m *maintenance) possibleCommit(settled bool, expiry int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !settled {
+		m.faultCheckpoint = true
+		if expiry != 0 && (m.faultExpiry == 0 || expiry < m.faultExpiry) {
+			m.faultExpiry = expiry
+		}
+		return
+	}
+	if m.stopping {
+		return
+	}
+	m.afterCommitLocked()
+	if expiry != 0 {
+		m.armExpiryLocked(expiry)
+	}
+}
+
+// A deadline can fence an attempt between physical settlement and recording
+// its possible-COMMIT work. Once that exact attempt joins and the replacement
+// is usable, promote only the already-retained fault opportunities.
+func (m *maintenance) activatePendingAfterJoin() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping {
+		return
+	}
+	if m.faultCheckpoint {
+		m.faultCheckpoint = false
+		m.afterCommitLocked()
+	}
+	if m.faultExpiry != 0 {
+		at := m.faultExpiry
+		m.faultExpiry = 0
+		m.armExpiryLocked(at)
+	}
 }
 
 func (m *maintenance) expire(ctx context.Context) error {
@@ -210,6 +261,7 @@ func (s *Store) PruneExpiredReceipts(ctx context.Context, before time.Time, limi
 	if limit < 1 || limit > 1000 || before.After(time.Now()) {
 		return 0, fail("invalid_argument", "bounded past-expiry maintenance required")
 	}
+	var applied int64 // the callback may outlive a canceled caller
 	err = s.write(ctx, Relaxed, false, func(ctx context.Context, tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, "DELETE FROM receipts WHERE rowid IN (SELECT rowid FROM receipts WHERE expires<? ORDER BY expires LIMIT ?) RETURNING scope", before.Unix(), limit)
 		if err != nil {
@@ -223,7 +275,7 @@ func (s *Store) PruneExpiredReceipts(ctx context.Context, before time.Time, limi
 				return err
 			}
 			perScope[scope]++
-			deleted++
+			applied++
 		}
 		if err = errors.Join(rows.Err(), rows.Close()); err != nil {
 			return err
@@ -238,6 +290,6 @@ func (s *Store) PruneExpiredReceipts(ctx context.Context, before time.Time, limi
 	if err != nil {
 		return 0, err
 	}
-	s.receiptsPruned.Add(uint64(deleted))
-	return deleted, nil
+	s.receiptsPruned.Add(uint64(applied))
+	return applied, nil
 }

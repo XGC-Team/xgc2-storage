@@ -14,6 +14,29 @@ owner's call budget. No savepoint, receipt or JSON envelope is involved. Revisio
 and counts that can exceed 2^53 are canonical decimal **strings**; Run and Session revisions
 are int64.
 
+An error from an admitted write carries `engine.WriteError`: `WriteNotCommitted` or
+`WriteUnknown`, and whether that attempt's physical transaction had settled at return.
+`MayHaveCommitted` means the COMMIT was handed to the physical owner; its call may enter
+after the caller returns. `WaitSettlement(ctx)` joins that same physical attempt and its
+attached fault-only revalidation, if any; it does not change the original disposition or
+prove COMMIT. After a failed physical close, the original completion remains pending
+until an explicit `Close` successfully joins that same retained driver. A rollback failure
+or lost COMMIT reply is not a committed receipt. Until physical join and a usable replacement, the owner refuses
+later calls and retains its exclusive database lock. A later read is a current-state
+observation, not proof of the original COMMIT. A possible COMMIT also retains the
+existing checkpoint opportunity after settlement; a confirmed rollback creates none.
+`CallbackPending` means the callback may still own captured results and validation facts;
+the caller must wait for settlement before using those facts. Typed operations detach their
+mutable inputs within their admission when needed, so a canceled caller cannot change the
+retained attempt. Configuration receipt replays do not copy an unused proposed snapshot.
+
+A deadline or failed rollback during an in-process read can return `engine.ReadError`.
+Its `WaitSettlement(ctx)` joins that same read callback and transaction; it never reports a
+COMMIT outcome. Typed reads return no partial result on error and retain their request data
+until the callback has stopped using it. A raw `Read` callback's captured state stays owned
+until settlement. Close joins active readers, and a failed physical reader close retains
+the database owner until a later explicit Close joins that connection.
+
 ## AgentLink enrollment
 
 `ListAgentLinks` reads the static enrollment projection and its database, complete scope,
@@ -27,6 +50,10 @@ presence, peer boots and epochs are not stored here. The independent enrollment 
 2048 rows, 64 MiB including record keys, and 256 KiB per canonical record.
 
 ## Configuration
+
+A matching stored configuration mutation receipt is returned after the existing writer
+transaction rolls back without changes. That replay does not commit or schedule a checkpoint;
+a failed or unjoined rollback is not reported as a successful replay.
 
 Resources with branches, immutable commits and CAS heads, kept exactly as they were:
 namespaces (folders), resources, branches, commits with their frozen payload, manifest and
@@ -59,7 +86,7 @@ Statuses: `queued`, `running`, `stopping`, `succeeded`, `failed`, `stopped`, `ca
 | `CreateRun` | Durable | accepts a Run as `queued` or `running`; lineage is checked (a root is its own root at depth 0); with a key, a repeated call returns the stored Run and `created=false`. The key lookup does not compare inputs |
 | `UpdateRunStatus(updates...)` | Relaxed | moves open Runs to `running` or `stopping`; one transaction for the whole slice; repeating the same status is a no-op; a `running` or `stopping` update of an already terminal Run is a no-op and leaves the revision unchanged; an open reverse transition is `failed_precondition`; one bad entry rolls the batch back |
 | `FinishRun(ctx, finish, policy) (RunFinishResult, error)` | Durable | records a terminal status and outcome even at quota; returns the stored `Run` and same-cut `Retention` effect. The same outcome returns the stored Run and does not change the row, revision, quota or effect. Status, termination and normalized uncompressed error, result, nodes and cleanup errors must match; zero `At` matches, a nonzero `At` must equal `FinishedAt`. A replay still enters one Durable transaction. A different outcome is `failed_precondition` |
-| `ApplyRunOps(ctx, creates, updates, finishes, policy) (RunOpsResult, error)` | Durable when `creates` or `finishes` is non-empty; Relaxed for updates alone; no transaction when all are empty | one transaction ordered creates, updates, finishes. `Created` contains one `CreatedRun{Run, Created}` per create; a repeated idempotency key returns the stored Run with `Created=false` without comparing inputs. More than `MaxPageSize` combined operations is `invalid_argument`. Any error rolls the whole batch back. `Retention` describes the final committed cut; a changed batch finish does not fetch or decompress a discarded Run detail |
+| `ApplyRunOps(ctx, creates, updates, finishes, policy) (RunOpsResult, error)` | Durable when `creates` or `finishes` is non-empty; Relaxed for updates alone; no transaction when all are empty | one transaction ordered creates, updates, finishes. `Created` contains one `CreatedRun{Run, Created}` per create; a repeated idempotency key returns the stored Run with `Created=false` without comparing inputs. More than `MaxPageSize` combined operations is `invalid_argument`. A confirmed rollback leaves the whole batch unchanged; a physical COMMIT or rollback failure can leave the outcome unknown. `Retention` describes the final committed cut; a changed batch finish does not fetch or decompress a discarded Run detail |
 | `GetRun`, `FindRunByIdempotencyKey` | read | |
 | `ListRuns` | read | newest first by (created_at, id); filters: exact id, target, root, session, workflow, accepted Experiment/instance, statuses, time window; opaque cursor; fixed `complete`, `identity` and `observation` projections; observation selects write-derived bounded source/error metadata, exact cleanup cardinality and result presence without selecting or decompressing any full execution JSON. Pages obey the response-byte budget as well as the row limit; an oversized first row is refused explicitly. Exact-id observation uses the primary key for bounded source navigation |
 | `InterruptOpenRuns(ctx, at, policy) (RunInterruptResult, error)` | Durable | Core's boot step interrupts all open Runs in one transaction; returns `Count` and same-cut `Retention` |
@@ -71,6 +98,18 @@ finish a Run or release eligibility; zero fields disable their selector. The com
 `HasVictim` is evaluated only for an actual changed finish or eligibility release, against
 the same scoped eligible count and oldest row. Replays and no-change releases return a zero
 effect. A later prune rechecks all real protections in its own transaction.
+
+For an unknown `CreateRun`, `FinishRun`, or `ApplyRunOps` containing creates or finishes,
+`RunWriteFaultError.WaitRevalidation(ctx)` returns a `RunFaultFact` after the exact
+physical attempt joins. `Creates` preserves each evaluated `CreatedRun`, including a
+`Created=false` replay; after a possible COMMIT its `CurrentKnown/Present/Current`
+fields report an exact identity-only row at the retained owner cut. After a confirmed
+pre-COMMIT rollback, `NonCommitted` is true and the retained before-state distinguishes
+an already-existing row from a replay of an insertion in the same rolled-back batch,
+without a current-row read. For
+changed finishes, the original policy is evaluated under the same owner using only the
+affected identities. No-op and replayed finishes produce no policy event. These facts
+do not change the original unknown disposition.
 
 An eligible Run has a positive finish time and no pending owner/root relation, live successor
 Run, live root or queued successor Session. An absent root is not live. The indexed derived
@@ -146,6 +185,24 @@ Its independent `Retention` effect can report a real nonfinal owner release; `La
 remains the separate final-root fence fact. The existing relation stores the immutable owner's
 Session selector for indexed activation checks; its physical bytes are charged and released
 with that relation, while the encoded-link capacity accounting remains unchanged.
+
+An unknown `ResolveRemoteRun` error also carries `RemoteRunResolveError`.
+Its `ValidatedAttempt` and `AttemptedLink` mean that transaction matched the stored complete
+link identity and reached its DELETE attempt; they do not assert deletion, COMMIT, or a release edge.
+An absent duplicate, identity refusal or earlier failure has no validated attempt.
+`WaitRevalidation(ctx)` returns the `RemoteRunFaultFact` for that exact relation and
+captured policy after physical join, before another writer can alter them. `Released`
+requires both the transaction's changed validated DELETE and current absence at that
+cut; `LastForOwner` and `LastForRoot` remain separate. A no-op or confirmed rollback
+has no release or retention event. Neither the attempt nor a later absent row is a
+success receipt.
+
+An unknown `ReserveRemoteRun` may carry `RemoteRunReserveError`. Its `Requested` link
+is caller input, not validation. `WaitRevalidation(ctx)` returns whether the original
+transaction validated the link, its `insert`, `bind`, or `existing` action and candidate
+effect, and the exact prior and same-cut current relation including its actual boot ID.
+An already-bound replay and a new bind remain distinct even if their current rows match.
+Neither a candidate effect nor a same-cut row is a COMMIT receipt.
 
 Age/count/all-closed pruning excludes each unresolved owner and its local root in the same
 transaction. Other finished development history remains eligible. Close/reopen preserves

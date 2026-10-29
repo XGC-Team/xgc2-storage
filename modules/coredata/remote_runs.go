@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
@@ -41,28 +42,146 @@ func (s *Store) ReserveRemoteRun(ctx context.Context, link model.RemoteRunLink) 
 // identity. A Stop acceptance alone is not a reason to call it.
 func (s *Store) ResolveRemoteRun(ctx context.Context, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
 	if err := validateRemoteLink(link); err != nil {
-		return model.RemoteRunResolveResult{}, err
+		return model.RemoteRunResolveResult{}, engine.WriteRefused(err)
 	}
 	if err := validateRetentionPolicy(policy); err != nil {
-		return model.RemoteRunResolveResult{}, err
+		return model.RemoteRunResolveResult{}, engine.WriteRefused(err)
 	}
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.RemoteRunResolveResult, error) {
-		return resolveRemoteRunPolicy(ctx, tx, scope, link, policy)
-	})
+	state := &remoteFaultState{scope: s.scope, link: link, policy: policy}
+	var result model.RemoteRunResolveResult
+	err := s.db.WriteWithFaultProbe(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		var e error
+		result, e = resolveRemoteRunPolicy(ctx, tx, s.scope, link, policy, &state.attempted)
+		if e == nil {
+			state.candidate = result
+		}
+		return e
+	}, state.probe)
+	var disposition *engine.WriteError
+	if err != nil && errors.As(err, &disposition) && disposition.Disposition == engine.WriteUnknown {
+		failure := &RemoteRunResolveError{cause: err, state: state}
+		// A callback held inside a real SQL call can outlive this caller. Its
+		// attempted bit is owned until settlement and must not be read here.
+		if !disposition.CallbackPending {
+			failure.ValidatedAttempt = state.attempted
+			if state.attempted {
+				failure.AttemptedLink = link
+			}
+		}
+		return model.RemoteRunResolveResult{}, failure
+	}
+	return result, err
+}
+
+// RemoteRunResolveError reports transaction-local attempt evidence only. It
+// never says the relation was deleted or that COMMIT succeeded. Inspect the
+// wrapped engine.WriteError for outcome and physical settlement.
+type RemoteRunResolveError struct {
+	ValidatedAttempt bool
+	AttemptedLink    model.RemoteRunLink
+	cause            error
+	state            *remoteFaultState
+}
+
+func (e *RemoteRunResolveError) Error() string { return e.cause.Error() }
+func (e *RemoteRunResolveError) Unwrap() error { return e.cause }
+
+// RemoteRunFaultFact is an exact post-join current observation, not a COMMIT
+// receipt. Released is only true for a transaction-validated changed DELETE
+// whose exact relation is absent before any intervening writer.
+type RemoteRunFaultFact struct {
+	Link             model.RemoteRunLink
+	ValidatedAttempt bool
+	NonCommitted     bool
+	RelationPresent  bool
+	Released         bool
+	LastForOwner     bool
+	LastForRoot      bool
+	RootFound        bool
+	RootFinishedAt   time.Time
+	OwnerFinishedAt  time.Time
+	Retention        model.RunRetentionEffect
+}
+
+func (e *RemoteRunResolveError) WaitRevalidation(ctx context.Context) (RemoteRunFaultFact, error) {
+	var disposition *engine.WriteError
+	if !errors.As(e.cause, &disposition) {
+		return RemoteRunFaultFact{}, failure("unavailable", "original writer disposition unavailable")
+	}
+	if err := disposition.WaitSettlement(ctx); err != nil {
+		return RemoteRunFaultFact{}, err
+	}
+	return e.state.fact, nil
+}
+
+type remoteFaultState struct {
+	scope     string
+	link      model.RemoteRunLink
+	policy    model.RunRetentionPolicy
+	attempted bool
+	candidate model.RemoteRunResolveResult
+	fact      RemoteRunFaultFact
+}
+
+func (s *remoteFaultState) probe(ctx context.Context, tx *sql.Tx, possibleCommit bool) error {
+	out := RemoteRunFaultFact{Link: s.link, ValidatedAttempt: s.attempted}
+	if !possibleCommit {
+		out.NonCommitted = true
+		s.fact = out
+		return nil
+	}
+	if !s.candidate.Changed {
+		s.fact = out
+		return nil
+	}
+	var root, call, boot string
+	err := tx.QueryRowContext(ctx, `SELECT root_run_id,call_node_id,boot_id FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`,
+		s.scope, s.link.OwnerRunID, s.link.TargetID, s.link.RunID).Scan(&root, &call, &boot)
+	if err == nil {
+		if root != s.link.RootRunID || call != s.link.CallNodeID || boot != s.link.BootID {
+			return failure("data_loss", "validated remote identity changed before fault revalidation")
+		}
+		out.RelationPresent = true
+		s.fact = out
+		return nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	out.Released = true
+	out.LastForOwner, out.LastForRoot = s.candidate.LastForOwner, s.candidate.LastForRoot
+	out.RootFound = s.candidate.RootFound
+	out.RootFinishedAt, out.OwnerFinishedAt = s.candidate.RootFinishedAt, s.candidate.OwnerFinishedAt
+	if s.candidate.Retention.EligibilityReleased {
+		cut := retentionChanges{released: true}
+		out.Retention, err = retentionEffect(ctx, tx, s.scope, &cut, s.policy)
+		if err != nil {
+			return err
+		}
+	}
+	s.fact = out
+	return nil
 }
 
 func resolveRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink) (model.RemoteRunResolveResult, error) {
-	return resolveRemoteRunPolicy(ctx, tx, scope, link, model.RunRetentionPolicy{})
+	return resolveRemoteRunPolicy(ctx, tx, scope, link, model.RunRetentionPolicy{}, nil)
 }
 
-func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
+func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, policy model.RunRetentionPolicy, attempted *bool) (model.RemoteRunResolveResult, error) {
 	var detail remoteRunChangeDetail
 	changed, err := changeRemoteRun(ctx, tx, scope, link, true, &detail)
+	if attempted != nil {
+		*attempted = detail.validatedAttempt
+	}
 	if err != nil {
 		return model.RemoteRunResolveResult{}, err
 	}
 	result := model.RemoteRunResolveResult{RootRunID: link.RootRunID, Changed: changed}
-	if !changed || detail.remaining > 0 {
+	if !changed {
+		return result, nil
+	}
+	result.LastForOwner = detail.remaining == 0
+	if !result.LastForOwner {
 		// Other relations of this owner necessarily share its validated root.
 		return result, nil
 	}
@@ -109,28 +228,141 @@ const remoteRunLastResolutionQuery = `SELECT
 
 func (s *Store) reserveRemoteRun(ctx context.Context, link model.RemoteRunLink) error {
 	if err := validateRemoteLink(link); err != nil {
-		return err
+		return engine.WriteRefused(err)
 	}
-	_, err := write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (bool, error) {
-		var detail remoteRunChangeDetail
-		changed, e := changeRemoteRun(ctx, tx, scope, link, false, &detail)
-		if e != nil || !detail.inserted || !detail.firstOwnerRelation || link.OwnerRunID == link.RootRunID {
-			return changed, e
+	state := &remoteReserveFaultState{scope: s.scope, requested: link}
+	err := s.db.WriteWithFaultProbe(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		changed, e := changeRemoteRun(ctx, tx, s.scope, link, false, &state.detail)
+		state.applied = changed && e == nil
+		if e != nil || !state.detail.inserted || !state.detail.firstOwnerRelation || link.OwnerRunID == link.RootRunID {
+			return e
 		}
 		var cut retentionChanges
-		if e = cut.invalidateRemoteRoot(ctx, tx, scope, link.RootRunID); e != nil {
-			return false, e
+		if e = cut.invalidateRemoteRoot(ctx, tx, s.scope, link.RootRunID); e != nil {
+			return e
 		}
-		return changed, cut.finish(ctx, tx, scope)
-	})
+		return cut.finish(ctx, tx, s.scope)
+	}, state.probe)
+	var disposition *engine.WriteError
+	if err != nil && errors.As(err, &disposition) && disposition.Disposition == engine.WriteUnknown {
+		return &RemoteRunReserveError{Requested: link, cause: err, state: state}
+	}
 	return err
 }
 
+// RemoteRunReserveError retains the original requested identity and attempt;
+// Requested alone is not proof that the transaction validated a relation.
+type RemoteRunReserveError struct {
+	Requested model.RemoteRunLink
+	cause     error
+	state     *remoteReserveFaultState
+}
+
+func (e *RemoteRunReserveError) Error() string { return e.cause.Error() }
+func (e *RemoteRunReserveError) Unwrap() error { return e.cause }
+
+// RemoteRunReserveFact separates the transaction-local action from the exact
+// same-owner row after physical join. Action is "insert", "bind", or "existing"
+// only when Validated is true; Applied is an in-transaction candidate, not a
+// COMMIT receipt. Current is meaningful only when CurrentKnown and Present.
+type RemoteRunReserveFact struct {
+	Requested     model.RemoteRunLink
+	Validated     bool
+	Action        string
+	Applied       bool
+	BeforePresent bool
+	Before        model.RemoteRunLink
+	NonCommitted  bool
+	CurrentKnown  bool
+	Present       bool
+	Current       model.RemoteRunLink
+}
+
+func (e *RemoteRunReserveError) WaitRevalidation(ctx context.Context) (RemoteRunReserveFact, error) {
+	var disposition *engine.WriteError
+	if !errors.As(e.cause, &disposition) {
+		return RemoteRunReserveFact{}, failure("unavailable", "original writer disposition unavailable")
+	}
+	if err := disposition.WaitSettlement(ctx); err != nil {
+		return RemoteRunReserveFact{}, err
+	}
+	return e.state.fact, nil
+}
+
+type remoteReserveFaultState struct {
+	scope     string
+	requested model.RemoteRunLink
+	detail    remoteRunChangeDetail
+	applied   bool
+	fact      RemoteRunReserveFact
+}
+
+const remoteReserveRevalidateQuery = `SELECT root_run_id,call_node_id,boot_id,encoded_bytes FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`
+
+func (s *remoteReserveFaultState) candidate() RemoteRunReserveFact {
+	return RemoteRunReserveFact{Requested: s.requested, Validated: s.detail.reserveValidated, Action: s.detail.reserveAction,
+		Applied: s.applied, BeforePresent: s.detail.reserveBeforePresent, Before: s.detail.reserveBefore}
+}
+
+func (s *remoteReserveFaultState) noCommitFact() RemoteRunReserveFact {
+	out := s.candidate()
+	out.NonCommitted = true
+	if out.Validated {
+		out.CurrentKnown, out.Present, out.Current = true, out.BeforePresent, out.Before
+	}
+	return out
+}
+
+func (s *remoteReserveFaultState) probe(ctx context.Context, tx *sql.Tx, possibleCommit bool) error {
+	if !possibleCommit {
+		s.fact = s.noCommitFact()
+		return nil
+	}
+	out := s.candidate()
+	if !out.Validated {
+		s.fact = out
+		return nil
+	}
+	var root, call, boot string
+	var encoded int64
+	err := tx.QueryRowContext(ctx, remoteReserveRevalidateQuery,
+		s.scope, s.requested.OwnerRunID, s.requested.TargetID, s.requested.RunID).Scan(&root, &call, &boot, &encoded)
+	out.CurrentKnown = true
+	if errors.Is(err, sql.ErrNoRows) {
+		if out.BeforePresent {
+			return failure("data_loss", "validated reservation disappeared before revalidation")
+		}
+		s.fact = out
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	current := s.requested
+	current.RootRunID, current.CallNodeID, current.BootID = root, call, boot
+	bytes, err := remoteLinkBytes(current)
+	if err != nil || validateRemoteLink(current) != nil || bytes != encoded || root != s.requested.RootRunID || call != s.requested.CallNodeID {
+		return failure("data_loss", "validated reservation identity changed before revalidation")
+	}
+	if out.Action == "existing" && current != out.Before || out.Action == "insert" && current != s.requested ||
+		out.Action == "bind" && current != out.Before && current != s.requested {
+		return failure("data_loss", "validated reservation boot changed before revalidation")
+	}
+	out.Present, out.Current = true, current
+	s.fact = out
+	return nil
+}
+
 type remoteRunChangeDetail struct {
-	remaining          int
-	ownerFinishedAt    int64
-	inserted           bool
-	firstOwnerRelation bool
+	remaining            int
+	ownerFinishedAt      int64
+	inserted             bool
+	firstOwnerRelation   bool
+	validatedAttempt     bool
+	reserveValidated     bool
+	reserveAction        string
+	reserveBeforePresent bool
+	reserveBefore        model.RemoteRunLink
 }
 
 func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.RemoteRunLink, resolve bool, detail *remoteRunChangeDetail) (bool, error) {
@@ -171,6 +403,12 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 			(resolve && current.BootID != link.BootID) || (!resolve && current.BootID != "" && link.BootID != "" && current.BootID != link.BootID) {
 			return false, failure("failed_precondition", "remote control identity or boot conflicts")
 		}
+		if !resolve && detail != nil {
+			detail.reserveValidated = true
+			detail.reserveAction = "existing"
+			detail.reserveBeforePresent = true
+			detail.reserveBefore = current
+		}
 		if resolve {
 			logical := existingBytes + 1 // comma
 			if count == 1 {
@@ -179,6 +417,9 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 			if logical > total || count == 1 && logical != total {
 				return false, failure("data_loss", "remote ownership accounting disagrees")
 			}
+			if detail != nil {
+				detail.validatedAttempt = true
+			}
 			if _, err = tx.ExecContext(ctx, `DELETE FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND target_id=? AND child_run_id=?`, scope, link.OwnerRunID, link.TargetID, link.RunID); err != nil {
 				return false, err
 			}
@@ -186,7 +427,18 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 			if err = release(ctx, tx, scope, 1, charged); err != nil {
 				return false, err
 			}
-			_, err = tx.ExecContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes-? WHERE scope=? AND id=?`, count-1, total-logical, charged, scope, link.OwnerRunID)
+			// The count is an accounting summary, not authority to release an
+			// owner fence. Check zero/nonzero against the existing owner-keyed
+			// relation in this same write, and roll everything back on mismatch.
+			var pending bool
+			err = tx.QueryRowContext(ctx, `UPDATE runs SET pending_remote_count=?,pending_remote_bytes=?,bytes=bytes-? WHERE scope=? AND id=?
+				RETURNING EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=?)`, count-1, total-logical, charged, scope, link.OwnerRunID, scope, link.OwnerRunID).Scan(&pending)
+			if errors.Is(err, sql.ErrNoRows) {
+				return false, failure("data_loss", "remote owner disappeared during resolution")
+			}
+			if err == nil && pending != (count > 1) {
+				return false, failure("data_loss", "remote ownership count disagrees with relations")
+			}
 			if err == nil && detail != nil {
 				detail.remaining, detail.ownerFinishedAt = count-1, finishedAt
 			}
@@ -202,6 +454,9 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 		delta := nextBytes - existingBytes
 		if delta <= 0 || total+delta > model.MaxRemoteRunLinksBytes {
 			return false, failure("resource_exhausted", "remote control owner capacity reached")
+		}
+		if detail != nil {
+			detail.reserveAction = "bind"
 		}
 		if err = reserve(ctx, tx, scope, 0, delta); err != nil {
 			return false, err
@@ -228,6 +483,10 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 	}
 	if count == model.MaxRemoteRunLinks || total+logical > model.MaxRemoteRunLinksBytes {
 		return false, failure("resource_exhausted", "remote control owner capacity reached")
+	}
+	if detail != nil {
+		detail.reserveValidated = true
+		detail.reserveAction = "insert"
 	}
 	charged := logical + rowOverhead + sessionBytes
 	if err = reserve(ctx, tx, scope, 1, charged); err != nil {

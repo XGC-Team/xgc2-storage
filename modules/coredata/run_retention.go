@@ -35,6 +35,7 @@ type retentionChanges struct {
 	changedFinish, released bool
 	roots                   map[string]retentionRootChange
 	local                   map[string]struct{}
+	finishedIDs             *[]string
 }
 
 func (c *retentionChanges) created(id, predecessor string) {
@@ -51,6 +52,9 @@ func (c *retentionChanges) created(id, predecessor string) {
 }
 func (c *retentionChanges) finished(id, predecessor string, eligible int64) {
 	c.changedFinish = true
+	if c.finishedIDs != nil {
+		*c.finishedIDs = append(*c.finishedIDs, id)
+	}
 	c.delta += eligible
 	if eligible != 0 {
 		c.released = true

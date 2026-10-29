@@ -33,9 +33,14 @@ func configurationCloneReceipt(ctx context.Context, tx *sql.Tx, scope string, q 
 	out.Replayed = true
 	return
 }
-func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationNamespaceClone) (out model.ConfigurationNamespaceResult, err error) {
+func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationNamespaceClone, own ...func(*model.ConfigurationNamespaceClone) error) (out model.ConfigurationNamespaceResult, err error) {
 	if out, err = configurationCloneReceipt(ctx, tx, scope, model.ConfigurationNamespaceCloneReceipt{Domain: q.Domain, Mutation: q.Mutation}); err != nil || out.Replayed {
 		return
+	}
+	if len(own) != 0 {
+		if err = own[0](&q); err != nil {
+			return out, err
+		}
 	}
 	if !positiveRevision(q.ExpectedRevision) || len(q.Namespaces) > MaxCloneNamespaces || len(q.Resources) > MaxCloneResources {
 		return out, failure("invalid_argument", "invalid bounded subtree clone")
@@ -45,6 +50,9 @@ func configurationClone(ctx context.Context, tx *sql.Tx, scope string, q model.C
 		associationCount += len(resource.Snapshot.Associations)
 		if associationCount > model.MaxConfigurationCloneAssociations {
 			return out, failure("resource_exhausted", "subtree clone association count exceeded")
+		}
+		if !configurationSnapshotWithinRawBounds(resource.Snapshot) {
+			return out, failure("resource_exhausted", "configuration plan bound exceeded")
 		}
 	}
 	size, err := cloneBytes(q)

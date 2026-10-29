@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -753,13 +754,31 @@ func pruneRuns(ctx context.Context, tx *sql.Tx, scope string, r model.RunRetenti
 // CreateRun durably accepts a Run. With an idempotency key, a repeated call
 // returns the stored Run and created is false, so a replayed start finds its
 // Run instead of making another.
-func (s *Store) CreateRun(ctx context.Context, q model.NewRun) (run model.Run, created bool, err error) {
-	err = s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) (e error) {
-		run, created, e = createRun(ctx, tx, s.scope, q)
-		return e
-	})
-	if err != nil {
+func (s *Store) CreateRun(ctx context.Context, q model.NewRun) (model.Run, bool, error) {
+	if err := canceledWrite(ctx); err != nil {
 		return model.Run{}, false, err
+	}
+	var run model.Run
+	var created bool
+	state := &runFaultState{scope: s.scope, tracksWrites: true}
+	err := s.db.WriteWithFaultProbeInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) (e error) {
+		if e = input.Own(ctx, func() { q = ownedRun(q) }); e != nil {
+			return e
+		}
+		run, created, e = createRunRaw(ctx, tx, s.scope, q)
+		if e != nil {
+			return e
+		}
+		state.created = []model.CreatedRun{{Run: run, Created: created}}
+		if !created {
+			return nil
+		}
+		var cut retentionChanges
+		cut.created(run.ID, run.PredecessorRunID)
+		return cut.finish(ctx, tx, s.scope)
+	}, state.probe)
+	if err != nil {
+		return model.Run{}, false, runFaultError(err, state)
 	}
 	return run, created, nil
 }
@@ -770,7 +789,17 @@ func (s *Store) CreateRun(ctx context.Context, q model.NewRun) (run model.Run, c
 // a transition is a no-op. A running or stopping update of an already terminal
 // Run is a no-op and leaves revision unchanged. An open Run never moves backward.
 func (s *Store) UpdateRunStatus(ctx context.Context, updates ...model.RunStatusUpdate) error {
-	return s.db.Write(ctx, engine.Relaxed, func(ctx context.Context, tx *sql.Tx) error {
+	if err := canceledWrite(ctx); err != nil {
+		return err
+	}
+	return s.db.WriteWithInput(ctx, engine.Relaxed, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) error {
+		if err := input.Own(ctx, func() {
+			if len(updates) <= model.MaxPageSize {
+				updates = slices.Clone(updates)
+			}
+		}); err != nil {
+			return err
+		}
 		return updateRunStatuses(ctx, tx, s.scope, updates)
 	})
 }
@@ -780,20 +809,36 @@ func (s *Store) UpdateRunStatus(ctx context.Context, updates ...model.RunStatusU
 // different outcome is failed_precondition.
 func (s *Store) FinishRun(ctx context.Context, f model.RunFinish, policy model.RunRetentionPolicy) (model.RunFinishResult, error) {
 	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunFinishResult{}, engine.WriteRefused(err)
+	}
+	if err := canceledWrite(ctx); err != nil {
 		return model.RunFinishResult{}, err
 	}
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunFinishResult, error) {
-		var cut retentionChanges
-		run, err := finishRunTransition(ctx, tx, scope, f, true, &cut, "", map[string]struct{}{f.ID: {}})
+	state := &runFaultState{scope: s.scope, policy: policy, tracksWrites: true}
+	var result model.RunFinishResult
+	err := s.db.WriteWithFaultProbeInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) error {
+		if err := input.Own(ctx, func() { f = ownedFinish(f) }); err != nil {
+			return err
+		}
+		cut := retentionChanges{finishedIDs: &state.finished}
+		run, err := finishRunTransition(ctx, tx, s.scope, f, true, &cut, "", map[string]struct{}{f.ID: {}})
 		if err != nil {
-			return model.RunFinishResult{}, err
+			return err
 		}
-		if err = cut.finish(ctx, tx, scope); err != nil {
-			return model.RunFinishResult{}, err
+		if err = cut.finish(ctx, tx, s.scope); err != nil {
+			return err
 		}
-		effect, err := retentionEffect(ctx, tx, scope, &cut, policy)
-		return model.RunFinishResult{Run: run, Retention: effect}, err
-	})
+		effect, err := retentionEffect(ctx, tx, s.scope, &cut, policy)
+		if err == nil {
+			result = model.RunFinishResult{Run: run, Retention: effect}
+			state.attempt = effect
+		}
+		return err
+	}, state.probe)
+	if err != nil {
+		return model.RunFinishResult{}, runFaultError(err, state)
+	}
+	return result, nil
 }
 
 // Expand the planned set once for a batch and retain only actual open
@@ -850,37 +895,57 @@ func batchPlannedSuccessors(ctx context.Context, tx *sql.Tx, scope string, ids [
 // Relaxed when only updates are present. An empty batch is a no-op.
 func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates []model.RunStatusUpdate, finishes []model.RunFinish, policy model.RunRetentionPolicy) (model.RunOpsResult, error) {
 	if err := validateRetentionPolicy(policy); err != nil {
-		return model.RunOpsResult{}, err
+		return model.RunOpsResult{}, engine.WriteRefused(err)
 	}
 	if len(creates)+len(updates)+len(finishes) > model.MaxPageSize {
-		return model.RunOpsResult{}, failure("invalid_argument", "at most 1000 run operations per batch")
+		return model.RunOpsResult{}, engine.WriteRefused(failure("invalid_argument", "at most 1000 run operations per batch"))
 	}
 	if len(creates)+len(updates)+len(finishes) == 0 {
 		return model.RunOpsResult{}, nil
+	}
+	if err := canceledWrite(ctx); err != nil {
+		return model.RunOpsResult{}, err
 	}
 	mode := engine.Relaxed
 	if len(creates) > 0 || len(finishes) > 0 {
 		mode = engine.Durable
 	}
-	created := make([]model.CreatedRun, 0, len(creates))
-	plannedIDs := make([]string, 0, len(finishes))
-	plannedSet := make(map[string]struct{}, len(finishes))
-	for _, f := range finishes {
-		if _, exists := plannedSet[f.ID]; !exists {
-			plannedIDs = append(plannedIDs, f.ID)
-			plannedSet[f.ID] = struct{}{}
-		}
-	}
+	var created []model.CreatedRun
 	var effect model.RunRetentionEffect
-	err := s.db.Write(ctx, mode, func(ctx context.Context, tx *sql.Tx) error {
-		created = created[:0]
-		var cut retentionChanges
+	state := &runFaultState{scope: s.scope, policy: policy, tracksWrites: len(creates)+len(finishes) != 0}
+	var probe engine.FaultProbe
+	if state.tracksWrites {
+		probe = state.probe
+	}
+	err := s.db.WriteWithFaultProbeInput(ctx, mode, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) error {
+		if err := input.Own(ctx, func() {
+			creates, updates, finishes = slices.Clone(creates), slices.Clone(updates), slices.Clone(finishes)
+			for i := range creates {
+				creates[i] = ownedRun(creates[i])
+			}
+			for i := range finishes {
+				finishes[i] = ownedFinish(finishes[i])
+			}
+		}); err != nil {
+			return err
+		}
+		created = make([]model.CreatedRun, 0, len(creates))
+		plannedIDs := make([]string, 0, len(finishes))
+		plannedSet := make(map[string]struct{}, len(finishes))
+		for _, f := range finishes {
+			if _, exists := plannedSet[f.ID]; !exists {
+				plannedIDs = append(plannedIDs, f.ID)
+				plannedSet[f.ID] = struct{}{}
+			}
+		}
+		cut := retentionChanges{finishedIDs: &state.finished}
 		for _, q := range creates {
 			run, ok, err := createRunRaw(ctx, tx, s.scope, q)
 			if err != nil {
 				return err
 			}
 			created = append(created, model.CreatedRun{Run: run, Created: ok})
+			state.created = created
 			if ok {
 				cut.created(run.ID, run.PredecessorRunID)
 			}
@@ -904,10 +969,13 @@ func (s *Store) ApplyRunOps(ctx context.Context, creates []model.NewRun, updates
 		}
 		var e error
 		effect, e = retentionEffect(ctx, tx, s.scope, &cut, policy)
+		if e == nil {
+			state.attempt = effect
+		}
 		return e
-	})
+	}, probe)
 	if err != nil {
-		return model.RunOpsResult{}, err
+		return model.RunOpsResult{}, runFaultError(err, state)
 	}
 	if len(creates) == 0 {
 		created = nil
@@ -925,16 +993,21 @@ func (s *Store) GetRun(ctx context.Context, id string) (model.Run, error) {
 func (s *Store) ListRuns(ctx context.Context, f model.RunFilter) (model.RunPage, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.RunPage, error) {
 		return listRuns(ctx, tx, scope, f)
-	})
+	}, func() { f.Statuses = slices.Clone(f.Statuses) })
 }
 
 // FindRunByIdempotencyKey returns the Run that a start with this key created.
-func (s *Store) FindRunByIdempotencyKey(ctx context.Context, key string) (run model.Run, found bool, err error) {
-	err = s.db.Read(ctx, func(ctx context.Context, tx *sql.Tx) (e error) {
+func (s *Store) FindRunByIdempotencyKey(ctx context.Context, key string) (model.Run, bool, error) {
+	var run model.Run
+	var found bool
+	err := s.db.Read(ctx, func(ctx context.Context, tx *sql.Tx) (e error) {
 		run, found, e = findRunByKey(ctx, tx, s.scope, key)
 		return e
 	})
-	return run, found, err
+	if err != nil {
+		return model.Run{}, false, err
+	}
+	return run, found, nil
 }
 
 // InterruptOpenRuns ends every Run that a stopped Core left open. Core calls it

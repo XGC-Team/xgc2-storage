@@ -91,6 +91,27 @@ conflict. A reply lost after COMMIT is outcome_unknown: query `/v1/receipt` with
 identity. not_found does not prove a previous request cannot still commit; callers must fence
 the earlier call before deciding to retry.
 
+For an in-process write that reaches the writer, `engine.WriteError` distinguishes a
+definite non-commit from an unknown outcome and reports whether its physical transaction
+had settled at return. `WaitSettlement(ctx)` joins the same in-flight physical attempt,
+without changing the outcome or providing a receipt. If physical close cannot be joined,
+the owner remains unavailable and retains the database lock. A possible receipt-producing
+COMMIT retains an expiry opportunity after safe settlement, without asserting a known
+commit. This Go error detail is not a receipt or an XRPC commit-phase assertion.
+
+An in-process read can return `engine.ReadError` when its caller's deadline ends or its
+rollback fails. `WaitSettlement(ctx)` joins the same physical reader; it is not a mutation
+receipt. Snapshot and Receipt return no late or partial result. An admitted reader remains
+owned through its actual callback and transaction, including while Close is waiting. Snapshot
+owns each query's keys or equality scalars only when that validated query needs them; rejected
+or unreached queries do not copy their unused payloads. An indexed equality scalar that cannot
+fit the existing 4 KiB encoded tuple bound is checked without first cloning or decoding its
+oversized input; valid escaped values and surrounding JSON whitespace remain accepted.
+
+The diagnostic `Stats.DurabilityEstimates` is a logical estimate of durability operations, not
+an OS sync counter. It increases for each acknowledged durable COMMIT, including an empty
+replay transaction, and for moving checkpoints; actual SQLite/VFS sync calls can differ.
+
 The per-scope receipt count is a counter maintained with the revision, never a COUNT(*).
 Receipts have a manifest TTL and quota. Cleanup is scheduled for the next expiry time, in
 bounded batches; after expiry no exactly-once claim is made.
@@ -123,7 +144,7 @@ distinguish disk_full/io_error/corrupt/busy/cancel/deadline.
 
 Maintenance is event driven: a commit arms one checkpoint after the checkpoint delay, a WAL
 above its threshold is checkpointed at once, and a stored receipt arms its own expiry. Nothing
-runs while the database is idle. `Stats` reports commits by class, durability barriers,
+runs while the database is idle. `Stats` reports commits by class, logical durability estimates,
 queue wait, SQL time, checkpoints, receipts pruned and physical DB/WAL/SHM bytes.
 
 ## Schema versions

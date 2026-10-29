@@ -129,8 +129,16 @@ func listRecordings(ctx context.Context, tx *sql.Tx, scope string, f model.Recor
 
 // AddRecording durably adds a recording to the index. Registering the same
 // recording again returns it with created false.
-func (s *Store) AddRecording(ctx context.Context, q model.NewRecording) (recording model.Recording, created bool, err error) {
-	err = s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) (e error) {
+func (s *Store) AddRecording(ctx context.Context, q model.NewRecording) (model.Recording, bool, error) {
+	if err := canceledWrite(ctx); err != nil {
+		return model.Recording{}, false, err
+	}
+	var recording model.Recording
+	var created bool
+	err := s.db.WriteWithInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) (e error) {
+		if e = input.Own(ctx, func() { q.Metadata = cloneBounded(q.Metadata, model.MaxRecordingMetadata) }); e != nil {
+			return e
+		}
 		recording, created, e = addRecording(ctx, tx, s.scope, q)
 		return e
 	})

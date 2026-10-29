@@ -40,6 +40,9 @@ func (s *Store) ReadCatalogHeaderPage(ctx context.Context, q model.Configuration
 		}
 		out.Generation = generation
 		return out, err
+	}, func() {
+		q.Catalog = ownedCatalogRead(q.Catalog)
+		q.ExpectedGeneration = ownedPointer(q.ExpectedGeneration)
 	})
 }
 

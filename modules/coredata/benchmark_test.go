@@ -52,7 +52,7 @@ func benchRun(id string) model.NewRun {
 func report(b *testing.B, db *engine.Store, before engine.Stats, unit string) {
 	b.Helper()
 	after, _ := db.Stats()
-	b.ReportMetric(float64(after.Fsyncs-before.Fsyncs)/float64(b.N), "syncs/op")
+	b.ReportMetric(float64(after.DurabilityEstimates-before.DurabilityEstimates)/float64(b.N), "durability-estimates/op")
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), unit)
 }
 

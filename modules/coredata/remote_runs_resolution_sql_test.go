@@ -72,11 +72,11 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 			if err = tx.Commit(); err != nil {
 				t.Fatal(err)
 			}
-			wantQueries := 3
+			wantQueries := 4
 			if i == 0 {
-				wantQueries = 2
+				wantQueries = 3
 			}
-			if len(rec.statements) != wantQueries || !out.Changed || out.LastForRoot != (i == 2) {
+			if len(rec.statements) != wantQueries || !out.Changed || out.LastForOwner != (i > 0) || out.LastForRoot != (i == 2) {
 				t.Fatalf("release %d queries=%d result=%+v statements=%v", i, len(rec.statements), out, rec.statements)
 			}
 			for _, query := range rec.statements {
@@ -86,8 +86,11 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 					}
 				}
 			}
-			if i > 0 && rec.statements[2] != remoteRunLastResolutionQuery {
-				t.Fatalf("last-owner check changed: %s", rec.statements[2])
+			if !strings.Contains(rec.statements[2], "RETURNING EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=?)") {
+				t.Fatalf("owner check was not part of the existing Run update: %s", rec.statements[2])
+			}
+			if i > 0 && rec.statements[3] != remoteRunLastResolutionQuery {
+				t.Fatalf("last-root check changed: %s", rec.statements[3])
 			}
 			bytesByPopulation[trial][i] = rec.bytes
 		}
@@ -117,7 +120,7 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 	if bytesByPopulation[0] != bytesByPopulation[1] {
 		t.Fatalf("unrelated roots changed driver bytes: %v", bytesByPopulation)
 	}
-	t.Logf("same-owner nonfinal / other-owner nonfinal / final driver bytes (0/128 unrelated roots): %v; query counts 2/3/3", bytesByPopulation)
+	t.Logf("same-owner nonfinal / other-owner nonfinal / final driver bytes (0/128 unrelated roots): %v; query counts 3/4/4 including UPDATE RETURNING", bytesByPopulation)
 }
 
 func TestRemoteResolutionRollbackRestoresLinkAndQuota(t *testing.T) {

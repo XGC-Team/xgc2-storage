@@ -91,7 +91,7 @@ func (tx controlledTransaction) Rollback() error {
 	return tx.Tx.Rollback()
 }
 
-func TestCancellationAfterCommitStartsPreservesCommittedResult(t *testing.T) {
+func TestCancellationAfterCommitStartsRetainsPhysicalAttempt(t *testing.T) {
 	control := &transactionControl{began: make(chan context.Context, 1), commitEntered: make(chan struct{}), continueCommit: make(chan struct{})}
 	s := controlledWriter(t, control)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -109,9 +109,19 @@ func TestCancellationAfterCommitStartsPreservesCommittedResult(t *testing.T) {
 	}()
 	<-control.commitEntered
 	cancel()
+	err := <-done
+	var outcome *WriteError
+	if !errors.As(err, &outcome) || outcome.Disposition != WriteUnknown || outcome.Settled || !outcome.MayHaveCommitted || committedValue != "the committed fact" {
+		t.Fatalf("in-flight commit was not retained as unknown: value=%q err=%v", committedValue, err)
+	}
+	wait, stop := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	if err := outcome.WaitSettlement(wait); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("physical commit falsely joined: %v", err)
+	}
+	stop()
 	close(control.continueCommit)
-	if err := <-done; err != nil || committedValue != "the committed fact" {
-		t.Fatalf("successful commit lost its result on cancellation: value=%q err=%v", committedValue, err)
+	if err := outcome.WaitSettlement(t.Context()); err != nil {
+		t.Fatalf("physical commit did not join: %v", err)
 	}
 	var count int
 	if err := s.writer.QueryRowContext(t.Context(), "SELECT count(*) FROM work WHERE id='committed'").Scan(&count); err != nil || count != 1 {
@@ -155,7 +165,7 @@ func GateNextCommitForModuleTest(t *testing.T, s *Store) (<-chan struct{}, func(
 		t.Fatal(err)
 	}
 	control := &transactionControl{began: make(chan context.Context, 1), commitEntered: make(chan struct{}), continueCommit: make(chan struct{})}
-	db := sql.OpenDB(controlledConnector{control: control, dsn: s.writerDSN(s.owner)})
+	db := sql.OpenDB(writerConnector{owner: s, base: controlledConnector{control: control, dsn: s.writerDSN(s.owner)}})
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	conn, err := db.Conn(t.Context())
@@ -170,7 +180,7 @@ func GateNextCommitForModuleTest(t *testing.T, s *Store) (<-chan struct{}, func(
 	return control.commitEntered, allow
 }
 
-func TestCanceledWriterWaitsForRealRollbackBeforeReturning(t *testing.T) {
+func TestCanceledWriterRetainsRealRollbackAfterReturning(t *testing.T) {
 	control := &transactionControl{began: make(chan context.Context, 1), rollbackEntered: make(chan struct{}), continueRollback: make(chan struct{})}
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(control.continueRollback) }) }
@@ -200,15 +210,19 @@ func TestCanceledWriterWaitsForRealRollbackBeforeReturning(t *testing.T) {
 	}
 	close(returnCallback)
 	<-control.rollbackEntered
-	select {
-	case err := <-done:
-		release()
-		t.Fatalf("writer returned before driver rollback completed: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	release()
-	if err := <-done; !errors.Is(err, context.Canceled) {
+	err := <-done
+	var outcome *WriteError
+	if !errors.Is(err, context.Canceled) || !errors.As(err, &outcome) || outcome.Disposition != WriteUnknown || outcome.Settled || outcome.MayHaveCommitted {
 		t.Fatalf("cancel result=%v", err)
+	}
+	wait, stop := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	if err := outcome.WaitSettlement(wait); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("held rollback falsely joined: %v", err)
+	}
+	stop()
+	release()
+	if err := outcome.WaitSettlement(t.Context()); err != nil {
+		t.Fatalf("physical rollback did not join: %v", err)
 	}
 	if err := s.transact(t.Context(), Durable, func(ctx context.Context, tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, "INSERT INTO work VALUES('kept')")
@@ -248,6 +262,13 @@ func TestCancelBeforeAndDuringBeginNeverEntersBusinessCallback(t *testing.T) {
 	close(control.continueBegin)
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("during BEGIN=%v", err)
+	} else {
+		var outcome *WriteError
+		if errors.As(err, &outcome) && !outcome.Settled {
+			if err := outcome.WaitSettlement(t.Context()); err != nil {
+				t.Fatalf("BEGIN cleanup did not join: %v", err)
+			}
+		}
 	}
 	control.beforeBegin = nil
 	if err := s.transact(t.Context(), Relaxed, func(ctx context.Context, tx *sql.Tx) error {
@@ -296,6 +317,12 @@ func TestCanceledSQLAndPreCommitCancelKeepTheNextDurableWriterUsable(t *testing.
 		if code(err) != "cancelled" {
 			t.Fatalf("pre-commit cancel %d: %v", i, err)
 		}
+		var outcome *WriteError
+		if errors.As(err, &outcome) && !outcome.Settled {
+			if err := outcome.WaitSettlement(ctx); err != nil {
+				t.Fatalf("pre-commit physical join %d: %v", i, err)
+			}
+		}
 		if err := s.Write(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error {
 			_, err := tx.ExecContext(ctx, "INSERT INTO scopes VALUES(?,'test',0,0)", fmt.Sprintf("kept-%d", i))
 			return err
@@ -324,6 +351,12 @@ func TestCanceledSQLAndPreCommitCancelKeepTheNextDurableWriterUsable(t *testing.
 	})
 	if code(err) != "deadline_exceeded" {
 		t.Fatalf("running SQL ignored deadline: %v", err)
+	}
+	var outcome *WriteError
+	if errors.As(err, &outcome) && !outcome.Settled {
+		if err := outcome.WaitSettlement(ctx); err != nil {
+			t.Fatalf("running SQL physical join: %v", err)
+		}
 	}
 	if got := synchronous(t, s, Durable); got != 2 {
 		t.Fatalf("SQL deadline left next writer unusable: %d", got)

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"testing"
@@ -39,9 +40,24 @@ func TestWriterSwitchesSynchronousPerTransaction(t *testing.T) {
 	if stats.CommitsDurable != 3 || stats.CommitsRelaxed != 3 {
 		t.Fatalf("commits by class: durable=%d relaxed=%d", stats.CommitsDurable, stats.CommitsRelaxed)
 	}
-	// Opening already ran a durable create; every durable commit asks for one sync.
-	if stats.Fsyncs < 3 {
-		t.Fatalf("durable commits did not account their durability barrier: %d", stats.Fsyncs)
+	// Each acknowledged durable COMMIT contributes one durability estimate.
+	if stats.DurabilityEstimates < 3 {
+		t.Fatalf("durable commits did not account their durability estimate: %d", stats.DurabilityEstimates)
+	}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &fields); err != nil {
+		t.Fatal(err)
+	}
+	var estimated uint64
+	if err := json.Unmarshal(fields["durability_estimates"], &estimated); err != nil || estimated != stats.DurabilityEstimates {
+		t.Fatalf("durability_estimates JSON = %s, want %d: %v", fields["durability_estimates"], stats.DurabilityEstimates, err)
+	}
+	if _, exists := fields["fsyncs"]; exists {
+		t.Fatal("old fsyncs diagnostic alias is present")
 	}
 }
 

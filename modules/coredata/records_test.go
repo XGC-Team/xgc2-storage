@@ -195,10 +195,10 @@ func TestFinishRunRecordsTheOutcomeOnce(t *testing.T) {
 	if d, r := replayed.CommitsDurable-replayAt.CommitsDurable, replayed.CommitsRelaxed-replayAt.CommitsRelaxed; d != 1 || r != 0 {
 		t.Fatalf("same-outcome finish transaction: durable=%d relaxed=%d", d, r)
 	}
-	if replayed.Fsyncs < replayAt.Fsyncs+1 {
-		t.Fatalf("durable replay asked for no fsync barrier: %d -> %d", replayAt.Fsyncs, replayed.Fsyncs)
+	if replayed.DurabilityEstimates < replayAt.DurabilityEstimates+1 {
+		t.Fatalf("durable replay was not counted as a durability estimate: %d -> %d", replayAt.DurabilityEstimates, replayed.DurabilityEstimates)
 	}
-	t.Logf("same-outcome finish: commits durable +%d, engine fsyncs +%d, wal %d -> %d", replayed.CommitsDurable-replayAt.CommitsDurable, replayed.Fsyncs-replayAt.Fsyncs, replayAt.WALBytes, replayed.WALBytes)
+	t.Logf("same-outcome finish: commits durable +%d, durability estimates +%d, wal %d -> %d", replayed.CommitsDurable-replayAt.CommitsDurable, replayed.DurabilityEstimates-replayAt.DurabilityEstimates, replayAt.WALBytes, replayed.WALBytes)
 	for _, mismatch := range []model.RunFinish{
 		{ID: finish.ID, Status: model.RunFailed, Termination: finish.Termination, Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
 		{ID: finish.ID, Status: finish.Status, Termination: "other", Result: finish.Result, Nodes: finish.Nodes, CleanupErrors: finish.CleanupErrors, At: finish.At},
@@ -971,7 +971,7 @@ func TestApplyRunOpsOneTransactionOrderedAndIdempotent(t *testing.T) {
 		t.Fatalf("idempotent batch transaction: durable=%d relaxed=%d", d, r)
 	}
 	after := stats(t, f)
-	t.Logf("idempotent batch: commits durable +%d, engine fsyncs +%d, wal %d -> %d", after.CommitsDurable-replayAt.CommitsDurable, after.Fsyncs-replayAt.Fsyncs, replayAt.WALBytes, after.WALBytes)
+	t.Logf("idempotent batch: commits durable +%d, durability estimates +%d, wal %d -> %d", after.CommitsDurable-replayAt.CommitsDurable, after.DurabilityEstimates-replayAt.DurabilityEstimates, replayAt.WALBytes, after.WALBytes)
 	if rowsAfter, bytesAfter := usageRows(t, f); rowsAfter != rows || bytesAfter != quota {
 		t.Fatalf("idempotent batch changed quota: %d/%d -> %d/%d", rows, quota, rowsAfter, bytesAfter)
 	}

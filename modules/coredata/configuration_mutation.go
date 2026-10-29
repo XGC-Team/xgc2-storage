@@ -53,8 +53,12 @@ func configurationPrepared(s model.PreparedConfigurationSnapshot, control any) (
 	return v, pin, nil
 }
 
+func configurationSnapshotWithinRawBounds(s model.PreparedConfigurationSnapshot) bool {
+	return len(s.Payload) <= model.MaxConfigurationPayloadBytes && len(s.Manifest) <= model.MaxConfigurationManifestBytes && len(s.Identity) <= model.MaxConfigurationIdentityBytes && len(s.CatalogSummary) <= model.MaxConfigurationCatalogSummaryBytes && len(s.References) <= model.MaxConfigurationReferences && len(s.Associations) <= model.MaxConfigurationAssociations && len(s.Change.Nodes) <= model.MaxConfigurationNodeChanges
+}
+
 func configurationPlanBound(s model.PreparedConfigurationSnapshot, control any, extra int) error {
-	if len(s.Payload) > model.MaxConfigurationPayloadBytes || len(s.Manifest) > model.MaxConfigurationManifestBytes || len(s.Identity) > model.MaxConfigurationIdentityBytes || len(s.CatalogSummary) > model.MaxConfigurationCatalogSummaryBytes || len(s.References) > model.MaxConfigurationReferences || len(s.Associations) > model.MaxConfigurationAssociations || len(s.Change.Nodes) > model.MaxConfigurationNodeChanges {
+	if !configurationSnapshotWithinRawBounds(s) {
 		return failure("resource_exhausted", "configuration plan bound exceeded")
 	}
 	identity, err := configurationIdentity(s.Payload)
@@ -137,13 +141,18 @@ func configurationGuard(b model.ConfigurationBranch, c model.ConfigurationCommit
 	}
 	return nil
 }
-func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceCreate) (out model.ConfigurationMutationResult, err error) {
+func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceCreate, own ...func(*model.ConfigurationResourceCreate) error) (out model.ConfigurationMutationResult, err error) {
 	if err = configurationMutationValid(q.Mutation); err != nil {
 		return out, err
 	}
 	out, err = configurationReceipt(ctx, tx, scope, model.ConfigurationReceipt{Domain: q.Domain, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCreateOperation}})
 	if err != nil || out.Found {
 		return out, err
+	}
+	if len(own) != 0 {
+		if err = own[0](&q); err != nil {
+			return out, err
+		}
 	}
 	d, err := configurationDomain(ctx, tx, q.Domain)
 	if err != nil {
@@ -250,13 +259,18 @@ func configurationCreate(ctx context.Context, tx *sql.Tx, scope string, q model.
 	err = configurationFinishReceipt(ctx, tx, scope, out, q.Snapshot, control, 0)
 	return out, err
 }
-func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceCommit) (out model.ConfigurationMutationResult, err error) {
+func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceCommit, own ...func(*model.ConfigurationResourceCommit) error) (out model.ConfigurationMutationResult, err error) {
 	if err = configurationMutationValid(q.Mutation); err != nil {
 		return out, err
 	}
 	out, err = configurationReceipt(ctx, tx, scope, model.ConfigurationReceipt{Domain: q.Domain, Key: q.Mutation.Key, IntentDigest: q.Mutation.IntentDigest, Operations: []string{model.ResourceCommitOperation}})
 	if err != nil || out.Found {
 		return out, err
+	}
+	if len(own) != 0 {
+		if err = own[0](&q); err != nil {
+			return out, err
+		}
 	}
 	d, err := configurationDomain(ctx, tx, q.Domain)
 	if err != nil {
@@ -334,6 +348,11 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	}
 	if q.ExpectedResourceRevision != "" && q.ExpectedResourceRevision != r.Revision {
 		return out, failure("conflict", "resource revision changed")
+	}
+	// Check the same existing raw bounds before encoding caller bytes. This
+	// also lets a canceled attempt leave an oversized invalid buffer unowned.
+	if !configurationSnapshotWithinRawBounds(q.Snapshot) {
+		return out, failure("resource_exhausted", "configuration plan bound exceeded")
 	}
 	plan, err := model.ConfigurationCommitPlanDigest(q)
 	if err != nil {

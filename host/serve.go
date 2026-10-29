@@ -60,9 +60,17 @@ type Server struct {
 // Serve starts the HTTP and gRPC hosts on the given private Unix sockets.
 // ctx bounds startup only.
 func (h *Host) Serve(ctx context.Context, config ServeConfig) (_ *Server, resultErr error) {
-	if h == nil || h.closed.Load() {
+	if h == nil {
 		return nil, errors.New("storage: owner is closed")
 	}
+	h.mu.Lock()
+	if h.closed.Load() {
+		h.mu.Unlock()
+		return nil, errors.New("storage: owner is closed")
+	}
+	h.serving.Add(1)
+	h.mu.Unlock()
+	defer h.serving.Done()
 	if config.TargetID == "" || (config.HTTPSocket == "" && config.GRPCSocket == "") {
 		return nil, errors.New("storage: target and an external endpoint required")
 	}

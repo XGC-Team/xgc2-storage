@@ -16,7 +16,7 @@ import (
 func (s *Store) ReadResourceHeaders(ctx context.Context, q model.ConfigurationCatalogRead) ([]model.ConfigurationResourceHeader, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) ([]model.ConfigurationResourceHeader, error) {
 		return configurationResourceHeaders(ctx, tx, scope, q)
-	})
+	}, func() { q = ownedCatalogRead(q) })
 }
 
 const configurationResourceHeaderColumns = `r.id,coalesce(r.namespace_id,''),r.name,r.name_key,r.revision,r.main_commit_id,r.archived,r.origin_resource_id,r.origin_commit_id,CASE WHEN length(r.body)<=262144 THEN r.body ELSE X'' END,
@@ -39,7 +39,7 @@ func (s *Store) ReadSelectedResourceHeaders(ctx context.Context, q model.Configu
 	}
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) ([]model.ConfigurationResourceHeader, error) {
 		return configurationHeaderPage(ctx, tx, scope, q.Catalog, q.Selector, q.OrdinaryOnly)
-	})
+	}, func() { q.Catalog = ownedCatalogRead(q.Catalog) })
 }
 
 func configurationHeaderPage(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead, selector string, ordinary bool) ([]model.ConfigurationResourceHeader, error) {

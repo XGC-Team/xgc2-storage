@@ -17,6 +17,10 @@ const maxCommitIdentityBatch = 8192
 func (s *Store) ReadCommitIdentities(ctx context.Context, domain model.ConfigurationDomainGuard, ids []string) ([]model.ConfigurationCommitIdentityState, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) ([]model.ConfigurationCommitIdentityState, error) {
 		return configurationCommitIdentities(ctx, tx, scope, domain, ids)
+	}, func() {
+		if len(ids) <= maxCommitIdentityBatch {
+			ids = append([]string(nil), ids...)
+		}
 	})
 }
 

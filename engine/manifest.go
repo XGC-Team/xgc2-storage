@@ -115,6 +115,12 @@ func canonicalObject(raw json.RawMessage) (json.RawMessage, map[string]any, erro
 	b, err := json.Marshal(v)
 	return b, v, err
 }
+
+const (
+	maxIndexTupleBytes  = 4096
+	maxIndexNumberBytes = 128
+)
+
 func indexTuple(data map[string]any, idx api.Index) (string, bool, error) {
 	values := make([]any, 0, len(idx.Fields))
 	nullable := false
@@ -130,7 +136,7 @@ func indexTuple(data map[string]any, idx api.Index) (string, bool, error) {
 		}
 		values = append(values, v)
 		if number, ok := v.(json.Number); ok {
-			if len(number) > 128 {
+			if len(number) > maxIndexNumberBytes {
 				return "", false, fail("resource_exhausted", "index number too large")
 			}
 			if pos := strings.IndexAny(string(number), "eE"); pos >= 0 {
@@ -147,7 +153,7 @@ func indexTuple(data map[string]any, idx api.Index) (string, bool, error) {
 		}
 	}
 	b, e := json.Marshal(values)
-	if len(b) > 4096 {
+	if len(b) > maxIndexTupleBytes {
 		return "", false, fail("resource_exhausted", "index tuple too large")
 	}
 	return string(b), nullable, e

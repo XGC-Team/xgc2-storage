@@ -220,13 +220,22 @@ func (s *Store) WriteAgentLink(ctx context.Context, q model.AgentLinkWrite) (mod
 	if err := agentLinkInputBound(q.Record); err != nil {
 		return model.AgentLinkWriteResult{}, err
 	}
+	if err := canceledWrite(ctx); err != nil {
+		return model.AgentLinkWriteResult{}, err
+	}
 	var out model.AgentLinkWriteResult
-	err = s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+	err = s.db.WriteWithInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) error {
+		if err := input.Own(ctx, func() {
+			q.Record.CapabilityManifest = bytes.Clone(q.Record.CapabilityManifest)
+			q.Record.Capabilities = slices.Clone(q.Record.Capabilities)
+		}); err != nil {
+			return err
+		}
 		var e error
 		out, e = agentLinkWrite(ctx, tx, s.scope, s.agentLinkIdentity, version, q.Record)
 		return e
 	})
-	if errors.Is(err, errAgentLinkNoChange) {
+	if errors.Is(err, errAgentLinkNoChange) && engine.DefinitelyNotCommitted(err) {
 		return out, nil
 	}
 	if err != nil {

@@ -1,6 +1,7 @@
 package coredata
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -286,8 +287,10 @@ func closeOpenSessions(ctx context.Context, tx *sql.Tx, scope string, at time.Ti
 // OpenSession durably opens a Session. Only one Session per target is live: a
 // second one on the same target is a conflict, while opening the same Session
 // again returns it with created false.
-func (s *Store) OpenSession(ctx context.Context, q model.NewSession) (session model.Session, created bool, err error) {
-	err = s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) (e error) {
+func (s *Store) OpenSession(ctx context.Context, q model.NewSession) (model.Session, bool, error) {
+	var session model.Session
+	var created bool
+	err := s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) (e error) {
 		session, created, e = openSession(ctx, tx, s.scope, q)
 		return e
 	})
@@ -305,7 +308,10 @@ func (s *Store) RequestStop(ctx context.Context, id string, intent []byte) (mode
 	if err != nil {
 		return model.Session{}, err
 	}
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.Session, error) {
+	return writeInput(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string, input *engine.WriteInput) (model.Session, error) {
+		if err := input.Own(ctx, func() { stored = bytes.Clone(stored) }); err != nil {
+			return model.Session{}, err
+		}
 		return requestStop(ctx, tx, scope, id, stored)
 	})
 }
@@ -323,8 +329,10 @@ func (s *Store) CloseSession(ctx context.Context, id string, close model.Session
 	if err != nil {
 		return model.SessionMutationResult{}, err
 	}
-	close.Error = stored
-	return write(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string) (model.SessionMutationResult, error) {
+	return writeInput(ctx, s, engine.Durable, func(ctx context.Context, tx *sql.Tx, scope string, input *engine.WriteInput) (model.SessionMutationResult, error) {
+		if err := input.Own(ctx, func() { close.Error = bytes.Clone(stored) }); err != nil {
+			return model.SessionMutationResult{}, err
+		}
 		var cut retentionChanges
 		session, err := closeSession(ctx, tx, scope, id, close, &cut)
 		if err != nil {
@@ -348,7 +356,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (model.Session, error
 func (s *Store) ListSessions(ctx context.Context, f model.SessionFilter) (model.SessionPage, error) {
 	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (model.SessionPage, error) {
 		return listSessions(ctx, tx, scope, f)
-	})
+	}, func() { f.Statuses = append([]model.SessionStatus(nil), f.Statuses...) })
 }
 
 // CloseOpenSessions marks every Session a stopped Core left live as interrupted.

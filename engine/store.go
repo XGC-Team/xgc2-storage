@@ -87,23 +87,40 @@ func (c *Config) defaults() error {
 }
 
 type Store struct {
-	config     Config
-	owner      *owner
-	wdb, rdb   *sql.DB
-	writer     *sql.Conn // dedicated writer connection; used only under gate
-	dbid       string
-	engine     string
-	namespaces map[string]api.Namespace
-	modules    map[string]Module
+	config          Config
+	owner           *owner
+	wdb, rdb        *sql.DB
+	writer          *sql.Conn // dedicated writer connection; used only under gate
+	writerMu        sync.Mutex
+	physicalWriter  *writerDriver
+	readerMu        sync.Mutex
+	physicalReaders map[*readerDriver]struct{}
+	dbid            string
+	engine          string
+	namespaces      map[string]api.Namespace
+	modules         map[string]Module
 	// queue admits writers, gate runs one of them, reads admits readers.
 	queue, gate, reads chan struct{}
 	closed             atomic.Bool
-	lifecycle          sync.RWMutex
+	// fenced prevents new calls while a failed writer is being physically
+	// settled, or while its connection cannot safely be restored.
+	fenced atomic.Bool
+	// A discarded reader whose physical Close failed remains owned even if a
+	// concurrently finishing writer clears its own settlement fence.
+	readerUnsettled atomic.Int32
+	closing         atomic.Bool
+	lifecycle       sync.RWMutex
+	// writerUnsettled is changed only under writer admission or lifecycle.Lock.
+	// A failed physical close keeps the owner lock until Close can join it.
+	writerUnsettled bool
+	// pendingFault belongs to the one fenced physical attempt. It is guarded
+	// by writer admission or lifecycle.Lock and never used on the normal path.
+	pendingFault *pendingFault
 	// synchronous is the writer connection's current safety level; gate guards it.
 	synchronous                                  Durability
 	calls, conflicts, timeouts                   atomic.Uint64
 	waitNS, sqlNS                                atomic.Uint64
-	durable, relaxed, fsyncs                     atomic.Uint64
+	durable, relaxed, durabilityEstimates        atomic.Uint64
 	checkpoints, receiptsPruned, maintenanceErrs atomic.Uint64
 	mutationMetadataReads, mutationPayloadReads  atomic.Uint64
 	mutationPayloadBytes, mutationOldDecodes     atomic.Uint64
@@ -185,10 +202,7 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 			opened.Close()
 		}
 	}()
-	s.wdb, err = sql.Open("sqlite", s.writerDSN(o))
-	if err != nil {
-		return nil, err
-	}
+	s.wdb = sql.OpenDB(writerConnector{owner: s, base: sqliteWriterConnector{dsn: s.writerDSN(o)}})
 	s.wdb.SetMaxOpenConns(1)
 	s.wdb.SetMaxIdleConns(1)
 	if s.writer, err = s.wdb.Conn(ctx); err != nil {
@@ -220,27 +234,10 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logPages, &checkpointed); err != nil {
 		return nil, err
 	}
-	var pageSize, pageCount, pageLimit int64
-	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+	if err = s.configureWriterCapacity(ctx); err != nil {
 		return nil, err
 	}
-	if err = s.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
-		return nil, err
-	}
-	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 || pageCount > c.MaxDBBytes/pageSize {
-		return nil, fail("resource_exhausted", "existing database exceeds configured page byte budget")
-	}
-	requestedPageLimit := c.MaxDBBytes / pageSize
-	if err = s.writer.QueryRowContext(ctx, fmt.Sprintf("PRAGMA max_page_count=%d", requestedPageLimit)).Scan(&pageLimit); err != nil {
-		return nil, err
-	}
-	if pageLimit > requestedPageLimit || pageLimit < pageCount {
-		return nil, fail("failed_precondition", "SQLite did not enforce configured page byte budget")
-	}
-	s.rdb, err = sql.Open("sqlite", s.readerDSN(o))
-	if err != nil {
-		return nil, err
-	}
+	s.rdb = sql.OpenDB(readerConnector{owner: s, base: sqliteWriterConnector{dsn: s.readerDSN(o)}})
 	s.rdb.SetMaxOpenConns(c.Readers)
 	s.rdb.SetMaxIdleConns(c.Readers)
 	if err = s.rdb.PingContext(ctx); err != nil {
@@ -248,6 +245,29 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	}
 	s.startMaintenance(ctx)
 	return s, nil
+}
+
+// configureWriterCapacity is also used when a failed transaction forces the
+// dedicated connection to be replaced under the same owner admission.
+func (s *Store) configureWriterCapacity(ctx context.Context) error {
+	var pageSize, pageCount, pageLimit int64
+	if err := s.writer.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return err
+	}
+	if err := s.writer.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return err
+	}
+	if pageSize < 512 || pageSize > 65536 || pageSize&(pageSize-1) != 0 || pageCount > s.config.MaxDBBytes/pageSize {
+		return fail("resource_exhausted", "existing database exceeds configured page byte budget")
+	}
+	requested := s.config.MaxDBBytes / pageSize
+	if err := s.writer.QueryRowContext(ctx, fmt.Sprintf("PRAGMA max_page_count=%d", requested)).Scan(&pageLimit); err != nil {
+		return err
+	}
+	if pageLimit > requested || pageLimit < pageCount {
+		return fail("failed_precondition", "SQLite did not enforce configured page byte budget")
+	}
+	return nil
 }
 
 func versionAtLeast(version string, want ...int) bool {
@@ -272,18 +292,39 @@ func (s *Store) Close() error {
 	if s == nil {
 		return nil
 	}
+	s.closing.Store(true)
+	s.fenced.Store(true)
 	// Maintenance admits its calls like any other, so it stops before Close
 	// waits for the admitted ones.
 	s.stopMaintenance()
 	s.lifecycle.Lock()
 	defer s.lifecycle.Unlock()
-	if s.closed.Swap(true) {
+	if s.closed.Load() {
 		return nil
 	}
-	var e error
-	if s.rdb != nil {
-		e = errors.Join(e, s.rdb.Close())
+	// With no fault probe to serve, close readers first so the physical writer
+	// is SQLite's final connection and its close finishes the WAL checkpoint.
+	// A pending exact probe needs the reader until after the old writer joins.
+	if s.pendingFault == nil {
+		if err := s.closeReaders(); err != nil {
+			return fmt.Errorf("reader remains owned: %w", err)
+		}
+	} else if err := s.closeFailedReaders(); err != nil {
+		return fmt.Errorf("reader remains owned: %w", err)
 	}
+	if err := s.closePhysicalWriter(true); err != nil {
+		s.writerUnsettled = true
+		return fmt.Errorf("writer remains owned: %w", err)
+	}
+	s.writerUnsettled = false
+	if err := s.finishPendingFault(); err != nil {
+		return fmt.Errorf("writer fault revalidation remains owned: %w", err)
+	}
+	if err := s.closeReaders(); err != nil {
+		return fmt.Errorf("reader remains owned: %w", err)
+	}
+	s.closed.Store(true)
+	var e error
 	if s.writer != nil {
 		e = errors.Join(e, s.writer.Close())
 	}
@@ -344,10 +385,19 @@ func collection(n api.Namespace, id string) (api.Collection, error) {
 // writer. A caller that finds the writer queue full waits for room until its
 // own deadline; it is never rejected only because others are ahead of it.
 func (s *Store) admit(ctx context.Context, write bool) (context.Context, func(), error) {
-	s.lifecycle.RLock()
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	if s.closing.Load() || s.fenced.Load() || s.readerUnsettled.Load() != 0 || !s.lifecycle.TryRLock() {
+		return nil, nil, fail("unavailable", "store is closing or writer settlement is unavailable")
+	}
 	if s.closed.Load() {
 		s.lifecycle.RUnlock()
 		return nil, nil, fail("unavailable", "store closed")
+	}
+	if s.fenced.Load() || s.readerUnsettled.Load() != 0 {
+		s.lifecycle.RUnlock()
+		return nil, nil, fail("unavailable", "writer settlement is unavailable")
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.config.CallBudget)
 	refuse := func(err error) (context.Context, func(), error) {
@@ -375,6 +425,14 @@ func (s *Store) admit(ctx context.Context, write bool) (context.Context, func(),
 			<-slot
 			return refuse(ctx.Err())
 		}
+	}
+	// A call queued before the fence must not start after an unsettled writer.
+	if s.fenced.Load() || s.readerUnsettled.Load() != 0 {
+		if write {
+			<-s.gate
+		}
+		<-slot
+		return refuse(fail("unavailable", "writer settlement is unavailable"))
 	}
 	s.waitNS.Add(uint64(time.Since(start)))
 	s.calls.Add(1)

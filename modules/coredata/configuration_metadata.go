@@ -8,11 +8,16 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceMetadata) (out model.ConfigurationMutationResult, err error) {
+func configurationResourceMetadata(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationResourceMetadata, own ...func(*model.ConfigurationResourceMetadata) error) (out model.ConfigurationMutationResult, err error) {
 	const op = model.ConfigurationResourceMetadataOperation
 	out, err = configurationStateReceipt(ctx, tx, scope, op, q.Domain, q.Mutation)
 	if err != nil || out.Found {
 		return
+	}
+	if len(own) != 0 {
+		if err = own[0](&q); err != nil {
+			return out, err
+		}
 	}
 	if !positiveRevision(q.ExpectedRevision) || !q.Protect && q.MoveTo == nil {
 		return out, failure("invalid_argument", "exact revision and an explicit metadata change required")
