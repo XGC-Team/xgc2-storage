@@ -155,17 +155,31 @@ scoped Session indexes without scanning clean or unrelated history.
 
 ## Recordings
 
-`AddRecording` (Durable, idempotent by id; different facts under one id are a `conflict`),
-`GetRecording` and `ListRecordings` (oldest first; filters: session, run, kind) keep the index
-of recordings that Runs registered.
+`recordings` is the durable index of files that Runs registered. Registration resolves
+the accepted Run and optional Session in the same transaction; caller metadata is
+projected into a fixed bounded summary and cannot establish association. The stored
+`experiment_resource_id`, `archive_class`, `sort_at` and summary survive later Run or
+Session pruning. Classes are `rosbag` (`.bag`), `screen` (`.mp4`), `image-gallery`
+(kind `image-gallery`) and `other`; registration derives the class, callers cannot
+supply it.
+
+| Function | Class | Behavior |
+| --- | --- | --- |
+| `AddRecording` | Durable | idempotent by id; an exact replay returns the stored row, while a changed session/run/kind/path/metadata is a `conflict`; derives association, archive class, `sort_at` and the fixed summary from the accepted Run/Session; the summary is bounded by `MaxRecordingSummaryBytes` (4 KiB) and raw metadata by `MaxRecordingMetadata` (256 KiB) |
+| `GetRecording` | read | full row, including metadata |
+| `ListRecordings` | read | returns the stored typed summary and never selects `metadata_json`; exact experiment, session, run, kind, archive-class and data-file filters; `(sort_at,id)` keyset in either direction. `DataFilesOnly` requires exactly one experiment and selects every non-gallery class. A valid metadata `startedAt` sets `sort_at`; otherwise `created_at` does |
+| `GetRecordingForDeletion` | read | returns the selected full row and checks its exact owning Run lifecycle in the same read transaction. An open Run is a `conflict`; a pruned Run is allowed; a live Session does not block |
+| `DeleteRecording` | Durable | deletes exactly the guarded row from `RecordingDelete{ID, RunID, SessionID, Kind, Path, CreatedAt}`, rechecks the Run lifecycle, and releases the stored one-row/byte charge once. A changed or reused guard is a `conflict`; a missing row is `not_found`; physical files are the caller's responsibility |
 
 ## Quota and retention
 
 Rows and bytes of Core data are charged to a per-scope live total (1,000,000 rows, 512 MiB);
-deleting a Run frees its share. `CreateRun`, `OpenSession` and `AddRecording` are refused at
-the limit with `resource_exhausted`, while the first `FinishRun` of an admitted Run
-records its outcome even when the quota is already full. A same-outcome `FinishRun`
-does not charge quota again. Core prunes with `PruneRuns` on its own schedule.
+deleting a Run or a recording frees its share. `CreateRun`, `OpenSession` and `AddRecording`
+are refused at the limit with `resource_exhausted`, while the first `FinishRun` of an admitted
+Run records its outcome even when the quota is already full. A same-outcome `FinishRun`
+does not charge quota again. `DeleteRecording` releases the stored row and byte charge once;
+a missing or already deleted row never releases again. Core prunes with `PruneRuns` on its
+own schedule.
 
 ## Unresolved remote control ownership
 
@@ -215,7 +229,7 @@ identities. Each owner holds at most
 
 ## Current schema admission
 
-The Core data schema is version 11 and is the only admitted layout. No Core legacy probe,
+The Core data schema is version 12 and is the only admitted layout. No Core legacy probe,
 historical decoder or migration ships. Older/newer stores fail closed without changing
 accepted data or creating a migration backup. The engine also admits current schemas only.
 Development storage is initialized explicitly;

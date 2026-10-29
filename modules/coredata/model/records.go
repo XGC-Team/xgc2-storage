@@ -291,17 +291,70 @@ type SessionPage struct {
 	Next     string
 }
 
-// Recording is an index entry for a recording that a Run registered.
-type Recording struct {
-	ID        string          `json:"id"`
-	SessionID string          `json:"session_id,omitempty"`
-	RunID     string          `json:"run_id"`
-	Kind      string          `json:"kind"`
-	Path      string          `json:"path"`
-	Metadata  json.RawMessage `json:"metadata,omitempty"`
-	CreatedAt time.Time       `json:"created_at"`
+// RecordingArchiveClass is the immutable archive surface class of a recording.
+// It is derived from the accepted kind and path at registration; a caller
+// cannot supply or change it.
+type RecordingArchiveClass string
+
+const (
+	RecordingArchiveROSBag  RecordingArchiveClass = "rosbag"
+	RecordingArchiveScreen  RecordingArchiveClass = "screen"
+	RecordingArchiveGallery RecordingArchiveClass = "image-gallery"
+	RecordingArchiveOther   RecordingArchiveClass = "other"
+)
+
+// RecordingOrder selects the chronological page direction. Equal sort instants
+// tie-break on the recording identity in the same direction.
+type RecordingOrder string
+
+const (
+	RecordingOldestFirst RecordingOrder = "asc"
+	RecordingNewestFirst RecordingOrder = "desc"
+)
+
+// RecordingSummary is the fixed list projection consumed by archive surfaces.
+// The JSON names are the field names the product already exposes. Association
+// fields come from the accepted Run/Session owner; the rest are projected from
+// the registration metadata.
+type RecordingSummary struct {
+	ExperimentName string    `json:"experimentName,omitempty"`
+	RunMode        string    `json:"runMode,omitempty"`
+	TargetID       string    `json:"targetId,omitempty"`
+	RecordingID    string    `json:"recordingId,omitempty"`
+	RecordID       string    `json:"recordId,omitempty"`
+	BindingID      string    `json:"bindingId,omitempty"`
+	TimeSource     string    `json:"timeSource,omitempty"`
+	MediaType      string    `json:"mediaType,omitempty"`
+	DurationMS     int64     `json:"durationMs,omitempty"`
+	Width          int       `json:"width,omitempty"`
+	Height         int       `json:"height,omitempty"`
+	Status         string    `json:"status,omitempty"`
+	HasPoster      bool      `json:"hasPoster,omitempty"`
+	StartedAt      time.Time `json:"startedAt,omitzero"`
+	EndedAt        time.Time `json:"endedAt,omitzero"`
+	FinishedAt     time.Time `json:"finishedAt,omitzero"`
 }
 
+// Recording is one durable registration. ExperimentResourceID, ArchiveClass and
+// SortAt are derived inside the registration transaction. List returns Summary
+// and leaves Metadata empty; Get and Add return the stored metadata too.
+type Recording struct {
+	ID                   string                `json:"id"`
+	SessionID            string                `json:"session_id,omitempty"`
+	RunID                string                `json:"run_id"`
+	ExperimentResourceID string                `json:"experiment_resource_id,omitempty"`
+	Kind                 string                `json:"kind"`
+	ArchiveClass         RecordingArchiveClass `json:"archive_class"`
+	Path                 string                `json:"path"`
+	Summary              RecordingSummary      `json:"summary"`
+	Metadata             json.RawMessage       `json:"metadata,omitempty"`
+	SortAt               time.Time             `json:"sort_at"`
+	CreatedAt            time.Time             `json:"created_at"`
+}
+
+// NewRecording registers one recording. Association, archive class and sort
+// order are never caller facts: registration derives them from the accepted
+// Run, the optional Session and the metadata's valid startedAt.
 type NewRecording struct {
 	ID        string
 	SessionID string
@@ -312,13 +365,33 @@ type NewRecording struct {
 	At        time.Time
 }
 
-// RecordingFilter lists recordings oldest first.
-type RecordingFilter struct {
-	SessionID string
+// RecordingDelete is the immutable guard captured from a selected stored row.
+// It carries no metadata payload or caller association. DeleteRecording also
+// rechecks the owning Run lifecycle inside its durable transaction.
+type RecordingDelete struct {
+	ID        string
 	RunID     string
+	SessionID string
 	Kind      string
-	Limit     int
-	Cursor    string
+	Path      string
+	CreatedAt time.Time
+}
+
+// RecordingFilter selects one chronological page. Zero fields do not filter.
+// DataFilesOnly selects non-gallery archive files and requires exactly one
+// Experiment. Order defaults to oldest first.
+type RecordingFilter struct {
+	ExperimentResourceID string
+	SessionID            string
+	RunID                string
+	Kind                 string
+	ArchiveClass         RecordingArchiveClass
+	DataFilesOnly        bool
+	Order                RecordingOrder
+	// Limit defaults to 100 and is at most 1000.
+	Limit int
+	// Cursor is the Next value of the previous page; the page keeps its Order.
+	Cursor string
 }
 
 type RecordingPage struct {
@@ -337,6 +410,7 @@ const (
 	MaxRunCleanupErrorsBytes     = 256 << 10
 	MaxStopIntentBytes           = 64 << 10
 	MaxRecordingMetadata         = 256 << 10
+	MaxRecordingSummaryBytes     = 4 << 10
 	MaxRunDepth                  = 1024
 	MaxPageSize                  = 1000
 )

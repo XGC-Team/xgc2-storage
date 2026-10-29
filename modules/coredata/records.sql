@@ -28,7 +28,14 @@ CREATE UNIQUE INDEX sessions_restart_queued_target ON sessions(scope,target_id) 
 CREATE INDEX sessions_opened ON sessions(scope,opened_at,id);
 CREATE INDEX sessions_target ON sessions(scope,target_id,opened_at,id);
 CREATE INDEX sessions_experiment ON sessions(scope,experiment_resource_id,opened_at,id);
-CREATE TABLE recordings(scope TEXT NOT NULL,id TEXT NOT NULL,session_id TEXT NOT NULL,run_id TEXT NOT NULL,kind TEXT NOT NULL,path TEXT NOT NULL,metadata_json BLOB NOT NULL,created_at INTEGER NOT NULL,bytes INTEGER NOT NULL CHECK(bytes>=0),PRIMARY KEY(scope,id));
-CREATE INDEX recordings_created ON recordings(scope,created_at,id);
-CREATE INDEX recordings_session ON recordings(scope,session_id,created_at,id) WHERE session_id<>'';
-CREATE INDEX recordings_run ON recordings(scope,run_id,created_at,id);
+CREATE TABLE recordings(scope TEXT NOT NULL,id TEXT NOT NULL,session_id TEXT NOT NULL,run_id TEXT NOT NULL,experiment_resource_id TEXT NOT NULL,kind TEXT NOT NULL,archive_class TEXT NOT NULL CHECK(archive_class IN ('rosbag','screen','image-gallery','other')),path TEXT NOT NULL,summary_json BLOB NOT NULL,metadata_json BLOB NOT NULL,sort_at INTEGER NOT NULL,created_at INTEGER NOT NULL,bytes INTEGER NOT NULL CHECK(bytes>=0),PRIMARY KEY(scope,id),CHECK(session_id='' OR experiment_resource_id<>''));
+CREATE INDEX recordings_created ON recordings(scope,sort_at,id);
+CREATE INDEX recordings_class ON recordings(scope,archive_class,sort_at,id);
+CREATE INDEX recordings_kind ON recordings(scope,kind,sort_at,id);
+CREATE INDEX recordings_experiment ON recordings(scope,experiment_resource_id,sort_at,id) WHERE experiment_resource_id<>'';
+CREATE INDEX recordings_experiment_class ON recordings(scope,experiment_resource_id,archive_class,sort_at,id) WHERE experiment_resource_id<>'';
+CREATE INDEX recordings_experiment_data ON recordings(scope,experiment_resource_id,sort_at,id) WHERE experiment_resource_id<>'' AND archive_class<>'image-gallery';
+CREATE INDEX recordings_session ON recordings(scope,session_id,sort_at,id) WHERE session_id<>'';
+CREATE INDEX recordings_session_class ON recordings(scope,experiment_resource_id,session_id,archive_class,sort_at,id) WHERE session_id<>'';
+CREATE INDEX recordings_session_data ON recordings(scope,experiment_resource_id,session_id,sort_at,id) WHERE session_id<>'' AND archive_class<>'image-gallery';
+CREATE INDEX recordings_run ON recordings(scope,run_id,sort_at,id);

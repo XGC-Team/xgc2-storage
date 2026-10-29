@@ -3,6 +3,7 @@ package coredata_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -729,22 +730,47 @@ func TestCloseOpenSessionsAtBoot(t *testing.T) {
 
 func TestRecordingsAreIndexedDurablyAndListedOldestFirst(t *testing.T) {
 	f := openStore(t)
+	// Accepted owners: a Session names its experiment and target, and the
+	// owning Run's session and target must agree with it.
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s1", TargetID: "local", ExperimentResourceID: "exp-1", ExperimentCommitID: "exp-1-v1", RunMode: "managed", ExperimentName: "Experiment One", At: epoch}))
+	must3(f.core.OpenSession(f.ctx, model.NewSession{ID: "s2", TargetID: "agent-1", ExperimentResourceID: "exp-2", ExperimentCommitID: "exp-2-v1", RunMode: "manual", ExperimentName: "Experiment Two", At: epoch}))
+	run := func(id, target, session, experiment string) model.Run {
+		q := newRun(id)
+		q.TargetID, q.SessionID = target, session
+		q.SourceObservation = json.RawMessage(`{"experimentInvocation":{"experimentId":"` + experiment + `"}}`)
+		return must3(f.core.CreateRun(f.ctx, q))
+	}
+	run("run-1", "local", "s1", "exp-1")
+	run("run-2", "agent-1", "s2", "exp-2")
+
 	before := stats(t, f)
-	q := model.NewRecording{ID: "rec-1", SessionID: "s1", RunID: "run-1", Kind: "rosbag", Path: "/data/bags/rec-1.bag", Metadata: []byte(`{"topics":["/a","/b"]}`), At: epoch}
+	q := model.NewRecording{ID: "rec-1", SessionID: "s1", RunID: "run-1", Kind: "rosbag", Path: "/data/bags/rec-1.bag", Metadata: []byte(`{"topics":["/a","/b"],"recordingId":"capture","startedAt":"2026-10-10T11:59:00Z"}`), At: epoch}
 	rec, created, err := f.core.AddRecording(f.ctx, q)
 	if err != nil || !created || string(rec.Metadata) != string(q.Metadata) {
 		t.Fatalf("add: %+v %v", rec, err)
 	}
+	if rec.ExperimentResourceID != "exp-1" || rec.ArchiveClass != model.RecordingArchiveROSBag || !rec.SortAt.Equal(time.Date(2026, 10, 10, 11, 59, 0, 0, time.UTC)) {
+		t.Fatalf("derived recording facts: %+v", rec)
+	}
+	if rec.Summary.ExperimentName != "Experiment One" || rec.Summary.RunMode != "managed" || rec.Summary.TargetID != "local" || rec.Summary.RecordingID != "capture" {
+		t.Fatalf("stored summary: %+v", rec.Summary)
+	}
 	if d, r := commits(t, f, before); d != 1 || r != 0 {
 		t.Fatalf("AddRecording must be one durable commit: durable=%d relaxed=%d", d, r)
 	}
-	if again, created, err := f.core.AddRecording(f.ctx, q); err != nil || created || again.ID != "rec-1" {
+	if again, created, err := f.core.AddRecording(f.ctx, q); err != nil || created || !reflect.DeepEqual(again, rec) {
 		t.Fatalf("replay: %+v %v %v", again, created, err)
 	}
-	clash := q
-	clash.Path = "/elsewhere"
-	if _, _, err = f.core.AddRecording(f.ctx, clash); errCode(err) != "conflict" {
-		t.Fatalf("clashing facts: %v", err)
+	for name, clash := range map[string]model.NewRecording{
+		"path":     func() model.NewRecording { c := q; c.Path = "/elsewhere"; return c }(),
+		"run":      func() model.NewRecording { c := q; c.RunID = "run-2"; return c }(),
+		"session":  func() model.NewRecording { c := q; c.SessionID, c.RunID = "s2", "run-2"; return c }(),
+		"kind":     func() model.NewRecording { c := q; c.Kind = "video"; return c }(),
+		"metadata": func() model.NewRecording { c := q; c.Metadata = []byte(`{"topics":[]}`); return c }(),
+	} {
+		if _, _, err = f.core.AddRecording(f.ctx, clash); errCode(err) != "conflict" {
+			t.Errorf("%s clash: %v", name, err)
+		}
 	}
 	for name, bad := range map[string]model.NewRecording{
 		"no path":      {ID: "x", RunID: "r", Kind: "k"},
@@ -756,14 +782,27 @@ func TestRecordingsAreIndexedDurablyAndListedOldestFirst(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
+	if _, _, err = f.core.AddRecording(f.ctx, model.NewRecording{ID: "x", RunID: "missing", Kind: "k", Path: "/p"}); errCode(err) != "not_found" {
+		t.Fatalf("missing run owner: %v", err)
+	}
+	if _, _, err = f.core.AddRecording(f.ctx, model.NewRecording{ID: "x", SessionID: "missing", RunID: "run-1", Kind: "k", Path: "/p"}); errCode(err) != "not_found" {
+		t.Fatalf("missing session owner: %v", err)
+	}
 	for i := 2; i <= 7; i++ {
-		must3(f.core.AddRecording(f.ctx, model.NewRecording{ID: fmt.Sprintf("rec-%d", i), SessionID: []string{"s1", "s2"}[i%2], RunID: "run-" + fmt.Sprint(i%3), Kind: []string{"rosbag", "video"}[i%2], Path: "/p", At: epoch.Add(time.Duration(i/2) * time.Second)}))
+		session, run := "s2", "run-2"
+		if i%2 == 0 {
+			session, run = "s1", "run-1"
+		}
+		must3(f.core.AddRecording(f.ctx, model.NewRecording{ID: fmt.Sprintf("rec-%d", i), SessionID: session, RunID: run, Kind: []string{"rosbag", "video"}[i%2], Path: "/p", At: epoch.Add(time.Duration(i/2) * time.Second)}))
 	}
 	var ids []string
 	cursor := ""
 	for {
 		page := must(f.core.ListRecordings(f.ctx, model.RecordingFilter{Limit: 3, Cursor: cursor}))
 		for _, r := range page.Recordings {
+			if r.Metadata != nil {
+				t.Fatalf("list returned metadata for %s", r.ID)
+			}
 			ids = append(ids, r.ID)
 		}
 		if page.Next == "" {
@@ -777,10 +816,13 @@ func TestRecordingsAreIndexedDurablyAndListedOldestFirst(t *testing.T) {
 	if n := len(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{SessionID: "s2"})).Recordings); n != 3 {
 		t.Errorf("session filter: %d", n)
 	}
+	if n := len(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp-1"})).Recordings); n != 4 {
+		t.Errorf("experiment filter: %d", n)
+	}
 	if n := len(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{Kind: "video"})).Recordings); n != 3 {
 		t.Errorf("kind filter: %d", n)
 	}
-	if n := len(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{RunID: "run-1"})).Recordings); n < 1 {
+	if n := len(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{RunID: "run-1"})).Recordings); n != 4 {
 		t.Errorf("run filter: %d", n)
 	}
 	if _, err = f.core.GetRecording(f.ctx, "ghost"); errCode(err) != "not_found" {
