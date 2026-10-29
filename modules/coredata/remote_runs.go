@@ -109,6 +109,9 @@ func (e *RemoteRunResolveError) WaitRevalidation(ctx context.Context) (RemoteRun
 		return RemoteRunFaultFact{}, failure("unavailable", "original writer disposition unavailable")
 	}
 	if err := disposition.WaitSettlement(ctx); err != nil {
+		if ctx.Err() == nil && disposition.NonCommittedAfterJoin() {
+			return RemoteRunFaultFact{Link: e.state.link, ValidatedAttempt: e.state.attempted, NonCommitted: true}, nil
+		}
 		return RemoteRunFaultFact{}, err
 	}
 	return e.state.fact, nil
@@ -284,6 +287,9 @@ func (e *RemoteRunReserveError) WaitRevalidation(ctx context.Context) (RemoteRun
 		return RemoteRunReserveFact{}, failure("unavailable", "original writer disposition unavailable")
 	}
 	if err := disposition.WaitSettlement(ctx); err != nil {
+		if ctx.Err() == nil && disposition.NonCommittedAfterJoin() {
+			return e.state.noCommitFact(), nil
+		}
 		return RemoteRunReserveFact{}, err
 	}
 	return e.state.fact, nil

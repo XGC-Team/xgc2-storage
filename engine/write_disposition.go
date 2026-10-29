@@ -52,6 +52,22 @@ type writeCompletion struct {
 	release       <-chan struct{}
 	ownerReleased <-chan struct{}
 	err           error // published before done closes
+	nonCommitted  bool  // same owner proved no business COMMIT before done closes
+}
+
+func trackNonCommit(probe FaultProbe, completion *writeCompletion) FaultProbe {
+	if probe == nil {
+		return nil
+	}
+	return func(ctx context.Context, tx *sql.Tx, possibleCommit bool) error {
+		if err := probe(ctx, tx, possibleCommit); err != nil {
+			return err
+		}
+		if !possibleCommit {
+			completion.nonCommitted = true
+		}
+		return nil
+	}
 }
 
 // WriteInput protects only the caller's mutable input during this admission.
@@ -183,11 +199,12 @@ func (s *Store) waitPhysical(ctx context.Context, operation func() error, cause 
 			if probe != nil && outcome.Disposition == WriteUnknown {
 				done, released := make(chan struct{}), make(chan struct{})
 				outcome.completion = &writeCompletion{done: done, release: released}
+				ownedProbe := trackNonCommit(probe, outcome.completion)
 				s.fenced.Store(true)
 				if !outcome.Settled {
-					s.retainFault(probe, outcome.MayHaveCommitted, done, released)
+					s.retainFault(ownedProbe, outcome.MayHaveCommitted, done, released)
 				} else {
-					go s.completeFault(probe, outcome.MayHaveCommitted, done, released)
+					go s.completeFault(ownedProbe, outcome.MayHaveCommitted, done, released)
 				}
 				return err
 			}
@@ -198,12 +215,13 @@ func (s *Store) waitPhysical(ctx context.Context, operation func() error, cause 
 		s.fenced.Store(true)
 		done, released := make(chan struct{}), make(chan struct{})
 		completion := &writeCompletion{done: done, release: released}
+		ownedProbe := trackNonCommit(probe, completion)
 		go func() {
 			err := <-result
 			var outcome *WriteError
 			if err != nil && errors.As(err, &outcome) && !outcome.Settled {
 				if probe != nil && disposition == WriteUnknown {
-					s.retainFault(probe, mayCommit, done, released)
+					s.retainFault(ownedProbe, mayCommit, done, released)
 					return
 				}
 				s.attachFailedClose(outcome)
@@ -212,15 +230,17 @@ func (s *Store) waitPhysical(ctx context.Context, operation func() error, cause 
 					completion.err = err
 				} else {
 					<-outcome.completion.done
+					completion.nonCommitted = !mayCommit
 				}
 				close(done)
 				return
 			}
 			if probe != nil && disposition == WriteUnknown {
 				knownRollback := err != nil && errors.As(err, &outcome) && outcome.Disposition == WriteNotCommitted && outcome.Settled
-				s.completeFault(probe, mayCommit && !knownRollback, done, released)
+				s.completeFault(ownedProbe, mayCommit && !knownRollback, done, released)
 				return
 			}
+			completion.nonCommitted = !mayCommit && (err == nil || DefinitelyNotCommitted(err))
 			if !s.closing.Load() && s.writerUsable() {
 				s.fenced.Store(false)
 				if s.maintenance != nil {
@@ -294,11 +314,15 @@ func (s *Store) beginWriterCallback(ctx context.Context, fn func(context.Context
 		select {
 		case reply <- result:
 		case <-abandoned:
+			var panicErr error
+			if result.panicValue != nil {
+				panicErr = fmt.Errorf("writer callback panicked after caller returned: %v", result.panicValue)
+			}
 			if result.tx != nil {
 				if rollbackErr := result.tx.Rollback(); rollbackErr != nil {
 					settled, settleErr := s.settleFailedWriter(ctx)
 					if !settled {
-						done <- newWriteError(errors.Join(rollbackErr, settleErr), WriteUnknown, false)
+						done <- newWriteError(errors.Join(rollbackErr, settleErr, panicErr), WriteUnknown, false)
 						return
 					}
 				}
@@ -306,8 +330,14 @@ func (s *Store) beginWriterCallback(ctx context.Context, fn func(context.Context
 			var outcome *WriteError
 			if result.err != nil && errors.As(result.err, &outcome) && !outcome.Settled {
 				done <- result.err
-			} else if result.panicValue != nil {
-				done <- fmt.Errorf("writer callback panicked after caller returned: %v", result.panicValue)
+			} else if panicErr != nil {
+				if probe != nil && started.Load() {
+					if err := s.runFaultProbe(probe, false); err != nil {
+						done <- newWriteError(errors.Join(panicErr, err), WriteUnknown, false)
+						return
+					}
+				}
+				done <- panicErr
 			} else if probe != nil && started.Load() {
 				if err := s.runFaultProbe(probe, false); err != nil {
 					done <- newWriteError(err, WriteUnknown, false)
@@ -333,12 +363,14 @@ func (s *Store) beginWriterCallback(ctx context.Context, fn func(context.Context
 		close(abandoned)
 		joined, released := make(chan struct{}), make(chan struct{})
 		completion := &writeCompletion{done: joined, release: released}
+		ownedProbe := trackNonCommit(probe, completion)
 		go func() {
 			err := <-done
 			var outcome *WriteError
 			if err != nil && errors.As(err, &outcome) && !outcome.Settled {
+				completion.err = err
 				if probe != nil && started.Load() {
-					s.retainFault(probe, false, joined, released)
+					s.retainFault(ownedProbe, false, joined, released)
 					return
 				}
 				s.attachFailedClose(outcome)
@@ -347,11 +379,13 @@ func (s *Store) beginWriterCallback(ctx context.Context, fn func(context.Context
 					completion.err = err
 				} else {
 					<-outcome.completion.done
+					completion.nonCommitted = true
 				}
 				close(joined)
 				return
 			}
 			completion.err = err
+			completion.nonCommitted = true
 			// A reported callback panic does not keep a rolled-back, joined
 			// writer fenced. Its error still belongs to this completion; only
 			// unresolved physical ownership makes the Store unavailable.
@@ -382,6 +416,8 @@ func (s *Store) writerUsable() bool {
 
 // WaitSettlement joins this exact physical attempt. It does not report a
 // successful COMMIT or turn the original unknown outcome into a receipt.
+// A retained attempt failure remains observable after a later successful
+// physical Close. NonCommittedAfterJoin reports the separate post-join fact.
 func (e *WriteError) WaitSettlement(ctx context.Context) error {
 	if e.completion == nil {
 		if e.Settled {
@@ -391,21 +427,44 @@ func (e *WriteError) WaitSettlement(ctx context.Context) error {
 	}
 	select {
 	case <-e.completion.done:
-		if e.completion.err != nil {
-			return e.completion.err
-		}
 		if e.completion.ownerReleased == nil {
-			return nil
+			return e.completion.err
 		}
 		select {
 		case <-e.completion.ownerReleased:
-			return nil
+			return e.completion.err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// NonCommittedAfterJoin is a later fact of this exact physical attempt. It
+// never changes the original error's disposition or converts a failed call
+// into a replay success. A synchronous unknown rollback/close failure without
+// a retained completion has no such proof.
+func (e *WriteError) NonCommittedAfterJoin() bool {
+	if e.Disposition == WriteNotCommitted && e.Settled {
+		return true
+	}
+	if e.completion == nil || e.MayHaveCommitted {
+		return false
+	}
+	select {
+	case <-e.completion.done:
+	default:
+		return false
+	}
+	if e.completion.ownerReleased != nil {
+		select {
+		case <-e.completion.ownerReleased:
+		default:
+			return false
+		}
+	}
+	return e.completion.nonCommitted
 }
 
 func newWriteError(cause error, disposition WriteDisposition, settled bool) error {

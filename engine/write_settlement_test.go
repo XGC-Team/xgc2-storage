@@ -294,6 +294,10 @@ func TestWriteCommitFaultReportsRealDispositionAndJoins(t *testing.T) {
 				return insertFaultRow(ctx, tx, tc.name)
 			})
 			requireWriteDisposition(t, err, tc.want, true)
+			var attempt *WriteError
+			if !errors.As(err, &attempt) || (tc.want == WriteUnknown && attempt.NonCommittedAfterJoin()) {
+				t.Fatalf("possible COMMIT was reported as noncommit: %v", err)
+			}
 			if !errors.Is(err, errSettlementCommit) || (plan.closeCalls.Load() > 0) != tc.wantClosed {
 				t.Fatalf("cause/physical close err=%v closes=%d", err, plan.closeCalls.Load())
 			}
@@ -552,7 +556,8 @@ func TestWriteRollbackFailureDoesNotTurnReplayIntoSuccess(t *testing.T) {
 	plan.rollback.Store(true)
 	err := s.Write(ctx, Durable, func(context.Context, *sql.Tx) error { return errReplayed })
 	requireWriteDisposition(t, err, WriteUnknown, true)
-	if !errors.Is(err, errReplayed) || DefinitelyNotCommitted(err) || code(err) == "replayed" {
+	var attempt *WriteError
+	if !errors.As(err, &attempt) || attempt.NonCommittedAfterJoin() || !errors.Is(err, errReplayed) || DefinitelyNotCommitted(err) || code(err) == "replayed" {
 		t.Fatalf("replay sentinel concealed rollback failure: %v", err)
 	}
 	if err := s.Write(ctx, Durable, func(ctx context.Context, tx *sql.Tx) error {

@@ -225,8 +225,11 @@ func TestHeldCallbackFailedRollbackRetainsOwnerForLaterClose(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatalf("later explicit join: %v", err)
 	}
-	if err := outcome.WaitSettlement(ctx); err != nil {
-		t.Fatalf("original callback missed later join: %v", err)
+	if err := outcome.WaitSettlement(ctx); !errors.Is(err, errSettlementRollback) || !errors.Is(err, errSettlementClose) {
+		t.Fatalf("later join lost the original physical failures: %v", err)
+	}
+	if !outcome.NonCommittedAfterJoin() || outcome.Disposition != WriteUnknown || outcome.Settled {
+		t.Fatalf("later join did not retain distinct original and joined facts: %+v", outcome)
 	}
 	reopened, err := Open(ctx, cfg)
 	if err != nil {

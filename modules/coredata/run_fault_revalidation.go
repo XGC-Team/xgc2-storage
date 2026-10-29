@@ -47,6 +47,9 @@ func (e *RunWriteFaultError) WaitRevalidation(ctx context.Context) (RunFaultFact
 		return RunFaultFact{}, failure("unavailable", "original writer disposition unavailable")
 	}
 	if err := disposition.WaitSettlement(ctx); err != nil {
+		if ctx.Err() == nil && disposition.NonCommittedAfterJoin() {
+			return e.state.noCommitFact(), nil
+		}
 		return RunFaultFact{}, err
 	}
 	return copyRunFaultFact(e.state.fact), nil
