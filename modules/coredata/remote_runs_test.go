@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +17,31 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
+
+// releaseBoundRemote walks one bound relation through the durable
+// settle→release order the caller owes the callee before resolving.
+func releaseBoundRemote(t *testing.T, f *store, link model.RemoteRunLink) {
+	t.Helper()
+	if link.BootID == "" {
+		return
+	}
+	if _, err := f.core.SettleRemoteRun(f.ctx, link, model.RemoteRunSettlement{Disposition: "succeeded", FinishedAt: epoch}); err != nil {
+		t.Fatalf("settle %s: %v", link.RunID, err)
+	}
+	if _, err := f.core.MarkRemoteRunReleased(f.ctx, link, time.Time{}); err != nil {
+		t.Fatalf("release %s: %v", link.RunID, err)
+	}
+}
+
+// fundedRemoteLink replicates the store's prefunded encoding bound: every
+// phase's metadata at maximum length.
+func fundedRemoteLink(link model.RemoteRunLink) model.RemoteRunLink {
+	link.Phase = model.RemoteRunReleased
+	link.SettledDisposition = "succeeded"
+	link.SettledAt = time.Unix(0, math.MaxInt64).UTC()
+	link.ReleasedAt = time.Unix(0, math.MaxInt64).UTC()
+	return link
+}
 
 func TestPendingRemoteRunProtectsOwnerAndRootAcrossReopenUntilExactJoin(t *testing.T) {
 	f := openStore(t)
@@ -41,6 +67,7 @@ func TestPendingRemoteRunProtectsOwnerAndRootAcrossReopenUntilExactJoin(t *testi
 		t.Fatal("idempotent reservation charged twice")
 	}
 	link.BootID = "boot-a"
+	link.Phase = model.RemoteRunOpen
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +107,7 @@ func TestPendingRemoteRunProtectsOwnerAndRootAcrossReopenUntilExactJoin(t *testi
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatal("failed join freed authority", err)
 	}
+	releaseBoundRemote(t, f, link)
 	if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
@@ -131,6 +159,7 @@ func TestPendingRemotePageAdvancesAcrossUnmatchedOwnersAndMutations(t *testing.T
 			}
 			seen[link.RunID] = true
 			// Removal changes array offsets; the stable identity cursor must not skip.
+			releaseBoundRemote(t, f, link)
 			if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
 			}
@@ -184,6 +213,7 @@ func TestPendingRemoteMutationsUseTheirIndexedRowAndRollbackQuota(t *testing.T) 
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
+	releaseBoundRemote(t, f, link)
 	if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
@@ -233,18 +263,22 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 	}
 	baseRows, baseBytes := usageRows(t, f)
 	links := []model.RemoteRunLink{
-		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a<1", CallNodeID: "call"},
-		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-2", CallNodeID: "call", BootID: "boot"},
-		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-3", CallNodeID: "call", BootID: "boot"},
-		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-1", CallNodeID: "call", BootID: "boot"},
-		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-2", CallNodeID: "call", BootID: "boot"},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a<1", CallNodeID: "call", Phase: model.RemoteRunOpen},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-2", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-a", RunID: "a-3", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-1", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen},
+		{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent-b", RunID: "b-2", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen},
 	}
 	for _, link := range links {
 		if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 			t.Fatal(err)
 		}
 	}
-	encoded, err := json.Marshal(links)
+	fundedLinks := make([]model.RemoteRunLink, len(links))
+	for i, link := range links {
+		fundedLinks[i] = fundedRemoteLink(link)
+	}
+	encoded, err := json.Marshal(fundedLinks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -286,6 +320,7 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 		}
 		link := page.Links[0]
 		seen[link.RunID] = true
+		releaseBoundRemote(t, f, link)
 		if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
@@ -302,6 +337,7 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 		t.Fatalf("other target lost: %+v %v", other, err)
 	}
 	for _, link := range other.Links {
+		releaseBoundRemote(t, f, link)
 		if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
@@ -344,6 +380,7 @@ func TestPendingRemoteCancellationAndQuotaRollback(t *testing.T) {
 	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, coredata.MaxScopeBytes, engine.ScopeID(f.scope))
 	bound := link
 	bound.BootID = "boot"
+	bound.Phase = model.RemoteRunOpen
 	if err = f.core.ReserveRemoteRun(f.ctx, bound); errCode(err) != "resource_exhausted" {
 		t.Fatalf("boot binding quota: %v", err)
 	}
@@ -453,6 +490,7 @@ func TestPendingRemoteTargetPagesAcrossOwnerCapacityAndReopen(t *testing.T) {
 				t.Fatalf("duplicate or foreign link: %+v", link)
 			}
 			seen[key] = true
+			releaseBoundRemote(t, f, link)
 			if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
 			}
@@ -489,6 +527,7 @@ func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
 		}
 		bound := unbound
 		bound.BootID = "boot"
+		bound.Phase = model.RemoteRunOpen
 		start := make(chan struct{})
 		var bindErr, resolveErr error
 		var wg sync.WaitGroup
@@ -508,6 +547,7 @@ func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
 		if err != nil || len(page.Links) != 1 || page.Links[0] != bound {
 			t.Fatalf("old resolve erased bound child: %+v %v", page, err)
 		}
+		releaseBoundRemote(t, f, bound)
 		if _, err := f.core.ResolveRemoteRun(f.ctx, bound, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
@@ -541,5 +581,91 @@ func TestPendingRemoteMissingRootStillProtectsOwner(t *testing.T) {
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})
 	if err != nil || pruned.Deleted != 1 {
 		t.Fatalf("joined missing-root owner not retired: %+v %v", pruned, err)
+	}
+}
+
+// A point-read on the relation's natural key returns only the selected
+// relation — unrelated owners and siblings are never touched or charged —
+// and keeps the settle/release absent/mismatch semantics.
+func TestReadRemoteRunLinkSelectsExactRelationAmongUnrelatedOwners(t *testing.T) {
+	f := openStore(t)
+	for _, q := range []model.NewRun{
+		newRun("root-a"), childRun("owner-a", "root-a", "root-a", 1),
+		newRun("root-b"), childRun("owner-b", "root-b", "root-b", 1),
+		newRun("unrelated"),
+	} {
+		if _, _, err := f.core.CreateRun(f.ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a1 := model.RemoteRunLink{OwnerRunID: "owner-a", RootRunID: "root-a", TargetID: "agent", RunID: "remote-a1", CallNodeID: "call-a1"}
+	a2 := model.RemoteRunLink{OwnerRunID: "owner-a", RootRunID: "root-a", TargetID: "agent", RunID: "remote-a2", CallNodeID: "call-a2"}
+	b1 := model.RemoteRunLink{OwnerRunID: "owner-b", RootRunID: "root-b", TargetID: "agent", RunID: "remote-b1", CallNodeID: "call-b1", BootID: "boot-b"}
+	for _, link := range []model.RemoteRunLink{a1, a2, b1} {
+		if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rowsBefore, bytesBefore := usageRows(t, f)
+
+	// Key-only read returns the stored identity plus the durable phase.
+	got, err := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-a", TargetID: "agent", RunID: "remote-a1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := a1
+	want.Phase = model.RemoteRunOpen
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("selected link: %+v != %+v", got, want)
+	}
+
+	// A bound relation reads back its bound boot; after settle the durable
+	// phase and evidence come back too.
+	if _, err := f.core.SettleRemoteRun(f.ctx, b1, model.RemoteRunSettlement{Disposition: "succeeded", FinishedAt: epoch}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-b", TargetID: "agent", RunID: "remote-b1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = b1
+	want.Phase = model.RemoteRunSettled
+	want.SettledDisposition = "succeeded"
+	want.SettledAt = epoch
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("settled link: %+v != %+v", got, want)
+	}
+
+	// Supplied identity fields are verified; absence and mismatch keep the
+	// settle/release semantics.
+	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-a", TargetID: "agent", RunID: "missing"}); return e }()); code != "not_found" {
+		t.Fatalf("absent relation: %s", code)
+	}
+	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-b", TargetID: "agent", RunID: "remote-a1"}); return e }()); code != "not_found" {
+		t.Fatalf("relation under an unrelated owner: %s", code)
+	}
+	mismatched := a2
+	mismatched.RootRunID = "other-root"
+	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, mismatched); return e }()); code != "failed_precondition" {
+		t.Fatalf("mismatched root: %s", code)
+	}
+	mismatched = b1
+	mismatched.BootID = "other-boot"
+	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, mismatched); return e }()); code != "failed_precondition" {
+		t.Fatalf("mismatched boot: %s", code)
+	}
+	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{TargetID: "agent", RunID: "remote-a1"}); return e }()); code != "invalid_argument" {
+		t.Fatalf("missing natural key: %s", code)
+	}
+
+	// The reads touched no other relation and charged nothing: every stored
+	// row is still present with its own identity.
+	page, err := f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 128)
+	if err != nil || len(page.Links) != 3 {
+		t.Fatalf("pending relations changed under point reads: %+v %v", page, err)
+	}
+	rowsAfter, bytesAfter := usageRows(t, f)
+	if rowsAfter != rowsBefore || bytesAfter != bytesBefore {
+		t.Fatalf("point reads charged capacity: rows %d!=%d bytes %d!=%d", rowsAfter, rowsBefore, bytesAfter, bytesBefore)
 	}
 }

@@ -15,6 +15,7 @@ import (
 // or predecessor relation changed. The group indexes let those two guards be
 // changed without visiting rows still protected by the other group guard.
 const retentionPendingClear = `CASE WHEN r.pending_remote_count<>0 THEN 0
+ WHEN r.incoming_remote_target_id<>'' AND r.incoming_hold_released=0 THEN 0
  WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) THEN 0
  WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) THEN 0 ELSE 1 END`
 const retentionLocal = `CASE WHEN (` + retentionPendingClear + `) THEN NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) ELSE 0 END`

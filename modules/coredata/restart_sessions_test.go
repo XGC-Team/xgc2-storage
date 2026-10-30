@@ -52,6 +52,7 @@ func TestRestartSessionReservationPromotionAndRemoteRetention(t *testing.T) {
 	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("pending remote promoted: %v", err)
 	}
+	releaseBoundRemote(t, f, link)
 	if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}

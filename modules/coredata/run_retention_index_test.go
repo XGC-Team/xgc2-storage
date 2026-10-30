@@ -234,6 +234,7 @@ func TestRetentionIndexNonfinalRemoteOwnerAndMissingRoot(t *testing.T) {
 				}
 			}
 			assertRetentionIndex(t, f)
+			releaseBoundRemote(t, f, a)
 			first, err := f.core.ResolveRemoteRun(f.ctx, a, p)
 			if err != nil || !first.Changed || first.LastForRoot || !first.Retention.EligibilityReleased || !first.Retention.HasVictim {
 				t.Fatalf("nonfinal release: %+v %v", first, err)
@@ -250,6 +251,7 @@ func TestRetentionIndexNonfinalRemoteOwnerAndMissingRoot(t *testing.T) {
 			if _, err = f.core.GetRun(f.ctx, "b"); err != nil {
 				t.Fatal(err)
 			}
+			releaseBoundRemote(t, f, b)
 			last, err := f.core.ResolveRemoteRun(f.ctx, b, p)
 			if err != nil || !last.LastForRoot || !last.Retention.HasVictim {
 				t.Fatalf("last: %+v %v", last, err)
@@ -335,6 +337,7 @@ func TestRetentionIndexBootOverlapAndNegativeFinish(t *testing.T) {
 		t.Fatalf("Session boot release: %+v %v", sessions, err)
 	}
 	assertRetentionIndex(t, f)
+	releaseBoundRemote(t, f, link)
 	released, err := f.core.ResolveRemoteRun(f.ctx, link, p)
 	if err != nil || !released.LastForRoot || !released.Retention.EligibilityReleased || !released.Retention.HasVictim {
 		t.Fatalf("remote boot release: %+v %v", released, err)
@@ -627,10 +630,12 @@ func TestRetentionIndexRemoteOwnerStillPendingAndLiveRoot(t *testing.T) {
 	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "owner", Status: model.RunSucceeded, At: epoch}, p); err != nil {
 		t.Fatal(err)
 	}
+	releaseBoundRemote(t, f, a)
 	first, err := f.core.ResolveRemoteRun(f.ctx, a, p)
 	if err != nil || !first.Changed || first.Retention != (model.RunRetentionEffect{}) {
 		t.Fatalf("other own link: %+v %v", first, err)
 	}
+	releaseBoundRemote(t, f, b)
 	second, err := f.core.ResolveRemoteRun(f.ctx, b, p)
 	if err != nil || !second.LastForRoot || second.Retention != (model.RunRetentionEffect{}) {
 		t.Fatalf("live root: %+v %v", second, err)
@@ -671,10 +676,12 @@ func TestRetentionIndexFirstRemoteRelationRevokesFinishedRoot(t *testing.T) {
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatalf("pending root pruned: %+v %v", pruned, err)
 	}
+	releaseBoundRemote(t, f, a)
 	if _, err = f.core.ResolveRemoteRun(f.ctx, a, p); err != nil {
 		t.Fatal(err)
 	}
 	assertRetentionIndex(t, f)
+	releaseBoundRemote(t, f, b)
 	last, err := f.core.ResolveRemoteRun(f.ctx, b, p)
 	if err != nil || !last.Retention.EligibilityReleased || !last.Retention.HasVictim {
 		t.Fatalf("root released: %+v %v", last, err)

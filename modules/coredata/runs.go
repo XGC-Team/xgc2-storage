@@ -117,19 +117,19 @@ func pageLimit(limit int) (int, error) {
 
 type scanner interface{ Scan(dest ...any) error }
 
-const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
+const runColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,status,termination,error_json,result_json,nodes_json,cleanup_errors_json,created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released"
 
 // runSummaryColumns replaces the large JSON columns by empty values.
-const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,x'',x'',0"
+const runSummaryColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,x'',x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,x'',x'',0,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released"
 
-const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,error_summary_json,x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed"
+const runObservationColumns = "id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,x'',x'',status,termination,error_summary_json,x'',x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0,source_observation_json,error_summary_json,cleanup_failed,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released"
 
 func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) {
 	var r model.Run
 	var status string
 	var inputs, trigger, errored, result, nodes, cleanup []byte
 	var created, started, finished int64
-	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.PredecessorRunID, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult, &r.SourceObservation, &r.ErrorSummary, &r.CleanupFailed); err != nil {
+	if err := row.Scan(&r.ID, &r.TargetID, &r.RootRunID, &r.ParentRunID, &r.CallNodeID, &r.Depth, &r.SessionID, &r.IdempotencyKey, &r.PredecessorRunID, &r.WorkflowResourceID, &r.WorkflowCommitID, &r.DefinitionDigest, &r.ActionID, &inputs, &trigger, &status, &r.Termination, &errored, &result, &nodes, &cleanup, &created, &started, &finished, &r.Revision, &r.HasResult, &r.SourceObservation, &r.ErrorSummary, &r.CleanupFailed, &r.IncomingHold.TargetID, &r.IncomingHold.PrincipalID, &r.IncomingHold.Released); err != nil {
 		return r, err
 	}
 	r.Status = model.RunStatus(status)
@@ -181,8 +181,11 @@ const rowOverhead = 256
 
 func runBytes(r model.Run) int64 {
 	n := rowOverhead
-	for _, s := range []string{r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.SessionID, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID, r.Termination} {
+	for _, s := range []string{r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.SessionID, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID, r.Termination, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID} {
 		n += len(s)
+	}
+	if r.IncomingHold.TargetID != "" {
+		n++
 	}
 	return int64(n + len(r.Inputs) + len(r.Trigger) + len(r.Error) + len(r.Result) + len(r.Nodes) + len(r.CleanupErrors) + len(r.SourceObservation) + len(r.ErrorSummary))
 }
@@ -215,6 +218,26 @@ func validateNewRun(q *model.NewRun) error {
 	case model.RunQueued, model.RunRunning:
 	default:
 		return failure("invalid_argument", "a Run is accepted as queued or running")
+	}
+	// An incoming hold is the stamped stable identity of the authenticated
+	// remote caller (its enrolled target and stable CoreID on the accepted
+	// transport, not an ephemeral boot). It requires the accepted call
+	// lineage (parent + call node), names a caller target different from
+	// this Run's own, and is always created active; release is a separate
+	// durable write.
+	if (q.IncomingHold.TargetID == "") != (q.IncomingHold.PrincipalID == "") || q.IncomingHold.Released {
+		return failure("invalid_argument", "an incoming hold requires the caller's stable target and core identity and cannot be created released")
+	}
+	if q.IncomingHold.TargetID != "" {
+		if !textKey(q.IncomingHold.TargetID) {
+			return failure("invalid_argument", "incoming caller target identity is required")
+		}
+		if err := optionalKey("incoming caller principal identity", q.IncomingHold.PrincipalID); err != nil {
+			return err
+		}
+		if q.IncomingHold.TargetID == q.TargetID || q.ParentRunID == "" || q.CallNodeID == "" {
+			return failure("invalid_argument", "an incoming hold requires a remote caller and the accepted call lineage")
+		}
 	}
 	return nil
 }
@@ -310,7 +333,7 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	at := nowOr(q.At)
 	r := model.Run{ID: q.ID, TargetID: q.TargetID, RootRunID: q.RootRunID, ParentRunID: q.ParentRunID, CallNodeID: q.CallNodeID, Depth: q.Depth, SessionID: q.SessionID,
 		IdempotencyKey: q.IdempotencyKey, PredecessorRunID: q.PredecessorRunID, WorkflowResourceID: q.WorkflowResourceID, WorkflowCommitID: q.WorkflowCommitID, DefinitionDigest: q.DefinitionDigest, ActionID: q.ActionID,
-		Inputs: inputs, Trigger: trigger, SourceObservation: source, Status: q.Status, CreatedAt: at, Revision: 1}
+		Inputs: inputs, Trigger: trigger, SourceObservation: source, Status: q.Status, CreatedAt: at, Revision: 1, IncomingHold: q.IncomingHold}
 	if r.Status == model.RunRunning {
 		r.StartedAt = at
 	}
@@ -326,9 +349,9 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?)",
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?,?,?,0)",
 		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, sessionInstance, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
-		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes)
+		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID)
 	return r, true, err
 }
 
@@ -622,12 +645,12 @@ const (
 	// All open roots and successors in this scope end in this same statement.
 	// Their old open state must not guard another row at the final cut.
 	bootLocal     = retentionPendingClear
-	interruptOpen = `UPDATE runs AS r SET status='interrupted',termination='interrupted',finished_at=?1,revision=revision+1,bytes=bytes+?2,
+	interruptOpen = `UPDATE runs AS r INDEXED BY runs_open SET status='interrupted',termination='interrupted',finished_at=?1,revision=revision+1,bytes=bytes+?2,
  (retention_local_ok,retention_eligible)=(WITH local(value) AS MATERIALIZED (SELECT CASE WHEN ?1>0 THEN (` + bootLocal + `) ELSE 0 END) SELECT value,CASE WHEN value THEN (` + retentionSessionClear + `) ELSE 0 END FROM local)
  WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible`
 
 	// Recheck all active guards before deletion. An absent root is not live.
-	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
+	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND (r.incoming_remote_target_id='' OR r.incoming_hold_released<>0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
 	pruneOldest     = "SELECT finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT 1"
 	pruneCandidates = "SELECT id,bytes,finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT ?"
 )

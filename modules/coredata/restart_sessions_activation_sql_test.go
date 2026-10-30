@@ -63,7 +63,7 @@ func TestRetentionEffectZeroCountSkipsOldest(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := model.RemoteRunLink{OwnerRunID: q.ID, RootRunID: q.ID, TargetID: "agent", RunID: "child", CallNodeID: "call", BootID: "boot"}
-	if _, err = changeRemoteRun(ctx, tx, testScope, link, false, nil); err != nil {
+	if _, err = changeRemoteRun(ctx, tx, testScope, link, remoteReserve, nil); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(); err != nil {

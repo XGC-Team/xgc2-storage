@@ -139,11 +139,12 @@ func TestRemoteReserveFaultProbeSeeksOnlyValidatedRelation(t *testing.T) {
 				t.Fatal(err)
 			}
 			link := model.RemoteRunLink{OwnerRunID: id, RootRunID: id, TargetID: "agent", RunID: "child", CallNodeID: "call", BootID: "boot"}
-			if changed, err := changeRemoteRun(ctx, tx, testScope, link, false, nil); err != nil || !changed {
+			if changed, err := changeRemoteRun(ctx, tx, testScope, link, remoteReserve, nil); err != nil || !changed {
 				t.Fatalf("seed relation=%t %v", changed, err)
 			}
 			if i == 0 {
 				selected = link
+				selected.Phase = model.RemoteRunOpen
 			}
 		}
 		if err = tx.Commit(); err != nil {

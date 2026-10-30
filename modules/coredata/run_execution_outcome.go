@@ -16,7 +16,8 @@ const executionOutcomeColumns = "id,target_id,root_run_id,parent_run_id,call_nod
 	"CASE WHEN length(result_json)<=? THEN result_json ELSE x'00' END," +
 	"x'',x'',created_at,started_at,finished_at,revision,length(result_json)>0," +
 	"CASE WHEN length(source_observation_json)<=? THEN source_observation_json ELSE x'00' END," +
-	"CASE WHEN length(error_summary_json)<=? THEN error_summary_json ELSE x'00' END,cleanup_failed"
+	"CASE WHEN length(error_summary_json)<=? THEN error_summary_json ELSE x'00' END,cleanup_failed," +
+	"incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released"
 
 func getRunExecutionOutcome(ctx context.Context, tx *sql.Tx, scope, id string) (model.Run, error) {
 	if !textKey(id) {

@@ -3,6 +3,7 @@ package coredata_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -39,7 +40,13 @@ func TestRemoteOwnerFenceUsesExactAcceptedOwnerAndFinalChangedRelease(t *testing
 		t.Fatalf("actual relation missed with corrupt summary: pending=%v err=%v", pending, err)
 	}
 	// Restore only the injected summary from the authoritative relation rows.
-	f.exec(t, `UPDATE runs SET pending_remote_count=(SELECT count(*) FROM run_remote_pending WHERE scope=runs.scope AND owner_run_id=runs.id),pending_remote_bytes=(SELECT sum(encoded_bytes)+count(*)+1 FROM run_remote_pending WHERE scope=runs.scope AND owner_run_id=runs.id) WHERE id=?`, "callback")
+	// The counter prefunds each relation's largest phase encoding, so the
+	// restored total is the funded array, not the stored actual bytes.
+	fundedJSON, err := json.Marshal([]model.RemoteRunLink{fundedRemoteLink(inner1), fundedRemoteLink(inner2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.exec(t, `UPDATE runs SET pending_remote_count=(SELECT count(*) FROM run_remote_pending WHERE scope=runs.scope AND owner_run_id=runs.id),pending_remote_bytes=? WHERE id=?`, int64(len(fundedJSON)), "callback")
 	other, err := coredata.New(f.db, api.Scope{Namespace: "core", User: "another", Workspace: "station"})
 	if err != nil {
 		t.Fatal(err)
@@ -62,6 +69,7 @@ func TestRemoteOwnerFenceUsesExactAcceptedOwnerAndFinalChangedRelease(t *testing
 		t.Fatal("canceled owner check succeeded")
 	}
 
+	releaseBoundRemote(t, f, inner1)
 	result, err := f.core.ResolveRemoteRun(f.ctx, inner1, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || result.LastForOwner || result.LastForRoot {
 		t.Fatalf("owner nonfinal: %+v %v", result, err)
@@ -73,6 +81,7 @@ func TestRemoteOwnerFenceUsesExactAcceptedOwnerAndFinalChangedRelease(t *testing
 	if pending, err := f.core.HasPendingRemoteOwner(f.ctx, "callback"); err != nil || !pending {
 		t.Fatalf("inner still pending=%v err=%v", pending, err)
 	}
+	releaseBoundRemote(t, f, inner2)
 	result, err = f.core.ResolveRemoteRun(f.ctx, inner2, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForOwner || result.LastForRoot {
 		t.Fatalf("callback final while ancestor pending: %+v %v", result, err)
@@ -86,6 +95,7 @@ func TestRemoteOwnerFenceUsesExactAcceptedOwnerAndFinalChangedRelease(t *testing
 	if pending, err := f.core.HasPendingRemoteOwner(f.ctx, "other-root"); err != nil || !pending {
 		t.Fatalf("unrelated owner released: %v %v", pending, err)
 	}
+	releaseBoundRemote(t, f, outer)
 	result, err = f.core.ResolveRemoteRun(f.ctx, outer, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForOwner || !result.LastForRoot {
 		t.Fatalf("ancestor final: %+v %v", result, err)
@@ -116,6 +126,7 @@ func TestRemoteOwnerFenceCorruptCountRollsBackRelease(t *testing.T) {
 				if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 					t.Fatal(err)
 				}
+				releaseBoundRemote(t, f, link)
 			}
 			var count int
 			var bytes, encoded int64

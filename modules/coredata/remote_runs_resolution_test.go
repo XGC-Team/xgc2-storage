@@ -2,11 +2,13 @@ package coredata_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
@@ -51,6 +53,7 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 	if gotRows, gotBytes := usageRows(t, f); gotRows != rows || gotBytes != bytes {
 		t.Fatal("rejected resolution changed quota")
 	}
+	releaseBoundRemote(t, f, a)
 	first, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
 	if err != nil || first != (model.RemoteRunResolveResult{RootRunID: "root", Changed: true, LastForOwner: true, Retention: model.RunRetentionEffect{EligibilityReleased: true}}) {
 		t.Fatalf("nonfinal owner: %+v %v", first, err)
@@ -66,6 +69,7 @@ func TestResolveRemoteRunReturnsOnlyTheCommittedFinalRootCut(t *testing.T) {
 	if gotRows, gotBytes := usageRows(t, f); gotRows != rowsAfterFirst || gotBytes != bytesAfterFirst {
 		t.Fatal("replay changed quota")
 	}
+	releaseBoundRemote(t, f, b)
 	last, err := f.core.ResolveRemoteRun(f.ctx, b, model.RunRetentionPolicy{})
 	if err != nil || !last.Changed || !last.LastForRoot || !last.RootFound || last.RootRunID != "root" || !last.RootFinishedAt.Equal(rootAt) || !last.OwnerFinishedAt.Equal(bAt) {
 		t.Fatalf("final owner: %+v %v", last, err)
@@ -109,6 +113,7 @@ func TestResolveRemoteRunDistinguishesLiveAndMissingRoots(t *testing.T) {
 				t.Fatal(err)
 			}
 			f.reopen(t)
+			releaseBoundRemote(t, f, link)
 			result, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 			if err != nil || !result.Changed || !result.LastForRoot || result.RootFound != exists || !result.RootFinishedAt.IsZero() || !result.OwnerFinishedAt.Equal(at) {
 				t.Fatalf("root status: %+v %v", result, err)
@@ -140,6 +145,11 @@ func TestResolveRemoteRunConcurrentOwnersAndDuplicateJoin(t *testing.T) {
 				b = a
 			} else if err := f.core.ReserveRemoteRun(f.ctx, b); err != nil {
 				t.Fatal(err)
+			}
+			for i, link := range []model.RemoteRunLink{a, b} {
+				if !duplicate || i == 0 {
+					releaseBoundRemote(t, f, link)
+				}
 			}
 			start := make(chan struct{})
 			var wg sync.WaitGroup
@@ -210,6 +220,7 @@ func TestResolveRemoteRunScopeAndCancellationLeaveNoFalseCommit(t *testing.T) {
 			t.Fatalf("canceled or foreign mutation removed protection: %v %v", pending, err)
 		}
 	}
+	releaseBoundRemote(t, f, link)
 	result, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForRoot {
 		t.Fatalf("scope release=%+v %v", result, err)
@@ -234,6 +245,7 @@ func TestResolveRemoteRunUsesTransactionCutWhenRootFinishesConcurrently(t *testi
 	var resolved model.RemoteRunResolveResult
 	var resolveErr, finishErr error
 	wg.Add(2)
+	releaseBoundRemote(t, f, link)
 	go func() {
 		defer wg.Done()
 		<-start
@@ -274,6 +286,7 @@ func TestResolveRemoteRunNewReservationReprotectsTerminalRoot(t *testing.T) {
 	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: epoch.Add(time.Minute)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
+	releaseBoundRemote(t, f, a)
 	last, err := f.core.ResolveRemoteRun(f.ctx, a, model.RunRetentionPolicy{})
 	if err != nil || !last.Changed || !last.LastForRoot || !last.RootFound || last.RootFinishedAt.IsZero() {
 		t.Fatalf("last cut=%+v %v", last, err)
@@ -301,6 +314,7 @@ func TestResolveRemoteRunReportsCancellationVersusActualDurableEffect(t *testing
 		if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 			t.Fatal(err)
 		}
+		releaseBoundRemote(t, f, link)
 		ctx, cancel := context.WithCancel(f.ctx)
 		start := make(chan struct{})
 		done := make(chan struct{})
@@ -319,19 +333,21 @@ func TestResolveRemoteRunReportsCancellationVersusActualDurableEffect(t *testing
 			cancel()
 		}
 		<-done
-		pending, pendingErr := f.core.HasPendingRemoteRoot(f.ctx, "root")
-		if pendingErr != nil {
-			t.Fatal(pendingErr)
+		var present bool
+		if err := f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {
+			return tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=? AND child_run_id=?)`, engine.ScopeID(f.scope), link.OwnerRunID, link.RunID).Scan(&present)
+		}); err != nil {
+			t.Fatal(err)
 		}
 		if err == nil {
 			committed++
-			if !result.Changed || !result.LastForRoot || pending {
-				t.Fatalf("successful commit disagrees with stored relation: %+v pending=%v", result, pending)
+			if !result.Changed || !result.LastForRoot || present {
+				t.Fatalf("successful commit disagrees with stored relation: %+v present=%v", result, present)
 			}
 		} else {
 			canceled++
-			if errCode(err) != "cancelled" || result != (model.RemoteRunResolveResult{}) || !pending {
-				t.Fatalf("canceled request changed relation or returned facts: %+v pending=%v err=%v", result, pending, err)
+			if errCode(err) != "cancelled" || result != (model.RemoteRunResolveResult{}) || !present {
+				t.Fatalf("canceled request changed relation or returned facts: %+v present=%v err=%v", result, present, err)
 			}
 			if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 				t.Fatal(err)
@@ -351,6 +367,7 @@ func TestResolveRemoteRunOneIntentReturnsOwnershipToBaseline(t *testing.T) {
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
+	releaseBoundRemote(t, f, link)
 	before := stats(t, f)
 	result, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{})
 	if err != nil || !result.Changed || !result.LastForRoot || !result.RootFound {
@@ -389,6 +406,7 @@ func TestResolveRemoteRunRacesNewReservationWithoutLosingProtection(t *testing.T
 		var resolved model.RemoteRunResolveResult
 		var resolveErr, reserveErr error
 		wg.Add(2)
+		releaseBoundRemote(t, f, a)
 		go func() {
 			defer wg.Done()
 			<-start
@@ -406,6 +424,7 @@ func TestResolveRemoteRunRacesNewReservationWithoutLosingProtection(t *testing.T
 		if pending, err := f.core.HasPendingRemoteRoot(f.ctx, "root"); err != nil || !pending {
 			t.Fatalf("new reservation not protected: %v %v", pending, err)
 		}
+		releaseBoundRemote(t, f, b)
 		if _, err := f.core.ResolveRemoteRun(f.ctx, b, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}

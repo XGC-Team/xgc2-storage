@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
@@ -36,7 +37,17 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 		}
 		add := func(link model.RemoteRunLink) {
 			t.Helper()
-			if _, err := changeRemoteRun(ctx, tx, testScope, link, false, nil); err != nil {
+			if _, err := changeRemoteRun(ctx, tx, testScope, link, remoteReserve, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		release := func(link model.RemoteRunLink) {
+			t.Helper()
+			settled := model.RemoteRunSettlement{Disposition: "succeeded", FinishedAt: time.Unix(1, 0)}
+			if _, err := settleRemoteRun(ctx, tx, testScope, link, settled, nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := markRemoteRunReleased(ctx, tx, testScope, link, time.Unix(2, 0), nil); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -50,6 +61,7 @@ func TestRemoteResolutionUsesOnlyCausalIndexedFacts(t *testing.T) {
 		}
 		for _, link := range links {
 			add(link)
+			release(link)
 		}
 		for i := 0; i < unrelated; i++ {
 			id := fmt.Sprintf("unrelated-%03d", i)
@@ -139,7 +151,13 @@ func TestRemoteResolutionRollbackRestoresLinkAndQuota(t *testing.T) {
 		t.Fatal(err)
 	}
 	link := model.RemoteRunLink{OwnerRunID: "root", RootRunID: "root", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot"}
-	if _, err = changeRemoteRun(ctx, tx, testScope, link, false, nil); err != nil {
+	if _, err = changeRemoteRun(ctx, tx, testScope, link, remoteReserve, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = settleRemoteRun(ctx, tx, testScope, link, model.RemoteRunSettlement{Disposition: "succeeded", FinishedAt: time.Unix(1, 0)}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = markRemoteRunReleased(ctx, tx, testScope, link, time.Unix(2, 0), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err = tx.Commit(); err != nil {

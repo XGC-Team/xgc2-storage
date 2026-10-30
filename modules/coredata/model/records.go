@@ -63,11 +63,15 @@ type Run struct {
 	Nodes             json.RawMessage `json:"nodes,omitempty"`
 	CleanupErrors     json.RawMessage `json:"cleanup_errors,omitempty"`
 	CleanupFailed     int             `json:"cleanup_failed,omitempty"`
-	Projection        RunProjection   `json:"-"`
-	CreatedAt         time.Time       `json:"created_at"`
-	StartedAt         time.Time       `json:"started_at,omitzero"`
-	FinishedAt        time.Time       `json:"finished_at,omitzero"`
-	Revision          int64           `json:"revision"`
+	// IncomingHold is the typed incoming control relation stamped at
+	// admission when the Run was accepted as another engine's child. Empty
+	// TargetID means the Run has no incoming hold.
+	IncomingHold IncomingRemoteHold `json:"incoming_hold,omitempty"`
+	Projection   RunProjection      `json:"-"`
+	CreatedAt    time.Time          `json:"created_at"`
+	StartedAt    time.Time          `json:"started_at,omitzero"`
+	FinishedAt   time.Time          `json:"finished_at,omitzero"`
+	Revision     int64              `json:"revision"`
 }
 
 // NewRun accepts a Run. RootRunID defaults to ID and Status to queued. A
@@ -92,6 +96,11 @@ type NewRun struct {
 	SourceObservation  json.RawMessage
 	Status             RunStatus
 	At                 time.Time
+	// IncomingHold stamps the authenticated caller's target and boot when
+	// this Run is admitted as another engine's child. It is written
+	// atomically with the Run; an idempotent retry can never recreate a
+	// released hold. Released must be false: a hold is created active.
+	IncomingHold IncomingRemoteHold
 }
 
 // RunStatusUpdate moves an open Run to running or stopping.

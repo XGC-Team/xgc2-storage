@@ -210,10 +210,11 @@ func TestRemoteSessionProjectionChargedAndReleasedExactly(t *testing.T) {
 	}
 	beforeRows, beforeBytes := usageRows(t, f)
 	link := remoteLink(q.ID, q.ID, "remote")
+	link.Phase = model.RemoteRunOpen
 	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := json.Marshal([]model.RemoteRunLink{link})
+	encoded, err := json.Marshal([]model.RemoteRunLink{fundedRemoteLink(link)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -228,6 +229,7 @@ func TestRemoteSessionProjectionChargedAndReleasedExactly(t *testing.T) {
 	}); err != nil || stored != q.SessionID {
 		t.Fatalf("relation Session selector=%q %v", stored, err)
 	}
+	releaseBoundRemote(t, f, link)
 	if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
