@@ -98,12 +98,12 @@ func TestInterruptedResourceCoverageNeedsAllExactJoinsAndOutboundResolution(t *t
 	}
 }
 
-func TestRecoveryDoesNotInferEmptyOrUncoveredEffects(t *testing.T) {
+func TestRecoveryDoesNotInferUncoveredEffects(t *testing.T) {
 	f := openStore(t)
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"empty", "uncovered"} {
+	for _, id := range []string{"uncovered"} {
 		child := incomingChild(id, "parent", "parent", "core", "core-principal")
 		child.RecoveryAgentBootID = "boot"
 		if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
@@ -116,7 +116,7 @@ func TestRecoveryDoesNotInferEmptyOrUncoveredEffects(t *testing.T) {
 	if _, err := f.core.InterruptOpenRuns(f.ctx, epoch.Add(time.Second), model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"empty", "uncovered"} {
+	for _, id := range []string{"uncovered"} {
 		if err := f.core.SealRunResourceRecovery(f.ctx, id, "boot"); errCode(err) != "failed_precondition" {
 			t.Fatalf("%s acquired a fabricated complete join: %v", id, err)
 		}

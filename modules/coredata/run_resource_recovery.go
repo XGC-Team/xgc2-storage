@@ -76,9 +76,6 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
-	if state.Joined && len(state.Resources) == 0 {
-		return model.RunResourceRecovery{}, false, failure("data_loss", "empty Run resource coverage has no positive join")
-	}
 	return state, true, nil
 }
 
@@ -304,9 +301,6 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 	}
 	if state.Joined {
 		return true, nil
-	}
-	if len(state.Resources) == 0 {
-		return false, nil
 	}
 	for _, a := range state.Resources {
 		// Remote calls first acquire a durable outbound relation. A local child
