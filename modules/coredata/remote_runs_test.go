@@ -321,7 +321,11 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 		link := page.Links[0]
 		seen[link.RunID] = true
 		releaseBoundRemote(t, f, link)
-		if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
+		resolve := f.core.ResolveRemoteRun
+		if link.BootID == "" {
+			resolve = f.core.ResolveUnsentRemoteRun
+		}
+		if _, err = resolve(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
 		if page.Next == "" {
@@ -338,7 +342,11 @@ func TestPendingRemoteMixedOwnerCursorAndExactQuota(t *testing.T) {
 	}
 	for _, link := range other.Links {
 		releaseBoundRemote(t, f, link)
-		if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
+		resolve := f.core.ResolveRemoteRun
+		if link.BootID == "" {
+			resolve = f.core.ResolveUnsentRemoteRun
+		}
+		if _, err = resolve(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -389,14 +397,14 @@ func TestPendingRemoteCancellationAndQuotaRollback(t *testing.T) {
 		t.Fatalf("failed boot binding changed authority: %+v %v", page, err)
 	}
 	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, bytes, engine.ScopeID(f.scope))
-	if _, err = f.core.ResolveRemoteRun(ctx, link, model.RunRetentionPolicy{}); err == nil {
+	if _, err = f.core.ResolveUnsentRemoteRun(ctx, link, model.RunRetentionPolicy{}); err == nil {
 		t.Fatal("canceled resolve succeeded")
 	}
 	page, err = f.core.ListPendingRemoteRuns(f.ctx, "agent", "", 1)
 	if err != nil || len(page.Links) != 1 {
 		t.Fatalf("canceled resolve removed relation: %+v %v", page, err)
 	}
-	if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
+	if _, err = f.core.ResolveUnsentRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	gotRows, gotBytes = usageRows(t, f)
@@ -536,7 +544,7 @@ func TestPendingRemoteBootBindRacesUnboundResolve(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			_, resolveErr = f.core.ResolveRemoteRun(f.ctx, unbound, model.RunRetentionPolicy{})
+			_, resolveErr = f.core.ResolveUnsentRemoteRun(f.ctx, unbound, model.RunRetentionPolicy{})
 		}()
 		close(start)
 		wg.Wait()
@@ -575,7 +583,7 @@ func TestPendingRemoteMissingRootStillProtectsOwner(t *testing.T) {
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatalf("missing root permitted owner retirement: %+v %v", pruned, err)
 	}
-	if _, err := f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
+	if _, err := f.core.ResolveUnsentRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour)})
@@ -638,10 +646,16 @@ func TestReadRemoteRunLinkSelectsExactRelationAmongUnrelatedOwners(t *testing.T)
 
 	// Supplied identity fields are verified; absence and mismatch keep the
 	// settle/release semantics.
-	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-a", TargetID: "agent", RunID: "missing"}); return e }()); code != "not_found" {
+	if code := errCode(func() error {
+		_, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-a", TargetID: "agent", RunID: "missing"})
+		return e
+	}()); code != "not_found" {
 		t.Fatalf("absent relation: %s", code)
 	}
-	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-b", TargetID: "agent", RunID: "remote-a1"}); return e }()); code != "not_found" {
+	if code := errCode(func() error {
+		_, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{OwnerRunID: "owner-b", TargetID: "agent", RunID: "remote-a1"})
+		return e
+	}()); code != "not_found" {
 		t.Fatalf("relation under an unrelated owner: %s", code)
 	}
 	mismatched := a2
@@ -654,7 +668,10 @@ func TestReadRemoteRunLinkSelectsExactRelationAmongUnrelatedOwners(t *testing.T)
 	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, mismatched); return e }()); code != "failed_precondition" {
 		t.Fatalf("mismatched boot: %s", code)
 	}
-	if code := errCode(func() error { _, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{TargetID: "agent", RunID: "remote-a1"}); return e }()); code != "invalid_argument" {
+	if code := errCode(func() error {
+		_, e := f.core.ReadRemoteRunLink(f.ctx, model.RemoteRunLink{TargetID: "agent", RunID: "remote-a1"})
+		return e
+	}()); code != "invalid_argument" {
 		t.Fatalf("missing natural key: %s", code)
 	}
 

@@ -94,8 +94,8 @@ func TestTypedRemoteHeldDeleteDoesNotExposeAttemptBeforeJoin(t *testing.T) {
 	if err != nil || !fact.NonCommitted || fact.Released || fact.Retention != (model.RunRetentionEffect{}) {
 		t.Fatalf("joined callback fact: %+v %v", fact, err)
 	}
-	if pending, err := store.HasPendingRemoteRoot(t.Context(), link.RootRunID); err != nil || !pending {
-		t.Fatalf("rolled-back remote link: %t %v", pending, err)
+	if current, err := store.ReadRemoteRunLink(t.Context(), link); err != nil || current.Phase != model.RemoteRunReleased {
+		t.Fatalf("rolled-back exact remote link: %+v %v", current, err)
 	}
 }
 
@@ -144,8 +144,8 @@ func TestTypedRemoteHeldDeleteAndFailedCloseRetainOriginalOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending, err := current.HasPendingRemoteRoot(ctx, link.RootRunID); err != nil || !pending {
-		t.Fatalf("joined rollback lost relation: pending=%t %v", pending, err)
+	if retained, err := current.ReadRemoteRunLink(ctx, link); err != nil || retained.Phase != model.RemoteRunReleased {
+		t.Fatalf("joined rollback lost exact relation: %+v %v", retained, err)
 	}
 }
 
@@ -286,7 +286,7 @@ func TestTypedReserveHeldBindKeepsValidatedPriorBoot(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call"}
+	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call", Phase: model.RemoteRunOpen}
 	if err := store.ReserveRemoteRun(ctx, unbound); err != nil {
 		t.Fatal(err)
 	}

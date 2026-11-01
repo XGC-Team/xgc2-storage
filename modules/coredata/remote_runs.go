@@ -168,6 +168,7 @@ type RemoteRunFaultFact struct {
 	RootFound        bool
 	RootFinishedAt   time.Time
 	OwnerFinishedAt  time.Time
+	RecoveredOwner   *model.Run
 	Retention        model.RunRetentionEffect
 }
 
@@ -224,6 +225,7 @@ func (s *remoteFaultState) probe(ctx context.Context, tx *sql.Tx, possibleCommit
 	out.LastForOwner, out.LastForRoot = s.candidate.LastForOwner, s.candidate.LastForRoot
 	out.RootFound = s.candidate.RootFound
 	out.RootFinishedAt, out.OwnerFinishedAt = s.candidate.RootFinishedAt, s.candidate.OwnerFinishedAt
+	out.RecoveredOwner = s.candidate.RecoveredOwner
 	if s.candidate.Retention.EligibilityReleased {
 		cut := retentionChanges{released: true}
 		out.Retention, err = retentionEffect(ctx, tx, s.scope, &cut, s.policy)
@@ -260,6 +262,19 @@ func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link 
 	if !result.LastForOwner {
 		// Other relations of this owner necessarily share its validated root.
 		return result, nil
+	}
+	if detail.ownerRecoveryTracked && detail.ownerFinishedAt > 0 {
+		sealed, err := sealRunResourceRecovery(ctx, tx, scope, link.OwnerRunID, "")
+		if err != nil {
+			return model.RemoteRunResolveResult{}, err
+		}
+		if sealed {
+			owner, err := scanRun(tx.QueryRowContext(ctx, "SELECT "+runObservationColumns+" FROM runs WHERE scope=? AND id=?", scope, link.OwnerRunID), model.RunObservation)
+			if err != nil {
+				return model.RemoteRunResolveResult{}, err
+			}
+			result.RecoveredOwner = &owner
+		}
 	}
 	var rootFinished sql.NullInt64
 	err = tx.QueryRowContext(ctx, remoteRunLastResolutionQuery,
@@ -438,6 +453,7 @@ func (s *remoteReserveFaultState) probe(ctx context.Context, tx *sql.Tx, possibl
 type remoteRunChangeDetail struct {
 	remaining            int
 	ownerFinishedAt      int64
+	ownerRecoveryTracked bool
 	inserted             bool
 	firstOwnerRelation   bool
 	validatedAttempt     bool
@@ -456,7 +472,8 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 	var root, target, status string
 	var count int
 	var total, finishedAt, sessionBytes int64
-	err := tx.QueryRowContext(ctx, `SELECT root_run_id,target_id,status,pending_remote_count,pending_remote_bytes,finished_at,length(CAST(session_id AS BLOB)) FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID).Scan(&root, &target, &status, &count, &total, &finishedAt, &sessionBytes)
+	var recoveryTracked bool
+	err := tx.QueryRowContext(ctx, `SELECT root_run_id,target_id,status,pending_remote_count,pending_remote_bytes,finished_at,length(CAST(session_id AS BLOB)),length(resource_recovery_json)>0 FROM runs WHERE scope=? AND id=?`, scope, link.OwnerRunID).Scan(&root, &target, &status, &count, &total, &finishedAt, &sessionBytes, &recoveryTracked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, failure("not_found", "remote control owner is unavailable")
 	}
@@ -504,6 +521,8 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 				return false, failure("failed_precondition", "a bound remote relation is not unsent")
 			case op == remoteResolveUnsent && current.Phase != model.RemoteRunOpen:
 				return false, failure("failed_precondition", "a settled or released remote relation is no longer unsent")
+			case op == remoteResolve && existingBoot == "":
+				return false, failure("failed_precondition", "an unbound relation requires a no-send proof")
 			case op == remoteResolve && existingBoot != "" && current.Phase != model.RemoteRunReleased:
 				// A bound relation owes the callee's incoming hold its release.
 				// Definitively-unsent reservations stay unbound and resolve
@@ -544,7 +563,7 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 				return false, failure("data_loss", "remote ownership count disagrees with relations")
 			}
 			if err == nil && detail != nil {
-				detail.remaining, detail.ownerFinishedAt = count-1, finishedAt
+				detail.remaining, detail.ownerFinishedAt, detail.ownerRecoveryTracked = count-1, finishedAt, recoveryTracked
 			}
 			return true, err
 		}

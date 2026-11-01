@@ -66,7 +66,7 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != state.AgentBootID || resource.Join.Kind != resource.Kind || resource.Kind == "uncovered-effect") {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource join")
 		}
-		if state.Joined && resource.Join == nil {
+		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
@@ -77,7 +77,7 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 }
 
 func validateRecoveryAdmission(a model.RunResourceAdmission) error {
-	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "uncovered-effect") {
+	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "workflow-call" && a.Kind != "uncovered-effect") {
 		return failure("invalid_argument", "exact resource ID, node ID and supported kind are required")
 	}
 	return nil
@@ -278,7 +278,10 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 		return false, nil
 	}
 	for _, a := range state.Resources {
-		if a.Join == nil {
+		// Every remote child of a workflow.call must first acquire a durable
+		// outbound relation. A local child is separately recorded as uncovered
+		// until its own exact join has a durable owner.
+		if a.Kind != "workflow-call" && a.Join == nil {
 			return false, nil
 		}
 	}

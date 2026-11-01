@@ -34,12 +34,18 @@ func TestRemoteResolutionCancellationRetainsExactCommitAttempt(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, model.NewRun{ID: "root", TargetID: "core", WorkflowResourceID: "wf", WorkflowCommitID: "commit", DefinitionDigest: "digest", ActionID: "run", Inputs: []byte(`{}`), Trigger: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	link := model.RemoteRunLink{OwnerRunID: "root", RootRunID: "root", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot"}
+	link := model.RemoteRunLink{OwnerRunID: "root", RootRunID: "root", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen}
 	if err := store.ReserveRemoteRun(ctx, link); err != nil {
 		t.Fatal(err)
 	}
 	finishedAt := time.Date(2026, 10, 29, 1, 0, 0, 0, time.UTC)
 	if _, err := store.FinishRun(ctx, model.RunFinish{ID: "root", Status: model.RunCanceled, At: finishedAt}, model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SettleRemoteRun(ctx, link, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRemoteRunReleased(ctx, link, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	entered, release := engine.GateNextCommitForModuleTest(t, db)

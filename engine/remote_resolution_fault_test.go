@@ -36,11 +36,19 @@ func remoteSettlementFixture(t *testing.T) (*engine.Store, *coredata.Store, engi
 	if _, _, err = store.CreateRun(t.Context(), model.NewRun{ID: "root", TargetID: "core", WorkflowResourceID: "wf", WorkflowCommitID: "commit", DefinitionDigest: "digest", ActionID: "run", Inputs: []byte(`{}`), Trigger: []byte(`{}`)}); err != nil {
 		t.Fatal(err)
 	}
-	link := model.RemoteRunLink{OwnerRunID: "root", RootRunID: "root", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot"}
+	link := model.RemoteRunLink{OwnerRunID: "root", RootRunID: "root", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen}
 	if err = store.ReserveRemoteRun(t.Context(), link); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = store.FinishRun(t.Context(), model.RunFinish{ID: "root", Status: model.RunCanceled, At: time.Now().UTC()}, model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	// These tests exercise the final durable DELETE, so the fixture must
+	// first supply the real terminal and incoming-hold release evidence.
+	if _, err = store.SettleRemoteRun(t.Context(), link, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.MarkRemoteRunReleased(t.Context(), link, time.Now().UTC()); err != nil {
 		t.Fatal(err)
 	}
 	return db, store, cfg, scope, link
@@ -86,8 +94,8 @@ func TestRemoteResolutionUnknownAfterRealCommitRetainsAttempt(t *testing.T) {
 	if after.Calls-before.Calls != 1 || after.WritersQueued != 0 || after.ReadersActive != 0 {
 		t.Fatalf("unknown write did not join: before=%+v after=%+v", before, after)
 	}
-	if pending, err := store.HasPendingRemoteRoot(t.Context(), link.RootRunID); err != nil || pending {
-		t.Fatalf("real commit did not delete relation: pending=%v %v", pending, err)
+	if _, err := store.ReadRemoteRunLink(t.Context(), link); err == nil {
+		t.Fatal("real commit did not delete the exact relation")
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -148,8 +156,8 @@ func TestRemoteResolutionWrongBootRollbackFailureHasNoAttempt(t *testing.T) {
 	if e != nil || !fact.NonCommitted || fact.ValidatedAttempt || fact.Released {
 		t.Fatalf("wrong identity rollback fact: %+v %v", fact, e)
 	}
-	if pending, e := store.HasPendingRemoteRoot(t.Context(), link.RootRunID); e != nil || !pending {
-		t.Fatalf("wrong identity removed the real link: pending=%v %v", pending, e)
+	if current, e := store.ReadRemoteRunLink(t.Context(), link); e != nil || current.Phase != model.RemoteRunReleased {
+		t.Fatalf("wrong identity removed the exact released relation: %+v %v", current, e)
 	}
 }
 
@@ -175,8 +183,8 @@ func TestRemoteResolutionFailedDeleteAttemptDoesNotAssertRelease(t *testing.T) {
 	if waitErr != nil || !fact.NonCommitted || !fact.ValidatedAttempt || fact.Released {
 		t.Fatalf("failed DELETE rollback fact: %+v %v", fact, waitErr)
 	}
-	if pending, err := store.HasPendingRemoteRoot(t.Context(), link.RootRunID); err != nil || !pending {
-		t.Fatalf("failed DELETE did not retain protection: pending=%v %v", pending, err)
+	if current, err := store.ReadRemoteRunLink(t.Context(), link); err != nil || current.Phase != model.RemoteRunReleased {
+		t.Fatalf("failed DELETE lost the exact relation: %+v %v", current, err)
 	}
 	if err := db.Write(t.Context(), engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `DROP TRIGGER injected_delete_failure`)
@@ -215,8 +223,8 @@ func TestRemoteResolutionUnjoinedRollbackFencesRevalidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pending, err := store.HasPendingRemoteRoot(t.Context(), link.RootRunID); err != nil || !pending {
-		t.Fatalf("joined reopen lost real protection: pending=%v error=%v", pending, err)
+	if retained, err := store.ReadRemoteRunLink(t.Context(), link); err != nil || retained.Phase != model.RemoteRunReleased {
+		t.Fatalf("joined reopen lost exact relation: %+v error=%v", retained, err)
 	}
 }
 
@@ -241,4 +249,48 @@ func TestRemoteResolutionValidationAndNormalOwnerWork(t *testing.T) {
 		t.Fatalf("normal release changed work shape: before=%+v after=%+v", afterRefusal, after)
 	}
 	t.Logf("normal release: +1 owner call, +1 durable, no extra reader, joined readers/writers=0/0")
+}
+
+func TestNestedOwnerRecoveryNoticeSurvivesLostResolutionReply(t *testing.T) {
+	db, store, _, _, _ := remoteSettlementFixture(t)
+	ctx := t.Context()
+	parent := model.NewRun{ID: "nested-parent", TargetID: "agent-parent", RootRunID: "root", ParentRunID: "root", CallNodeID: "outer", Depth: 1,
+		WorkflowResourceID: "wf", WorkflowCommitID: "commit", DefinitionDigest: "digest", ActionID: "run", Inputs: []byte(`{}`), Trigger: []byte(`{}`),
+		IncomingHold: model.IncomingRemoteHold{TargetID: "core", PrincipalID: "core-principal"}, RecoveryAgentBootID: "old-parent-boot"}
+	if _, _, err := store.CreateRun(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AdmitRunResource(ctx, parent.ID, parent.RecoveryAgentBootID, model.RunResourceAdmission{ID: "call-admission", NodeID: "call", Kind: "workflow-call"}); err != nil {
+		t.Fatal(err)
+	}
+	link := model.RemoteRunLink{OwnerRunID: parent.ID, RootRunID: "root", TargetID: "agent-grandchild", RunID: "nested-child", CallNodeID: "call", BootID: "old-grandchild-boot"}
+	if err := store.ReserveRemoteRun(ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InterruptOpenRuns(ctx, time.Now().UTC(), model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SettleRemoteRun(ctx, link, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRemoteRunReleased(ctx, link, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	engine.InjectCommitAfterForModuleTest(t, db)
+	if _, err := store.ResolveRemoteRun(ctx, link, model.RunRetentionPolicy{}); err == nil {
+		t.Fatal("expected a lost reply after the real commit")
+	} else {
+		var fault *coredata.RemoteRunResolveError
+		if !errors.As(err, &fault) {
+			t.Fatalf("missing exact resolution fault: %v", err)
+		}
+		fact, err := fault.WaitRevalidation(ctx)
+		if err != nil || !fact.ValidatedAttempt || !fact.Released || fact.RecoveredOwner == nil || fact.RecoveredOwner.ID != parent.ID || fact.RecoveredOwner.Status != model.RunInterrupted {
+			t.Fatalf("lost reply discarded the exact owner notification: %+v %v", fact, err)
+		}
+	}
+	state, found, err := store.GetRunResourceRecovery(ctx, parent.ID)
+	if err != nil || !found || !state.Joined {
+		t.Fatalf("actual parent receipt was not durable: %+v %v %v", state, found, err)
+	}
 }

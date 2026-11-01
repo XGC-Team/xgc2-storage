@@ -95,6 +95,16 @@ func releaseIncomingRun(ctx context.Context, tx *sql.Tx, scope, runID string, wa
 	if cleanupFailed != 0 {
 		return false, failure("failed_precondition", "the incoming child Run still reports failed cleanup")
 	}
+	// Terminal business status does not join a nested remote call. Check the
+	// child's exact outbound owner in this same transaction; new relations
+	// cannot be admitted after its status becomes terminal.
+	var pending bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=?)`, scope, runID).Scan(&pending); err != nil {
+		return false, err
+	}
+	if pending {
+		return false, failure("failed_precondition", "the incoming child Run still owns a remote call")
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE runs SET incoming_hold_released=1 WHERE scope=? AND id=?`, scope, runID); err != nil {
 		return false, err
 	}

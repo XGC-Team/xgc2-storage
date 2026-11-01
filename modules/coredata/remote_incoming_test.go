@@ -357,7 +357,7 @@ func TestSettleRemoteRunGatesBoundRelation(t *testing.T) {
 		t.Fatalf("unbound reservation settled: %v", err)
 	}
 	// The unbound reservation still resolves directly; it provably sent no Start.
-	if _, err := f.core.ResolveRemoteRun(f.ctx, unbound, model.RunRetentionPolicy{}); err != nil {
+	if _, err := f.core.ResolveUnsentRemoteRun(f.ctx, unbound, model.RunRetentionPolicy{}); err != nil {
 		t.Fatalf("unsent reservation blocked: %v", err)
 	}
 

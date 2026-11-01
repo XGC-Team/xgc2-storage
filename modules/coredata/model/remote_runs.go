@@ -96,14 +96,17 @@ type IncomingRunRelease struct {
 // These are facts at the transaction cut, not a promise that later writes
 // cannot create a new relation or otherwise protect history.
 type RemoteRunResolveResult struct {
-	RootRunID       string             `json:"rootRunId"`
-	Changed         bool               `json:"changed"`
-	LastForOwner    bool               `json:"lastForOwner"`
-	LastForRoot     bool               `json:"lastForRoot"`
-	RootFound       bool               `json:"rootFound"`
-	RootFinishedAt  time.Time          `json:"rootFinishedAt,omitzero"`
-	OwnerFinishedAt time.Time          `json:"ownerFinishedAt,omitzero"`
-	Retention       RunRetentionEffect `json:"retention"`
+	RootRunID       string    `json:"rootRunId"`
+	Changed         bool      `json:"changed"`
+	LastForOwner    bool      `json:"lastForOwner"`
+	LastForRoot     bool      `json:"lastForRoot"`
+	RootFound       bool      `json:"rootFound"`
+	RootFinishedAt  time.Time `json:"rootFinishedAt,omitzero"`
+	OwnerFinishedAt time.Time `json:"ownerFinishedAt,omitzero"`
+	// RecoveredOwner is the bounded observation of this exact owner only when
+	// this resolution durably sealed its interrupted resource coverage.
+	RecoveredOwner *Run               `json:"recoveredOwner,omitempty"`
+	Retention      RunRetentionEffect `json:"retention"`
 }
 
 type RemoteRunPage struct {

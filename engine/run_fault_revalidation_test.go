@@ -314,7 +314,7 @@ func TestRemoteFaultNonfinalOwnerRevalidatesOnlyReleasedPolicy(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	linkA := model.RemoteRunLink{OwnerRunID: a.ID, RootRunID: root.ID, TargetID: "agent", RunID: "remote-a", CallNodeID: "call", BootID: "boot"}
+	linkA := model.RemoteRunLink{OwnerRunID: a.ID, RootRunID: root.ID, TargetID: "agent", RunID: "remote-a", CallNodeID: "call", BootID: "boot", Phase: model.RemoteRunOpen}
 	linkB := model.RemoteRunLink{OwnerRunID: b.ID, RootRunID: root.ID, TargetID: "agent", RunID: "remote-b", CallNodeID: "call", BootID: "boot"}
 	for _, link := range []model.RemoteRunLink{linkA, linkB} {
 		if err := store.ReserveRemoteRun(ctx, link); err != nil {
@@ -325,6 +325,12 @@ func TestRemoteFaultNonfinalOwnerRevalidatesOnlyReleasedPolicy(t *testing.T) {
 		if _, err := store.FinishRun(ctx, model.RunFinish{ID: id, Status: model.RunSucceeded, At: at.Add(time.Minute)}, model.RunRetentionPolicy{}); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if _, err := store.SettleRemoteRun(ctx, linkA, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRemoteRunReleased(ctx, linkA, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 	policy := model.RunRetentionPolicy{OlderThan: at.Add(time.Hour)}
 	engine.InjectCommitAfterForModuleTest(t, db)
@@ -411,8 +417,8 @@ func TestRemoteFaultCanceledCommitConfirmedRollbackHasNoRelease(t *testing.T) {
 	if err != nil || !fact.NonCommitted || fact.Released || fact.Retention != (model.RunRetentionEffect{}) {
 		t.Fatalf("rolled-back release manufactured a wake: %+v %v", fact, err)
 	}
-	if pending, err := store.HasPendingRemoteRoot(ctx, link.RootRunID); err != nil || !pending {
-		t.Fatalf("rolled-back release lost exact relation: pending=%t %v", pending, err)
+	if current, err := store.ReadRemoteRunLink(ctx, link); err != nil || current.Phase != model.RemoteRunReleased {
+		t.Fatalf("rolled-back release lost exact relation: %+v %v", current, err)
 	}
 }
 
@@ -437,7 +443,7 @@ func TestReserveFaultDistinguishesInsertBindAndBoundReplay(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "remote-child", CallNodeID: "call"}
+	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "remote-child", CallNodeID: "call", Phase: model.RemoteRunOpen}
 	attempt := func(link model.RemoteRunLink) coredata.RemoteRunReserveFact {
 		t.Helper()
 		engine.InjectCommitAfterForModuleTest(t, db)
@@ -474,7 +480,7 @@ func TestReserveFaultCanceledBindRollbackPreservesPriorBoot(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call"}
+	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call", Phase: model.RemoteRunOpen}
 	if err := store.ReserveRemoteRun(ctx, unbound); err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +512,7 @@ func TestReserveFaultFailedCloseJoinsBoundFactBeforeUnlock(t *testing.T) {
 	if _, _, err := store.CreateRun(ctx, owner); err != nil {
 		t.Fatal(err)
 	}
-	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call"}
+	unbound := model.RemoteRunLink{OwnerRunID: owner.ID, RootRunID: owner.ID, TargetID: "agent", RunID: "child", CallNodeID: "call", Phase: model.RemoteRunOpen}
 	if err := store.ReserveRemoteRun(ctx, unbound); err != nil {
 		t.Fatal(err)
 	}
@@ -538,6 +544,12 @@ func TestReserveFaultFailedCloseJoinsBoundFactBeforeUnlock(t *testing.T) {
 	defer reopened.Close()
 	current, err := coredata.New(reopened, scope)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.SettleRemoteRun(ctx, fact.Current, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := current.MarkRemoteRunReleased(ctx, fact.Current, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	result, err := current.ResolveRemoteRun(ctx, fact.Current, model.RunRetentionPolicy{})
