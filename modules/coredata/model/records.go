@@ -152,6 +152,10 @@ const (
 
 // RunFilter selects Runs newest first. Zero fields do not filter.
 type RunFilter struct {
+	ActionID     string
+	TerminalOnly bool
+	OverlapSince time.Time
+	OverlapUntil time.Time
 	// These select accepted Experiment invocation identity from the same-row source projection.
 	ExperimentResourceID string
 	WorkflowInstanceID   string

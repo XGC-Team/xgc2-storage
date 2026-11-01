@@ -4,3 +4,6 @@ package model
 // and error plus bounded observation metadata, without unrelated payloads.
 // It is returned by GetRunExecutionOutcome, not accepted as a list projection.
 const RunExecutionOutcome RunProjection = "execution-outcome"
+
+// RunExecutionInput is an exact-id input projection, not a list projection.
+const RunExecutionInput RunProjection = "execution-input"

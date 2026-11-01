@@ -154,7 +154,7 @@ func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) 
 		{nodes, model.MaxRunNodesBytes, &r.Nodes},
 		{cleanup, model.MaxRunCleanupErrorsBytes, &r.CleanupErrors},
 	} {
-		if r.Projection == model.RunObservation && field.target == &r.Error {
+		if (r.Projection == model.RunObservation || r.Projection == model.RunExecutionInput) && field.target == &r.Error {
 			r.Error = rawOrNil(field.stored)
 			continue
 		}
@@ -583,7 +583,7 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		}
 		where, args = append(where, "session_instance_id=?"), append(args, f.SessionInstanceID)
 	}
-	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID, "source_experiment_id": f.ExperimentResourceID, "source_instance_id": f.WorkflowInstanceID} {
+	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID, "action_id": f.ActionID, "source_experiment_id": f.ExperimentResourceID, "source_instance_id": f.WorkflowInstanceID} {
 		if value == "" {
 			continue
 		}
@@ -595,6 +595,23 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 			// The condition of the partial index on session_id.
 			where = append(where, "session_id<>''")
 		}
+	}
+	if f.TerminalOnly {
+		if len(f.Statuses) > 0 {
+			return "", nil, 0, failure("invalid_argument", "terminal and explicit status filters are exclusive")
+		}
+		where = append(where, "finished_at>0 AND status IN ('succeeded','failed','stopped','canceled','interrupted')")
+	}
+	if !f.OverlapSince.IsZero() && !f.OverlapUntil.IsZero() && !f.OverlapSince.Before(f.OverlapUntil) {
+		return "", nil, 0, failure("invalid_argument", "overlap interval must have from before to")
+	}
+	if !f.OverlapUntil.IsZero() {
+		where = append(where, "created_at<? AND (CASE WHEN started_at>0 THEN started_at ELSE created_at END)<?")
+		args = append(args, nanos(f.OverlapUntil), nanos(f.OverlapUntil))
+	}
+	if !f.OverlapSince.IsZero() {
+		where = append(where, "(finished_at=0 OR finished_at>?)")
+		args = append(args, nanos(f.OverlapSince))
 	}
 	if len(f.Statuses) > 0 {
 		marks, open := make([]string, len(f.Statuses)), true
