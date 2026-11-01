@@ -1,14 +1,21 @@
 package model
 
-// RunResourceRecovery is the current-format control fact for one incoming
-// remote Run. It is separate from the public node outcome and is absent for
-// historical Runs whose effect admissions were not recorded.
+// RunResourceRecovery is the current-format control fact for an incoming Run
+// or its exactly admitted local child. It is separate from the public node
+// outcome and absent for historical Runs whose effects were not recorded.
 type RunResourceRecovery struct {
 	AgentBootID          string                       `json:"agentBootId"`
 	Resources            []RunResourceAdmission       `json:"resources"`
 	Joined               bool                         `json:"joined"`
 	TrackRemoteProviders bool                         `json:"trackRemoteProviders,omitempty"`
 	RemoteProviders      []RunRemoteProviderSelection `json:"remoteProviders,omitempty"`
+}
+
+// RunRecoveryTransition carries exact newly completed callers and the
+// ordinary retention effect of the same durable transition.
+type RunRecoveryTransition struct {
+	Recovered []Run
+	Retention RunRetentionEffect
 }
 
 // RunRemoteProviderSelection is the exact provider admitted on the
@@ -25,12 +32,15 @@ type RunRemoteProviderSelection struct {
 }
 
 // RunResourceAdmission precedes a local effect. An admission is never a join:
-// only the exact process owner's subsequent proof can fill Join.
+// only the exact process owner can fill Join, and only the exact local Run
+// owner can record the separate physical and complete child joins.
 type RunResourceAdmission struct {
-	ID     string           `json:"id"`
-	NodeID string           `json:"nodeId"`
-	Kind   string           `json:"kind"`
-	Join   *RunResourceJoin `json:"join,omitempty"`
+	ID                  string           `json:"id"`
+	NodeID              string           `json:"nodeId"`
+	Kind                string           `json:"kind"`
+	Join                *RunResourceJoin `json:"join,omitempty"`
+	LocalPhysicalJoined bool             `json:"localPhysicalJoined,omitempty"`
+	LocalJoined         bool             `json:"localJoined,omitempty"`
 }
 
 // RunResourceJoin binds the physical owner's evidence to the exact admitted

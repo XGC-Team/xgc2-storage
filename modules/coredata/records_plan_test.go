@@ -196,6 +196,14 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 		// table traversal. Actual table scans still fail this assertion.
 		tablePlan := strings.ReplaceAll(detail, "SCAN local", "READ local scalar")
 		tablePlan = strings.ReplaceAll(tablePlan, "SCAN CONSTANT ROW", "READ constant row")
+		if name == "open runs at boot" {
+			// json_each walks only the bounded admitted resources on one exact
+			// parent, selected by the Run primary key. It is not a history scan.
+			if !strings.Contains(detail, "SEARCH owner USING INDEX sqlite_autoindex_runs_1 (scope=? AND id=?)") || !strings.Contains(detail, "SCAN admission VIRTUAL TABLE INDEX") {
+				t.Errorf("%s: missing exact local-owner resource read: %s", name, detail)
+			}
+			tablePlan = strings.ReplaceAll(tablePlan, "SCAN admission VIRTUAL TABLE INDEX", "READ exact owner resources VIRTUAL TABLE INDEX")
+		}
 		t.Logf("%s: %s", name, detail)
 		if kindPrefixes[name] && !strings.Contains(detail, "scope=? AND kind=?") {
 			t.Errorf("%s: missing exact Kind equality prefix: %s", name, detail)

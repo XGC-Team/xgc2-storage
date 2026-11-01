@@ -283,8 +283,15 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err := validateNewRun(&q); err != nil {
 		return model.Run{}, false, err
 	}
-	if q.RecoveryAgentBootID != "" && (!textKey(q.RecoveryAgentBootID) || !q.IncomingHold.Active()) {
-		return model.Run{}, false, failure("invalid_argument", "resource recovery requires an exact Agent boot and incoming hold")
+	if q.RecoveryAgentBootID != "" {
+		if !textKey(q.RecoveryAgentBootID) {
+			return model.Run{}, false, failure("invalid_argument", "resource recovery requires an exact Agent boot")
+		}
+		if !q.IncomingHold.Active() {
+			if err := validateLocalRecoveryChild(ctx, tx, scope, q); err != nil {
+				return model.Run{}, false, err
+			}
+		}
 	}
 	inputs, err := jsonField("inputs", q.Inputs, model.MaxRunInputsBytes, true, true)
 	if err != nil {
@@ -688,7 +695,7 @@ const (
  WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible,length(resource_recovery_json)>0`
 
 	// Recheck all active guards before deletion. An absent root is not live.
-	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND (r.incoming_remote_target_id='' OR r.incoming_hold_released<>0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
+	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND (r.incoming_remote_target_id='' OR r.incoming_hold_released<>0) AND (" + retentionLocalChildClear + ") AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
 	pruneOldest     = "SELECT finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT 1"
 	pruneCandidates = "SELECT id,bytes,finished_at FROM runs INDEXED BY runs_retention_eligible WHERE scope=? AND retention_eligible=1 ORDER BY finished_at,id LIMIT ?"
 )

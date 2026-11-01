@@ -156,19 +156,20 @@ func (e *RemoteRunResolveError) Unwrap() error { return e.cause }
 // whose exact relation is absent before any intervening writer. Phase is the
 // relation's durable settlement phase when RelationPresent.
 type RemoteRunFaultFact struct {
-	Link             model.RemoteRunLink
-	ValidatedAttempt bool
-	NonCommitted     bool
-	RelationPresent  bool
-	Phase            model.RemoteRunPhase
-	Released         bool
-	LastForOwner     bool
-	LastForRoot      bool
-	RootFound        bool
-	RootFinishedAt   time.Time
-	OwnerFinishedAt  time.Time
-	RecoveredOwner   *model.Run
-	Retention        model.RunRetentionEffect
+	Link               model.RemoteRunLink
+	ValidatedAttempt   bool
+	NonCommitted       bool
+	RelationPresent    bool
+	Phase              model.RemoteRunPhase
+	Released           bool
+	LastForOwner       bool
+	LastForRoot        bool
+	RootFound          bool
+	RootFinishedAt     time.Time
+	OwnerFinishedAt    time.Time
+	RecoveredOwner     *model.Run
+	RecoveredAncestors *[]model.Run
+	Retention          model.RunRetentionEffect
 }
 
 func (e *RemoteRunResolveError) WaitRevalidation(ctx context.Context) (RemoteRunFaultFact, error) {
@@ -225,6 +226,7 @@ func (s *remoteFaultState) probe(ctx context.Context, tx *sql.Tx, possibleCommit
 	out.RootFound = s.candidate.RootFound
 	out.RootFinishedAt, out.OwnerFinishedAt = s.candidate.RootFinishedAt, s.candidate.OwnerFinishedAt
 	out.RecoveredOwner = s.candidate.RecoveredOwner
+	out.RecoveredAncestors = s.candidate.RecoveredAncestors
 	if s.candidate.Retention.EligibilityReleased {
 		cut := retentionChanges{released: true}
 		out.Retention, err = retentionEffect(ctx, tx, s.scope, &cut, s.policy)
@@ -262,6 +264,7 @@ func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link 
 		// Other relations of this owner necessarily share its validated root.
 		return result, nil
 	}
+	var cut retentionChanges
 	if detail.ownerRecoveryTracked && detail.ownerFinishedAt > 0 {
 		sealed, err := sealRunResourceRecovery(ctx, tx, scope, link.OwnerRunID, "")
 		if err != nil {
@@ -273,6 +276,13 @@ func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link 
 				return model.RemoteRunResolveResult{}, err
 			}
 			result.RecoveredOwner = &owner
+		}
+		ancestors, err := completeLocalAncestors(ctx, tx, scope, link.OwnerRunID, &cut, false)
+		if err != nil {
+			return model.RemoteRunResolveResult{}, err
+		}
+		if len(ancestors) != 0 {
+			result.RecoveredAncestors = &ancestors
 		}
 	}
 	var rootFinished sql.NullInt64
@@ -293,7 +303,6 @@ func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link 
 		}
 		result.OwnerFinishedAt = instant(detail.ownerFinishedAt)
 	}
-	var cut retentionChanges
 	if detail.ownerFinishedAt > 0 {
 		cut.touch(link.OwnerRunID)
 	}

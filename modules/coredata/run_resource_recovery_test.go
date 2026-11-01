@@ -62,20 +62,20 @@ func TestInterruptedResourceCoverageNeedsAllExactJoinsAndOutboundResolution(t *t
 		func() model.RunResourceJoin { p := provider; p.AgentBootID = "replacement"; return p }(),
 		func() model.RunResourceJoin { p := provider; p.StartTicks = 0; return p }(),
 	} {
-		if err := f.core.JoinRunResource(f.ctx, wrong); errCode(err) != "failed_precondition" && errCode(err) != "invalid_argument" {
+		if _, err := f.core.JoinRunResource(f.ctx, wrong, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" && errCode(err) != "invalid_argument" {
 			t.Fatalf("foreign or incomplete proof accepted: %+v %v", wrong, err)
 		}
 	}
-	if err := f.core.JoinRunResource(f.ctx, provider); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, provider, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.core.JoinRunResource(f.ctx, provider); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, provider, model.RunRetentionPolicy{}); err != nil {
 		t.Fatalf("exact receipt replay: %v", err)
 	}
 	if err := f.core.SealRunResourceRecovery(f.ctx, "child", child.RecoveryAgentBootID); errCode(err) != "failed_precondition" {
 		t.Fatalf("one joined resource covered another: %v", err)
 	}
-	if err := f.core.JoinRunResource(f.ctx, proof("command", "prepare", 23)); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, proof("command", "prepare", 23), model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.core.SealRunResourceRecovery(f.ctx, "child", child.RecoveryAgentBootID); errCode(err) != "failed_precondition" {
@@ -122,7 +122,7 @@ func TestRecoveryDoesNotInferEmptyOrUncoveredEffects(t *testing.T) {
 		}
 	}
 	p := model.RunResourceJoin{RunID: "uncovered", NodeID: "remote-shell", ResourceID: "effect", Kind: "process", AgentBootID: "boot", Incarnation: "i", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 1, OwnerPID: 1, OwnerStartTicks: 1}
-	if err := f.core.JoinRunResource(f.ctx, p); errCode(err) != "failed_precondition" {
+	if _, err := f.core.JoinRunResource(f.ctx, p, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
 		t.Fatalf("an uncovered effect accepted a process proof: %v", err)
 	}
 }
@@ -185,7 +185,7 @@ func TestInterruptedAfterDurableResourceJoinSealsWithoutSourceReplay(t *testing.
 		t.Fatal(err)
 	}
 	proof := model.RunResourceJoin{RunID: child.ID, NodeID: "node", ResourceID: "p", Kind: "process", AgentBootID: "boot", Incarnation: "inc", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 3, OwnerPID: 1, OwnerStartTicks: 1}
-	if err := f.core.JoinRunResource(f.ctx, proof); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, proof, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	// The process source can already be retired after JoinRunResource commits.

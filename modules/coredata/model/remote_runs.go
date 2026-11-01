@@ -105,8 +105,11 @@ type RemoteRunResolveResult struct {
 	OwnerFinishedAt time.Time `json:"ownerFinishedAt,omitzero"`
 	// RecoveredOwner is the bounded observation of this exact owner only when
 	// this resolution durably sealed its interrupted resource coverage.
-	RecoveredOwner *Run               `json:"recoveredOwner,omitempty"`
-	Retention      RunRetentionEffect `json:"retention"`
+	RecoveredOwner *Run `json:"recoveredOwner,omitempty"`
+	// RecoveredAncestors are newly sealed local callers whose earlier physical
+	// join was waiting for this exact relation to close.
+	RecoveredAncestors *[]Run             `json:"recoveredAncestors,omitempty"`
+	Retention          RunRetentionEffect `json:"retention"`
 }
 
 type RemoteRunPage struct {

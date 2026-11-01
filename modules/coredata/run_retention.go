@@ -14,10 +14,23 @@ import (
 // successor Session). It is maintained on the exact Run whose owner, root-link
 // or predecessor relation changed. The group indexes let those two guards be
 // changed without visiting rows still protected by the other group guard.
+// An exact tracked local child is retained while its own admitted parent has
+// not joined it. The parent is selected by primary key; no history scan or
+// independent ownership table is needed.
+const retentionLocalChildClear = `NOT EXISTS (SELECT 1 FROM runs owner
+ WHERE owner.scope=r.scope AND owner.id=r.parent_run_id AND owner.target_id=r.target_id
+ AND length(owner.resource_recovery_json)>0 AND CASE
+ WHEN json_valid(CAST(owner.resource_recovery_json AS TEXT)) THEN EXISTS
+ (SELECT 1 FROM json_each(CAST(owner.resource_recovery_json AS TEXT),'$.resources') admission
+  WHERE json_extract(admission.value,'$.kind')='local-call'
+  AND json_extract(admission.value,'$.id')=r.id
+  AND coalesce(json_extract(admission.value,'$.localJoined'),0)=0)
+ ELSE 1 END)`
 const retentionPendingClear = `CASE WHEN r.pending_remote_count<>0 THEN 0
  WHEN r.incoming_remote_target_id<>'' AND r.incoming_hold_released=0 THEN 0
  WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) THEN 0
- WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) THEN 0 ELSE 1 END`
+ WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) THEN 0
+ WHEN NOT (` + retentionLocalChildClear + `) THEN 0 ELSE 1 END`
 const retentionLocal = `CASE WHEN (` + retentionPendingClear + `) THEN NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) ELSE 0 END`
 const retentionLocalPlanned = `CASE WHEN (` + retentionPendingClear + `) THEN NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0 AND (?15='' OR successor.id NOT IN (SELECT value FROM json_each(?15)))) ELSE 0 END`
 const retentionRootClear = `NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0)`

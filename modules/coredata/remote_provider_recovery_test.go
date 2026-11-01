@@ -185,7 +185,7 @@ func TestRemoteSelectionAndLocalResourceShareExactRunOwner(t *testing.T) {
 	}
 	proof := model.RunResourceJoin{RunID: child.ID, NodeID: "local", ResourceID: "local-process", Kind: "process", AgentBootID: child.RecoveryAgentBootID,
 		Incarnation: "local-incarnation", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 3, OwnerPID: 1, OwnerStartTicks: 1}
-	if err := f.core.JoinRunResource(f.ctx, proof); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, proof, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.core.InterruptOpenRuns(f.ctx, epoch.Add(time.Second), model.RunRetentionPolicy{}); err != nil {

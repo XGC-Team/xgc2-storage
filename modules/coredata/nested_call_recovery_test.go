@@ -40,7 +40,7 @@ func TestInterruptedNestedRemoteCallsSealOnlyAfterEveryExactChildJoins(t *testin
 	}
 	proof := model.RunResourceJoin{RunID: parent.ID, NodeID: "serve", ResourceID: "serve", Kind: "process", AgentBootID: parent.RecoveryAgentBootID,
 		Incarnation: "old-process", HostBootID: "os", PID: 23, PGID: 23, StartTicks: 31, OwnerPID: 1, OwnerStartTicks: 1}
-	if err := f.core.JoinRunResource(f.ctx, proof); err != nil {
+	if _, err := f.core.JoinRunResource(f.ctx, proof, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.core.SealRunResourceRecovery(f.ctx, parent.ID, parent.RecoveryAgentBootID); errCode(err) != "failed_precondition" {

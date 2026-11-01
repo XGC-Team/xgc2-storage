@@ -66,7 +66,13 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != state.AgentBootID || resource.Join.Kind != resource.Kind || resource.Kind == "uncovered-effect") {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource join")
 		}
-		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" {
+		if (resource.LocalPhysicalJoined || resource.LocalJoined) && (resource.Kind != "local-call" || resource.Join != nil) || resource.LocalJoined && !resource.LocalPhysicalJoined {
+			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local child join")
+		}
+		if state.Joined && resource.Kind == "local-call" && !resource.LocalJoined {
+			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined local child")
+		}
+		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" && resource.Kind != "local-call" {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
@@ -77,7 +83,7 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 }
 
 func validateRecoveryAdmission(a model.RunResourceAdmission) error {
-	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "workflow-call" && a.Kind != "uncovered-effect") {
+	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "workflow-call" && a.Kind != "local-call" && a.Kind != "uncovered-effect") {
 		return failure("invalid_argument", "exact resource ID, node ID and supported kind are required")
 	}
 	return nil
@@ -174,7 +180,7 @@ func (s *Store) GetRunResourceRecovery(ctx context.Context, runID string) (model
 // A repeated identical admission is a no-op. Storage errors, including an
 // unknown COMMIT disposition, must be joined before the caller starts work.
 func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) error {
-	if !textKey(runID) || !textKey(bootID) || admission.Join != nil {
+	if !textKey(runID) || !textKey(bootID) || admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined {
 		return engine.WriteRefused(failure("invalid_argument", "exact Run and boot admission is required"))
 	}
 	if err := validateRecoveryAdmission(admission); err != nil {
@@ -203,11 +209,28 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 
 // JoinRunResource persists only the exact process owner's positive join. The
 // source PID evidence may retire only after this durable write is accepted.
-func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin) error {
+func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin, policy model.RunRetentionPolicy) (model.RunRecoveryTransition, error) {
 	if err := validateRecoveryJoin(proof); err != nil {
-		return engine.WriteRefused(err)
+		return model.RunRecoveryTransition{}, engine.WriteRefused(err)
 	}
-	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunRecoveryTransition{}, engine.WriteRefused(err)
+	}
+	var result model.RunRecoveryTransition
+	err := s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		var cut retentionChanges
+		complete := func() error {
+			var err error
+			result.Recovered, err = completeLocalAncestors(ctx, tx, s.scope, proof.RunID, &cut, true)
+			if err != nil {
+				return err
+			}
+			if err := cut.finish(ctx, tx, s.scope); err != nil {
+				return err
+			}
+			result.Retention, err = retentionEffect(ctx, tx, s.scope, &cut, policy)
+			return err
+		}
 		status, state, found, err := readRunRecovery(ctx, tx, s.scope, proof.RunID)
 		if err != nil {
 			return err
@@ -225,7 +248,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 			}
 			if a.Join != nil {
 				if *a.Join == proof {
-					return nil
+					return complete()
 				}
 				return failure("failed_precondition", "resource already has a different join")
 			}
@@ -236,10 +259,18 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 				return failure("failed_precondition", "Run is already joined")
 			}
 			a.Join = &proof
-			return writeRunRecovery(ctx, tx, s.scope, proof.RunID, state, false)
+			if err := writeRunRecovery(ctx, tx, s.scope, proof.RunID, state, false); err != nil {
+				return err
+			}
+			return complete()
 		}
 		return failure("failed_precondition", "resource was not admitted")
 	})
+	if err != nil {
+		// The transaction callback can still own result after an early error.
+		return model.RunRecoveryTransition{}, err
+	}
+	return result, err
 }
 
 // SealRunResourceRecovery is a positive exact-Run receipt. Incoming retention
@@ -278,10 +309,10 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 		return false, nil
 	}
 	for _, a := range state.Resources {
-		// Every remote child of a workflow.call must first acquire a durable
-		// outbound relation. A local child is separately recorded as uncovered
-		// until its own exact join has a durable owner.
-		if a.Kind != "workflow-call" && a.Join == nil {
+		// Remote calls first acquire a durable outbound relation. A local child
+		// remains unjoined until its physical owner and all of its own admitted
+		// resources have supplied their exact evidence.
+		if a.Kind == "local-call" && !a.LocalJoined || a.Kind != "workflow-call" && a.Kind != "local-call" && a.Join == nil {
 			return false, nil
 		}
 	}
