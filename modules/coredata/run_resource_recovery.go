@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
@@ -92,7 +91,7 @@ func decodeRecoveryNodes(raw []byte) ([]byte, model.RunResourceRecovery, bool, e
 			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource admission")
 		}
 		seen[resource.ID] = true
-		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != envelope.Recovery.AgentBootID || resource.Kind == "uncovered-effect") {
+		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != envelope.Recovery.AgentBootID || resource.Join.Kind != resource.Kind || resource.Kind == "uncovered-effect") {
 			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource join")
 		}
 		if envelope.Recovery.Joined && resource.Join == nil {
@@ -118,7 +117,7 @@ func validateRecoveryJoin(p model.RunResourceJoin) error {
 			return failure("invalid_argument", "exact resource and process owner identities are required")
 		}
 	}
-	if p.PID <= 1 || p.PGID != p.PID || p.StartTicks == 0 || p.OwnerPID < 1 || p.OwnerStartTicks == 0 {
+	if (p.Kind != "process" && p.Kind != "command") || p.PID <= 1 || p.PGID != p.PID || p.StartTicks == 0 || p.OwnerPID < 1 || p.OwnerStartTicks == 0 {
 		return failure("invalid_argument", "complete kernel process identities are required")
 	}
 	return nil
@@ -240,7 +239,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 		if err != nil {
 			return err
 		}
-		if !found || (!model.RunStatus(status).Open() && model.RunStatus(status) != model.RunInterrupted) || state.AgentBootID != proof.AgentBootID {
+		if !found || state.AgentBootID != proof.AgentBootID {
 			return failure("failed_precondition", "Run has no matching resource coverage")
 		}
 		for i := range state.Resources {
@@ -248,7 +247,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 			if a.ID != proof.ResourceID {
 				continue
 			}
-			if a.NodeID != proof.NodeID || a.Kind == "uncovered-effect" {
+			if a.NodeID != proof.NodeID || a.Kind != proof.Kind || a.Kind == "uncovered-effect" {
 				return failure("failed_precondition", "join does not match the admitted process")
 			}
 			if a.Join != nil {
@@ -256,6 +255,9 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 					return nil
 				}
 				return failure("failed_precondition", "resource already has a different join")
+			}
+			if !model.RunStatus(status).Open() && model.RunStatus(status) != model.RunInterrupted {
+				return failure("failed_precondition", "a normally finished Run cannot acquire a late join")
 			}
 			if state.Joined {
 				return failure("failed_precondition", "Run is already joined")
@@ -275,32 +277,48 @@ func (s *Store) SealRunResourceRecovery(ctx context.Context, runID, bootID strin
 		return engine.WriteRefused(failure("invalid_argument", "exact Run and Agent boot are required"))
 	}
 	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
-		status, nodes, state, found, err := readRecoveryNodes(ctx, tx, s.scope, runID)
+		joined, err := sealRunResourceRecovery(ctx, tx, s.scope, runID, bootID)
 		if err != nil {
 			return err
 		}
-		if !found || model.RunStatus(status) != model.RunInterrupted || state.AgentBootID != bootID {
-			return failure("failed_precondition", "Run has no matching interrupted resource coverage")
+		if !joined {
+			return failure("failed_precondition", "Run resource coverage is unknown or incomplete")
 		}
-		if state.Joined {
-			return nil
-		}
-		if len(state.Resources) == 0 {
-			return failure("failed_precondition", "empty resource admissions do not prove a join")
-		}
-		for _, a := range state.Resources {
-			if a.Join == nil {
-				return failure("failed_precondition", fmt.Sprintf("resource %s has no join proof", a.ID))
-			}
-		}
-		var pending bool
-		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=?)", s.scope, runID).Scan(&pending); err != nil {
-			return err
-		}
-		if pending {
-			return failure("failed_precondition", "Run still owns an outbound remote relation")
-		}
-		state.Joined = true
-		return writeRecoveryNodes(ctx, tx, s.scope, runID, nodes, state, false)
+		return nil
 	})
+}
+
+// Called on one exact newly interrupted Run. Empty bootID is internal to the
+// interruption transaction; it selects the already stamped original boot.
+func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, bootID string) (bool, error) {
+	status, nodes, state, found, err := readRecoveryNodes(ctx, tx, scope, runID)
+	if err != nil {
+		return false, err
+	}
+	if !found || model.RunStatus(status) != model.RunInterrupted || (bootID != "" && state.AgentBootID != bootID) {
+		return false, nil
+	}
+	if state.Joined {
+		return true, nil
+	}
+	if len(state.Resources) == 0 {
+		return false, nil
+	}
+	for _, a := range state.Resources {
+		if a.Join == nil {
+			return false, nil
+		}
+	}
+	var pending bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM run_remote_pending WHERE scope=? AND owner_run_id=?)", scope, runID).Scan(&pending); err != nil {
+		return false, err
+	}
+	if pending {
+		return false, nil
+	}
+	state.Joined = true
+	if err := writeRecoveryNodes(ctx, tx, scope, runID, nodes, state, false); err != nil {
+		return false, err
+	}
+	return true, nil
 }

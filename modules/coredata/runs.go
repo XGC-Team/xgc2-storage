@@ -481,7 +481,7 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		return existing, nil
 	}
 	trackedNodes := false
-	if f.Status == model.RunInterrupted {
+	if f.RecoveryAgentBootID != "" {
 		var stored []byte
 		if err := tx.QueryRowContext(ctx, "SELECT nodes_json FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&stored); err != nil {
 			return model.Run{}, err
@@ -490,13 +490,14 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		if err != nil {
 			return model.Run{}, err
 		}
-		if tracked {
-			nodes, err = encodeRecoveryNodes(nodes, recovery)
-			if err != nil {
-				return model.Run{}, err
-			}
-			trackedNodes = true
+		if !tracked || recovery.AgentBootID != f.RecoveryAgentBootID {
+			return model.Run{}, failure("failed_precondition", "finish does not match the admitted Run resource owner")
 		}
+		nodes, err = encodeRecoveryNodes(nodes, recovery)
+		if err != nil {
+			return model.Run{}, err
+		}
+		trackedNodes = true
 	}
 	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
 		*field, err = encodeRunPayload(*field)
@@ -517,8 +518,17 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 	var predecessor, failedSession string
 	_, rootFinishes := plannedSet[rootID]
 	if err = tx.QueryRowContext(ctx, retentionFinish,
-		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current, rootFinishes, planned).Scan(&eligible, &predecessor, &failedSession); err != nil {
+		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current, rootFinishes, planned,
+		trackedNodes, len(resourceRecoveryPrefix), resourceRecoveryPrefix).Scan(&eligible, &predecessor, &failedSession); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return model.Run{}, failure("failed_precondition", "finish would discard admitted Run resource evidence")
+		}
 		return model.Run{}, err
+	}
+	if trackedNodes && f.Status == model.RunInterrupted {
+		if _, err := sealRunResourceRecovery(ctx, tx, scope, f.ID, f.RecoveryAgentBootID); err != nil {
+			return model.Run{}, err
+		}
 	}
 	// A Session can outlive the display Run. Record the failure on that actual
 	// Session in the same transaction before the Run becomes prunable.
@@ -691,7 +701,7 @@ const (
 	bootLocal     = retentionPendingClear
 	interruptOpen = `UPDATE runs AS r INDEXED BY runs_open SET status='interrupted',termination='interrupted',finished_at=?1,revision=revision+1,bytes=bytes+?2,
  (retention_local_ok,retention_eligible)=(WITH local(value) AS MATERIALIZED (SELECT CASE WHEN ?1>0 THEN (` + bootLocal + `) ELSE 0 END) SELECT value,CASE WHEN value THEN (` + retentionSessionClear + `) ELSE 0 END FROM local)
- WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible`
+ WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible,coalesce(substr(nodes_json,1,?4)=?5,0)`
 
 	// Recheck all active guards before deletion. An absent root is not live.
 	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND (r.incoming_remote_target_id='' OR r.incoming_hold_released<>0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
@@ -700,18 +710,23 @@ const (
 )
 
 func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Time, cut *retentionChanges) (int, error) {
-	rows, err := tx.QueryContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope)
+	rows, err := tx.QueryContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope, len(resourceRecoveryPrefix), resourceRecoveryPrefix)
 	if err != nil {
 		return 0, err
 	}
 	n := 0
+	var tracked []string
 	for rows.Next() {
 		var id, predecessor string
 		var eligible int64
-		if err = rows.Scan(&id, &predecessor, &eligible); err != nil {
+		var recovery bool
+		if err = rows.Scan(&id, &predecessor, &eligible, &recovery); err != nil {
 			break
 		}
 		cut.finished(id, predecessor, eligible)
+		if recovery {
+			tracked = append(tracked, id)
+		}
 		n++
 	}
 	if err == nil {
@@ -722,6 +737,14 @@ func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Ti
 	}
 	if err != nil {
 		return 0, err
+	}
+	// These are only the already-open, explicitly tracked Runs returned by
+	// the existing interruption statement. Unknown/incomplete ones stay open
+	// to recovery without adding a history scan or waiting for remote peers.
+	for _, id := range tracked {
+		if _, err := sealRunResourceRecovery(ctx, tx, scope, id, ""); err != nil {
+			return 0, err
+		}
 	}
 	if n == 0 {
 		return 0, nil

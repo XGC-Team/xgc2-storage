@@ -127,6 +127,9 @@ type RunFinish struct {
 	Nodes         json.RawMessage
 	CleanupErrors json.RawMessage
 	At            time.Time
+	// RecoveryAgentBootID selects the same Run-resource owner stamped at
+	// admission; a tracked Run cannot finish by discarding that evidence.
+	RecoveryAgentBootID string
 }
 
 // CreatedRun is the per-item result of creating a Run in ApplyRunOps.

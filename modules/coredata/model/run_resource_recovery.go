@@ -24,6 +24,7 @@ type RunResourceJoin struct {
 	RunID           string `json:"runId"`
 	NodeID          string `json:"nodeId"`
 	ResourceID      string `json:"resourceId"`
+	Kind            string `json:"kind"`
 	AgentBootID     string `json:"agentBootId"`
 	Incarnation     string `json:"incarnation"`
 	HostBootID      string `json:"hostBootId"`

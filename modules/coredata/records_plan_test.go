@@ -113,7 +113,7 @@ func TestRecordQueriesUseTheirIndexes(t *testing.T) {
 	q, a = runs(model.RunFilter{Statuses: []model.RunStatus{model.RunFailed, model.RunInterrupted}})
 	add("failed runs", q, a, "runs_created", true)
 	add("run by idempotency key", "SELECT "+runColumns+" FROM runs WHERE scope=? AND "+byKey, []any{"s", "k"}, "runs_idempotency", false)
-	add("open runs at boot", interruptOpen, []any{1, 1, "s"}, "runs_open", false)
+	add("open runs at boot", interruptOpen, []any{1, 1, "s", len(resourceRecoveryPrefix), resourceRecoveryPrefix}, "runs_open", false)
 	add("next eligible expiry", pruneOldest, []any{"s"}, "runs_retention_eligible", true)
 	add("prune candidates", pruneCandidates, []any{"s", 10}, "runs_retention_eligible", true)
 

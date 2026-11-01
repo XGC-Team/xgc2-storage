@@ -44,7 +44,11 @@ func TestInterruptedResourceCoverageNeedsAllExactJoinsAndOutboundResolution(t *t
 		t.Fatalf("unjoined resources produced a receipt: %v", err)
 	}
 	proof := func(id, node string, pid int) model.RunResourceJoin {
-		return model.RunResourceJoin{RunID: "child", NodeID: node, ResourceID: id, AgentBootID: child.RecoveryAgentBootID,
+		kind := "process"
+		if id == "command" {
+			kind = "command"
+		}
+		return model.RunResourceJoin{RunID: "child", NodeID: node, ResourceID: id, Kind: kind, AgentBootID: child.RecoveryAgentBootID,
 			Incarnation: "inc-" + id, HostBootID: "os-boot", PID: pid, PGID: pid, StartTicks: uint64(pid * 4), OwnerPID: 11, OwnerStartTicks: 22}
 	}
 	provider := proof("provider", "serve-process", 21)
@@ -112,7 +116,7 @@ func TestRecoveryDoesNotInferEmptyOrUncoveredEffects(t *testing.T) {
 			t.Fatalf("%s acquired a fabricated complete join: %v", id, err)
 		}
 	}
-	p := model.RunResourceJoin{RunID: "uncovered", NodeID: "remote-shell", ResourceID: "effect", AgentBootID: "boot", Incarnation: "i", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 1, OwnerPID: 1, OwnerStartTicks: 1}
+	p := model.RunResourceJoin{RunID: "uncovered", NodeID: "remote-shell", ResourceID: "effect", Kind: "process", AgentBootID: "boot", Incarnation: "i", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 1, OwnerPID: 1, OwnerStartTicks: 1}
 	if err := f.core.JoinRunResource(f.ctx, p); errCode(err) != "failed_precondition" {
 		t.Fatalf("an uncovered effect accepted a process proof: %v", err)
 	}
@@ -133,6 +137,14 @@ func TestInterruptedFinishKeepsNodeDetailAndActualQuota(t *testing.T) {
 	}
 	nodes := json.RawMessage(`[{"id":"node","status":"running"}]`)
 	finish := model.RunFinish{ID: child.ID, Status: model.RunInterrupted, Termination: "interrupted", Nodes: nodes, At: epoch.Add(time.Second)}
+	if _, err := f.core.FinishRun(f.ctx, finish, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
+		t.Fatalf("finish discarded tracked evidence without its owner: %v", err)
+	}
+	finish.RecoveryAgentBootID = "other-boot"
+	if _, err := f.core.FinishRun(f.ctx, finish, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
+		t.Fatalf("foreign owner finished tracked Run: %v", err)
+	}
+	finish.RecoveryAgentBootID = "boot"
 	if _, err := f.core.FinishRun(f.ctx, finish, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +166,36 @@ func TestInterruptedFinishKeepsNodeDetailAndActualQuota(t *testing.T) {
 	}
 }
 
+func TestInterruptedAfterDurableResourceJoinSealsWithoutSourceReplay(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
+		t.Fatal(err)
+	}
+	child := incomingChild("joined-before-crash", "parent", "parent", "core", "core-principal")
+	child.RecoveryAgentBootID = "boot"
+	if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.core.AdmitRunResource(f.ctx, child.ID, "boot", model.RunResourceAdmission{ID: "p", NodeID: "node", Kind: "process"}); err != nil {
+		t.Fatal(err)
+	}
+	proof := model.RunResourceJoin{RunID: child.ID, NodeID: "node", ResourceID: "p", Kind: "process", AgentBootID: "boot", Incarnation: "inc", HostBootID: "os", PID: 2, PGID: 2, StartTicks: 3, OwnerPID: 1, OwnerStartTicks: 1}
+	if err := f.core.JoinRunResource(f.ctx, proof); err != nil {
+		t.Fatal(err)
+	}
+	// The process source can already be retired after JoinRunResource commits.
+	// A crash before the full Run receipt must still finish the exact join.
+	f.reopen(t)
+	if _, err := f.core.InterruptOpenRuns(f.ctx, epoch.Add(time.Second), model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen(t)
+	state, found, err := f.core.GetRunResourceRecovery(f.ctx, child.ID)
+	if err != nil || !found || !state.Joined || len(state.Resources) != 1 || state.Resources[0].Join == nil || *state.Resources[0].Join != proof {
+		t.Fatalf("persisted join was not sealed on interruption: %+v found=%v error=%v", state, found, err)
+	}
+}
+
 // FinishRun historically accepts any valid JSON in Nodes. A marker embedded
 // there by itself is therefore not evidence that the new admission writer ran.
 func TestHistoricalNodesCannotForgeNewRecoveryCoverage(t *testing.T) {
@@ -165,7 +207,7 @@ func TestHistoricalNodesCannotForgeNewRecoveryCoverage(t *testing.T) {
 	if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
 		t.Fatal(err)
 	}
-	legacy := json.RawMessage(`{"$runResourceRecovery":"xgc2-run-resource-recovery-v1","recovery":{"agentBootId":"boot","resources":[{"id":"r","nodeId":"n","kind":"process","join":{"runId":"old-shaped","nodeId":"n","resourceId":"r","agentBootId":"boot","incarnation":"i","hostBootId":"host","pid":2,"pgid":2,"startTicks":1,"ownerPid":1,"ownerStartTicks":1}}],"joined":true}}`)
+	legacy := json.RawMessage(`{"$runResourceRecovery":"xgc2-run-resource-recovery-v1","recovery":{"agentBootId":"boot","resources":[{"id":"r","nodeId":"n","kind":"process","join":{"runId":"old-shaped","nodeId":"n","resourceId":"r","kind":"process","agentBootId":"boot","incarnation":"i","hostBootId":"host","pid":2,"pgid":2,"startTicks":1,"ownerPid":1,"ownerStartTicks":1}}],"joined":true}}`)
 	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: "old-shaped", Status: model.RunInterrupted, Nodes: legacy, At: epoch.Add(time.Second)}, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
