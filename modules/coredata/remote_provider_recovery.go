@@ -51,7 +51,7 @@ func (s *Store) AdmitRemoteProviderRecovery(ctx context.Context, item model.RunR
 		if root != item.Link.RootRunID || call != item.Link.CallNodeID || boot != item.Link.BootID || phase != string(model.RemoteRunOpen) || session != item.SessionID {
 			return failure("failed_precondition", "the selected provider differs from its admitted relation or Session")
 		}
-		status, nodes, state, found, err := readRecoveryNodes(ctx, tx, s.scope, item.Link.OwnerRunID)
+		status, state, found, err := readRunRecovery(ctx, tx, s.scope, item.Link.OwnerRunID)
 		if err != nil {
 			return err
 		}
@@ -96,7 +96,7 @@ func (s *Store) AdmitRemoteProviderRecovery(ctx context.Context, item model.RunR
 			}
 		}
 		state.RemoteProviders = append(retained, item)
-		return writeRecoveryNodes(ctx, tx, s.scope, item.Link.OwnerRunID, nodes, state, true)
+		return writeRunRecovery(ctx, tx, s.scope, item.Link.OwnerRunID, state, true)
 	})
 }
 
@@ -113,7 +113,7 @@ func (s *Store) GetRemoteProviderRecovery(ctx context.Context, link model.Remote
 	out, err := read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (result, error) {
 		var root, call, boot, session, ownerRoot, ownerTarget string
 		var tracked bool
-		err := tx.QueryRowContext(ctx, `SELECT p.root_run_id,p.call_node_id,p.boot_id,r.session_id,r.root_run_id,r.target_id,coalesce(substr(r.nodes_json,1,?)=?,0) FROM run_remote_pending p JOIN runs r ON r.scope=p.scope AND r.id=p.owner_run_id WHERE p.scope=? AND p.owner_run_id=? AND p.target_id=? AND p.child_run_id=?`, len(resourceRecoveryPrefix), resourceRecoveryPrefix, scope, link.OwnerRunID, link.TargetID, link.RunID).Scan(&root, &call, &boot, &session, &ownerRoot, &ownerTarget, &tracked)
+		err := tx.QueryRowContext(ctx, `SELECT p.root_run_id,p.call_node_id,p.boot_id,r.session_id,r.root_run_id,r.target_id,length(r.resource_recovery_json)>0 FROM run_remote_pending p JOIN runs r ON r.scope=p.scope AND r.id=p.owner_run_id WHERE p.scope=? AND p.owner_run_id=? AND p.target_id=? AND p.child_run_id=?`, scope, link.OwnerRunID, link.TargetID, link.RunID).Scan(&root, &call, &boot, &session, &ownerRoot, &ownerTarget, &tracked)
 		if errors.Is(err, sql.ErrNoRows) {
 			return result{}, nil
 		}
@@ -129,7 +129,7 @@ func (s *Store) GetRemoteProviderRecovery(ctx context.Context, link model.Remote
 		if !tracked {
 			return result{}, nil
 		}
-		_, _, state, found, err := readRecoveryNodes(ctx, tx, scope, link.OwnerRunID)
+		_, state, found, err := readRunRecovery(ctx, tx, scope, link.OwnerRunID)
 		if err != nil || !found || !state.TrackRemoteProviders {
 			return result{}, err
 		}

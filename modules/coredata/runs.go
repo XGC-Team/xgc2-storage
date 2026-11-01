@@ -158,14 +158,6 @@ func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) 
 			r.Error = rawOrNil(field.stored)
 			continue
 		}
-		if field.target == &r.Nodes {
-			raw, _, _, err := decodeStoredNodes(field.stored)
-			if err != nil {
-				return r, err
-			}
-			*field.target = rawOrNil(raw)
-			continue
-		}
 		raw, err := decodeRunPayload(field.stored, field.limit)
 		if err != nil {
 			return r, err
@@ -356,28 +348,25 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err != nil {
 		return model.Run{}, false, err
 	}
-	storedNodes := []byte{}
+	storedRecovery := []byte{}
 	if q.RecoveryAgentBootID != "" || q.TrackRemoteProviderRecovery {
 		state := model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, TrackRemoteProviders: q.TrackRemoteProviderRecovery}
 		if q.RecoveryAgentBootID != "" {
 			state.Resources = []model.RunResourceAdmission{}
 		}
-		raw, err := encodeRecoveryNodes(nil, state)
-		if err != nil {
-			return model.Run{}, false, err
-		}
-		storedNodes, err = encodeRecoveryPayload(raw)
+		storedRecovery, err = encodeRunRecovery(state)
 		if err != nil {
 			return model.Run{}, false, err
 		}
 	}
-	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger)+len(storedNodes)+len(sessionInstance))
+
+	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger)+len(storedRecovery)+len(sessionInstance))
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',?,x'',0,?,?,0,1,?,?,?,0)",
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,resource_recovery_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',?,x'',0,?,?,0,1,?,?,?,0)",
 		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, sessionInstance, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
-		storedInputs, storedTrigger, []byte(source), string(r.Status), "", storedNodes, nanos(r.CreatedAt), nanos(r.StartedAt), bytes, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID)
+		storedInputs, storedTrigger, []byte(source), string(r.Status), "", storedRecovery, nanos(r.CreatedAt), nanos(r.StartedAt), bytes, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID)
 	return r, true, err
 }
 
@@ -484,36 +473,27 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		}
 		return existing, nil
 	}
-	trackedNodes := false
+	trackedRecovery := false
 	if f.RecoveryAgentBootID != "" || f.TrackRemoteProviderRecovery {
-		var stored []byte
-		if err := tx.QueryRowContext(ctx, "SELECT nodes_json FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&stored); err != nil {
-			return model.Run{}, err
-		}
-		_, recovery, tracked, err := decodeStoredNodes(stored)
+		_, recovery, tracked, err := readRunRecovery(ctx, tx, scope, f.ID)
 		if err != nil {
 			return model.Run{}, err
 		}
 		if !tracked || recovery.AgentBootID != f.RecoveryAgentBootID || recovery.TrackRemoteProviders != f.TrackRemoteProviderRecovery {
 			return model.Run{}, failure("failed_precondition", "finish does not match the admitted Run resource owner")
 		}
-		nodes, err = encodeRecoveryNodes(nodes, recovery)
-		if err != nil {
-			return model.Run{}, err
-		}
-		trackedNodes = true
+		trackedRecovery = true
 	}
+
 	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
 		*field, err = encodeRunPayload(*field)
 		if err != nil {
 			return model.Run{}, err
 		}
 	}
-	if trackedNodes {
-		nodes = append(append([]byte(nil), resourceRecoveryPrefix...), nodes...)
-	}
-	// Account an explicitly tracked Run's old admissions inside the writer;
-	// ordinary changed finishes still select only the same thin driver facts.
+
+	// Account the replaced public node detail inside the writer. Recovery is
+	// stored separately and remains charged to the same Run.
 	grown := int64(len(f.Termination) + len(errored) + len(result) + len(nodes) + len(cleanup) + len(preview))
 	if err = chargeRunFinish(ctx, tx, scope, f.ID, grown); err != nil {
 		return model.Run{}, err
@@ -523,13 +503,13 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 	_, rootFinishes := plannedSet[rootID]
 	if err = tx.QueryRowContext(ctx, retentionFinish,
 		string(f.Status), f.Termination, []byte(errored), []byte(preview), []byte(result), []byte(nodes), []byte(cleanup), cleanupFailed, nanos(nowOr(f.At)), grown, scope, f.ID, current, rootFinishes, planned,
-		trackedNodes, len(resourceRecoveryPrefix), resourceRecoveryPrefix).Scan(&eligible, &predecessor, &failedSession); err != nil {
+		trackedRecovery).Scan(&eligible, &predecessor, &failedSession); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return model.Run{}, failure("failed_precondition", "finish would discard admitted Run resource evidence")
+			return model.Run{}, failure("failed_precondition", "finish does not match the admitted Run resource owner")
 		}
 		return model.Run{}, err
 	}
-	if trackedNodes && f.Status == model.RunInterrupted {
+	if trackedRecovery && f.Status == model.RunInterrupted {
 		if _, err := sealRunResourceRecovery(ctx, tx, scope, f.ID, f.RecoveryAgentBootID); err != nil {
 			return model.Run{}, err
 		}
@@ -705,7 +685,7 @@ const (
 	bootLocal     = retentionPendingClear
 	interruptOpen = `UPDATE runs AS r INDEXED BY runs_open SET status='interrupted',termination='interrupted',finished_at=?1,revision=revision+1,bytes=bytes+?2,
  (retention_local_ok,retention_eligible)=(WITH local(value) AS MATERIALIZED (SELECT CASE WHEN ?1>0 THEN (` + bootLocal + `) ELSE 0 END) SELECT value,CASE WHEN value THEN (` + retentionSessionClear + `) ELSE 0 END FROM local)
- WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible,coalesce(substr(nodes_json,1,?4)=?5,0)`
+ WHERE scope=?3 AND status IN ('queued','running','stopping') RETURNING id,predecessor_run_id,retention_eligible,length(resource_recovery_json)>0`
 
 	// Recheck all active guards before deletion. An absent root is not live.
 	eligibleRuns    = "scope=? AND finished_at>0 AND pending_remote_count=0 AND (r.incoming_remote_target_id='' OR r.incoming_hold_released<>0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs p WHERE p.scope=r.scope AND p.id=r.root_run_id AND p.finished_at=0) AND NOT EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) AND NOT EXISTS (SELECT 1 FROM runs successor WHERE successor.scope=r.scope AND successor.predecessor_run_id=r.id AND successor.predecessor_run_id<>'' AND successor.finished_at=0) AND NOT EXISTS (SELECT 1 FROM sessions successor_session WHERE successor_session.scope=r.scope AND successor_session.target_id=r.target_id AND successor_session.predecessor_session_id=r.session_id AND successor_session.predecessor_session_id<>'' AND successor_session.status='queued')"
@@ -714,7 +694,7 @@ const (
 )
 
 func interruptOpenRuns(ctx context.Context, tx *sql.Tx, scope string, at time.Time, cut *retentionChanges) (int, error) {
-	rows, err := tx.QueryContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope, len(resourceRecoveryPrefix), resourceRecoveryPrefix)
+	rows, err := tx.QueryContext(ctx, interruptOpen, nanos(nowOr(at)), len("interrupted"), scope)
 	if err != nil {
 		return 0, err
 	}

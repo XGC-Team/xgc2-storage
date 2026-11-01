@@ -265,3 +265,47 @@ func TestInterruptedHistoricalRunDoesNotAcquireResourceCoverage(t *testing.T) {
 		t.Fatalf("old missing admissions were sealed: %v", err)
 	}
 }
+
+func TestRunRecoveryIsDedicatedTypedControlAndPublicNodesRemainIndependent(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
+		t.Fatal(err)
+	}
+	child := incomingChild("tracked-control", "parent", "parent", "core", "principal")
+	child.RecoveryAgentBootID = "boot"
+	if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.core.AdmitRunResource(f.ctx, child.ID, "boot", model.RunResourceAdmission{ID: "actual-process", NodeID: "node", Kind: "process"}); err != nil {
+		t.Fatal(err)
+	}
+	nodes := json.RawMessage(`[{"id":"node","status":"failed"}]`)
+	if _, err := f.core.FinishRun(f.ctx, model.RunFinish{ID: child.ID, Status: model.RunInterrupted, Nodes: nodes, RecoveryAgentBootID: "boot", At: epoch.Add(time.Second)}, model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen(t)
+	var control []byte
+	if err := f.db.Read(f.ctx, func(ctx context.Context, tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, "SELECT resource_recovery_json FROM runs WHERE id=?", child.ID).Scan(&control)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var typed model.RunResourceRecovery
+	if err := json.Unmarshal(control, &typed); err != nil || typed.AgentBootID != "boot" || len(typed.Resources) != 1 || typed.Resources[0].ID != "actual-process" || typed.Joined {
+		t.Fatalf("stored control fact is not the admitted typed record: %s %+v %v", control, typed, err)
+	}
+	run, err := f.core.GetRun(f.ctx, child.ID)
+	if err != nil || string(run.Nodes) != string(nodes) {
+		t.Fatalf("control encoding changed public nodes: %s %v", run.Nodes, err)
+	}
+	// Corruption of the control field is not silently interpreted as proof;
+	// it also must not prevent reading the independent public node outcome.
+	f.exec(t, `UPDATE runs SET resource_recovery_json=? WHERE id=?`, []byte(`{"agentBootId":"boot","resources":[],"joined":true,"foreign":1}`), child.ID)
+	if _, _, err := f.core.GetRunResourceRecovery(f.ctx, child.ID); errCode(err) != "data_loss" {
+		t.Fatalf("corrupt/unknown control schema accepted: %v", err)
+	}
+	run, err = f.core.GetRun(f.ctx, child.ID)
+	if err != nil || string(run.Nodes) != string(nodes) {
+		t.Fatalf("unrelated node detail depends on control decoding: %s %v", run.Nodes, err)
+	}
+}

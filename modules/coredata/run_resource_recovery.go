@@ -11,115 +11,69 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-// The existing Run detail holds low-frequency resource ownership, alongside
-// its public node detail. Older rows have no marker and remain unknown.
-const resourceRecoveryFormat = "xgc2-run-resource-recovery-v1"
-const maxStoredRunNodesBytes = 2 * model.MaxRunNodesBytes
+// Run recovery is a separate typed control field on the Run, never an
+// interpretation of the public node outcome. An empty field means unknown.
+const maxRunRecoveryBytes = 2 * model.MaxRunNodesBytes
 
-// Ordinary historical node payloads are always gzip streams produced by
-// encodeRunPayload, regardless of their JSON contents. This non-gzip storage
-// prefix is written only at the new Run admission cut. Consequently an old
-// caller's arbitrary Nodes JSON cannot impersonate admitted coverage.
-var resourceRecoveryPrefix = []byte("XGC2-RUN-RESOURCES\x00\x01")
-
-type resourceRecoveryNodes struct {
-	Format   string                    `json:"$runResourceRecovery"`
-	Nodes    json.RawMessage           `json:"nodes,omitempty"`
-	Recovery model.RunResourceRecovery `json:"recovery"`
-}
-
-func encodeRecoveryNodes(nodes []byte, recovery model.RunResourceRecovery) ([]byte, error) {
-	if len(nodes) > model.MaxRunNodesBytes || len(nodes) > 0 && !json.Valid(nodes) {
-		return nil, failure("resource_exhausted", "Run node detail exceeds its existing limit")
-	}
-	raw, err := json.Marshal(resourceRecoveryNodes{Format: resourceRecoveryFormat, Nodes: nodes, Recovery: recovery})
+func encodeRunRecovery(state model.RunResourceRecovery) ([]byte, error) {
+	raw, err := json.Marshal(state)
 	if err != nil {
 		return nil, err
 	}
-	if len(raw) > maxStoredRunNodesBytes {
+	if len(raw) > maxRunRecoveryBytes {
 		return nil, failure("resource_exhausted", "Run resource admissions exceed their storage budget")
 	}
 	return raw, nil
 }
 
-func encodeRecoveryPayload(raw []byte) ([]byte, error) {
-	compressed, err := encodeRunPayload(raw)
-	if err != nil {
-		return nil, err
+func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
+	if len(raw) == 0 {
+		return model.RunResourceRecovery{}, false, nil
 	}
-	return append(append([]byte(nil), resourceRecoveryPrefix...), compressed...), nil
-}
-
-func decodeStoredNodes(stored []byte) ([]byte, model.RunResourceRecovery, bool, error) {
-	if !bytes.HasPrefix(stored, resourceRecoveryPrefix) {
-		raw, err := decodeRunPayload(stored, model.MaxRunNodesBytes)
-		return raw, model.RunResourceRecovery{}, false, err
+	if len(raw) > maxRunRecoveryBytes || !json.Valid(raw) {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource recovery fact")
 	}
-	raw, err := decodeRunPayload(stored[len(resourceRecoveryPrefix):], maxStoredRunNodesBytes)
-	if err != nil {
-		return nil, model.RunResourceRecovery{}, false, err
-	}
-	nodes, recovery, found, err := decodeRecoveryNodes(raw)
-	if err == nil && !found {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "missing Run resource recovery fact")
-	}
-	return nodes, recovery, found, err
-}
-
-// decodeRecoveryNodes distinguishes a positively marked new Run from every
-// historical value; an absent marker is never interpreted as empty coverage.
-func decodeRecoveryNodes(raw []byte) ([]byte, model.RunResourceRecovery, bool, error) {
-	if len(raw) == 0 || !isObject(raw) {
-		return nil, model.RunResourceRecovery{}, false, nil
-	}
-	var header map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &header); err != nil {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run node detail")
-	}
-	if _, exists := header["$runResourceRecovery"]; !exists {
-		return nil, model.RunResourceRecovery{}, false, nil
-	}
-	var envelope resourceRecoveryNodes
+	var state model.RunResourceRecovery
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&envelope); err != nil || envelope.Format != resourceRecoveryFormat || len(envelope.Nodes) > model.MaxRunNodesBytes {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource recovery fact")
+	if err := decoder.Decode(&state); err != nil {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource recovery fact")
 	}
-	if envelope.Recovery.AgentBootID == "" {
-		if !envelope.Recovery.TrackRemoteProviders || envelope.Recovery.Resources != nil || envelope.Recovery.Joined {
-			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
+	if state.AgentBootID == "" {
+		if !state.TrackRemoteProviders || state.Resources != nil || state.Joined {
+			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
 		}
-	} else if !textKey(envelope.Recovery.AgentBootID) || envelope.Recovery.Resources == nil {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
+	} else if !textKey(state.AgentBootID) || state.Resources == nil {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
 	}
-	if len(envelope.Recovery.RemoteProviders) > model.MaxRemoteRunLinks || !envelope.Recovery.TrackRemoteProviders && len(envelope.Recovery.RemoteProviders) != 0 {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "untracked remote provider selection")
+	if len(state.RemoteProviders) > model.MaxRemoteRunLinks || !state.TrackRemoteProviders && len(state.RemoteProviders) != 0 {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "untracked remote provider selection")
 	}
-	selected := make(map[string]bool, len(envelope.Recovery.RemoteProviders))
-	for _, item := range envelope.Recovery.RemoteProviders {
+	selected := make(map[string]bool, len(state.RemoteProviders))
+	for _, item := range state.RemoteProviders {
 		key := item.Link.TargetID + "\x00" + item.Link.RunID
 		if validateRemoteProviderSelection(item) != nil || selected[key] {
-			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid remote provider selection")
+			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid remote provider selection")
 		}
 		selected[key] = true
 	}
-	seen := make(map[string]bool, len(envelope.Recovery.Resources))
-	for _, resource := range envelope.Recovery.Resources {
+	seen := make(map[string]bool, len(state.Resources))
+	for _, resource := range state.Resources {
 		if validateRecoveryAdmission(resource) != nil || seen[resource.ID] {
-			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource admission")
+			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource admission")
 		}
 		seen[resource.ID] = true
-		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != envelope.Recovery.AgentBootID || resource.Join.Kind != resource.Kind || resource.Kind == "uncovered-effect") {
-			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource join")
+		if resource.Join != nil && (validateRecoveryJoin(*resource.Join) != nil || resource.Join.ResourceID != resource.ID || resource.Join.NodeID != resource.NodeID || resource.Join.AgentBootID != state.AgentBootID || resource.Join.Kind != resource.Kind || resource.Kind == "uncovered-effect") {
+			return model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource join")
 		}
-		if envelope.Recovery.Joined && resource.Join == nil {
-			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
+		if state.Joined && resource.Join == nil {
+			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
-	if envelope.Recovery.Joined && len(envelope.Recovery.Resources) == 0 {
-		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "empty Run resource coverage has no positive join")
+	if state.Joined && len(state.Resources) == 0 {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "empty Run resource coverage has no positive join")
 	}
-	return envelope.Nodes, envelope.Recovery, true, nil
+	return state, true, nil
 }
 
 func validateRecoveryAdmission(a model.RunResourceAdmission) error {
@@ -141,43 +95,39 @@ func validateRecoveryJoin(p model.RunResourceJoin) error {
 	return nil
 }
 
-func readRecoveryNodes(ctx context.Context, tx *sql.Tx, scope, runID string) (string, []byte, model.RunResourceRecovery, bool, error) {
+func readRunRecovery(ctx context.Context, tx *sql.Tx, scope, runID string) (string, model.RunResourceRecovery, bool, error) {
 	var status string
 	var stored []byte
-	err := tx.QueryRowContext(ctx, "SELECT status,nodes_json FROM runs WHERE scope=? AND id=?", scope, runID).Scan(&status, &stored)
+	err := tx.QueryRowContext(ctx, "SELECT status,resource_recovery_json FROM runs WHERE scope=? AND id=?", scope, runID).Scan(&status, &stored)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil, model.RunResourceRecovery{}, false, failure("not_found", "run not found")
+		return "", model.RunResourceRecovery{}, false, failure("not_found", "run not found")
 	}
 	if err != nil {
-		return "", nil, model.RunResourceRecovery{}, false, err
+		return "", model.RunResourceRecovery{}, false, err
 	}
-	nodes, state, found, err := decodeStoredNodes(stored)
+	state, found, err := decodeRunRecovery(stored)
 	if err == nil && found {
 		for _, item := range state.RemoteProviders {
 			if item.Link.OwnerRunID != runID {
-				return "", nil, model.RunResourceRecovery{}, false, failure("data_loss", "selected provider belongs to a different Run")
+				return "", model.RunResourceRecovery{}, false, failure("data_loss", "selected provider belongs to a different Run")
 			}
 		}
 		for _, resource := range state.Resources {
 			if resource.Join != nil && resource.Join.RunID != runID {
-				return "", nil, model.RunResourceRecovery{}, false, failure("data_loss", "resource join belongs to a different Run")
+				return "", model.RunResourceRecovery{}, false, failure("data_loss", "resource join belongs to a different Run")
 			}
 		}
 	}
-	return status, nodes, state, found, err
+	return status, state, found, err
 }
 
-func writeRecoveryNodes(ctx context.Context, tx *sql.Tx, scope, runID string, nodes []byte, state model.RunResourceRecovery, reserveGrowth bool) error {
-	raw, err := encodeRecoveryNodes(nodes, state)
-	if err != nil {
-		return err
-	}
-	stored, err := encodeRecoveryPayload(raw)
+func writeRunRecovery(ctx context.Context, tx *sql.Tx, scope, runID string, state model.RunResourceRecovery, reserveGrowth bool) error {
+	stored, err := encodeRunRecovery(state)
 	if err != nil {
 		return err
 	}
 	var oldLen int
-	if err := tx.QueryRowContext(ctx, "SELECT length(nodes_json) FROM runs WHERE scope=? AND id=?", scope, runID).Scan(&oldLen); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT length(resource_recovery_json) FROM runs WHERE scope=? AND id=?", scope, runID).Scan(&oldLen); err != nil {
 		return err
 	}
 	delta := int64(len(stored) - oldLen)
@@ -189,7 +139,7 @@ func writeRecoveryNodes(ctx context.Context, tx *sql.Tx, scope, runID string, no
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, "UPDATE runs SET nodes_json=?,bytes=bytes+? WHERE scope=? AND id=?", stored, delta, scope, runID)
+	_, err = tx.ExecContext(ctx, "UPDATE runs SET resource_recovery_json=?,bytes=bytes+? WHERE scope=? AND id=?", stored, delta, scope, runID)
 	return err
 }
 
@@ -214,7 +164,7 @@ func (s *Store) GetRunResourceRecovery(ctx context.Context, runID string) (model
 		found bool
 	}
 	out, err := read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (result, error) {
-		_, _, state, found, err := readRecoveryNodes(ctx, tx, scope, runID)
+		_, state, found, err := readRunRecovery(ctx, tx, scope, runID)
 		return result{state, found && state.AgentBootID != ""}, err
 	})
 	return out.state, out.found, err
@@ -231,7 +181,7 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 		return engine.WriteRefused(err)
 	}
 	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
-		status, nodes, state, found, err := readRecoveryNodes(ctx, tx, s.scope, runID)
+		status, state, found, err := readRunRecovery(ctx, tx, s.scope, runID)
 		if err != nil {
 			return err
 		}
@@ -247,7 +197,7 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 			}
 		}
 		state.Resources = append(state.Resources, admission)
-		return writeRecoveryNodes(ctx, tx, s.scope, runID, nodes, state, true)
+		return writeRunRecovery(ctx, tx, s.scope, runID, state, true)
 	})
 }
 
@@ -258,7 +208,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 		return engine.WriteRefused(err)
 	}
 	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
-		status, nodes, state, found, err := readRecoveryNodes(ctx, tx, s.scope, proof.RunID)
+		status, state, found, err := readRunRecovery(ctx, tx, s.scope, proof.RunID)
 		if err != nil {
 			return err
 		}
@@ -286,7 +236,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 				return failure("failed_precondition", "Run is already joined")
 			}
 			a.Join = &proof
-			return writeRecoveryNodes(ctx, tx, s.scope, proof.RunID, nodes, state, false)
+			return writeRunRecovery(ctx, tx, s.scope, proof.RunID, state, false)
 		}
 		return failure("failed_precondition", "resource was not admitted")
 	})
@@ -314,7 +264,7 @@ func (s *Store) SealRunResourceRecovery(ctx context.Context, runID, bootID strin
 // Called on one exact newly interrupted Run. Empty bootID is internal to the
 // interruption transaction; it selects the already stamped original boot.
 func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, bootID string) (bool, error) {
-	status, nodes, state, found, err := readRecoveryNodes(ctx, tx, scope, runID)
+	status, state, found, err := readRunRecovery(ctx, tx, scope, runID)
 	if err != nil {
 		return false, err
 	}
@@ -340,7 +290,7 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 		return false, nil
 	}
 	state.Joined = true
-	if err := writeRecoveryNodes(ctx, tx, scope, runID, nodes, state, false); err != nil {
+	if err := writeRunRecovery(ctx, tx, scope, runID, state, false); err != nil {
 		return false, err
 	}
 	return true, nil

@@ -82,7 +82,7 @@ func releaseIncomingRun(ctx context.Context, tx *sql.Tx, scope, runID string, wa
 		if !textKey(want.AgentBootID) {
 			return false, failure("failed_precondition", "interrupted Run release requires its original Agent boot")
 		}
-		_, _, recovery, found, err := readRecoveryNodes(ctx, tx, scope, runID)
+		_, recovery, found, err := readRunRecovery(ctx, tx, scope, runID)
 		if err != nil {
 			return false, err
 		}
