@@ -29,10 +29,13 @@ func TestSessionActivationUnsafeSubsetPlans(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows.Close()
-	for _, index := range []string{"runs_session_instance_open", "runs_session_pending", "run_remote_pending_session"} {
+	for _, index := range []string{"runs_session_instance_open"} {
 		if !strings.Contains(plan.String(), index) {
 			t.Fatalf("missing %s: %s", index, plan.String())
 		}
+	}
+	if strings.Contains(plan.String(), "runs_session_pending") || strings.Contains(plan.String(), "run_remote_pending_session") {
+		t.Fatalf("offline remote relations still occupy the Session slot: %s", plan.String())
 	}
 	// Failed cleanup is already part of the predecessor Session read. Do not
 	// repeat the same fact as a Run-index probe on each clean activation.
