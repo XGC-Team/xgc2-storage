@@ -275,7 +275,9 @@ func resolveRemoteRunPolicy(ctx context.Context, tx *sql.Tx, scope string, link 
 			if err != nil {
 				return model.RemoteRunResolveResult{}, err
 			}
-			result.RecoveredOwner = &owner
+			if owner.Status == model.RunInterrupted {
+				result.RecoveredOwner = &owner
+			}
 		}
 		ancestors, err := completeLocalAncestors(ctx, tx, scope, link.OwnerRunID, &cut, false)
 		if err != nil {

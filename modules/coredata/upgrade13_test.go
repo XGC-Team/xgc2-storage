@@ -20,6 +20,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/api"
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
 // This fixture was created through the actual schema-13 Storage implementation
@@ -350,5 +351,112 @@ func TestOfflineUpgradeCrashRollsBackTheSameThirteenDatabase(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Prepare realistic incoming/remote facts in a disposable copy of the real 13
+// fixture. This setup is test-only; the upgrade below uses the public owner.
+func legacyIncomingFixture(t *testing.T) (engine.Config, string) {
+	t.Helper()
+	cfg, backups := realThirteenFixture(t)
+	db, err := sql.Open("sqlite", cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE runs SET status='interrupted',termination='interrupted',finished_at=created_at+1,parent_run_id='upstream-parent',root_run_id='up-root1',call_node_id='outer',depth=1,incoming_remote_target_id='upstream',incoming_remote_principal_id='operator',incoming_hold_released=0 WHERE id='kept-run'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`UPDATE run_remote_pending SET root_run_id='up-root1' WHERE owner_run_id='kept-run'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, backups
+}
+
+func TestOfflineLegacyScopeWitnessPreservesRemoteOwnership(t *testing.T) {
+	cfg, backups := legacyIncomingFixture(t)
+	before := originalFacts(t, cfg.Path)
+	witness := &coredata.LegacyLocalScopeHandoff{PreviousKernelBootID: "old-kernel", ReplacementKernelBootID: "new-kernel", PreviousAgentBootID: "old-agent", RunIDs: []string{"kept-run"}}
+	receipt, err := coredata.Upgrade13To14WithLocalScope(t.Context(), cfg, filepath.Join(backups, "before.db"), witness)
+	if err != nil || receipt.From != 13 || receipt.To != 14 {
+		t.Fatalf("offline witness: %+v %v", receipt, err)
+	}
+	if got := originalFacts(t, filepath.Join(backups, "before.db")); !reflect.DeepEqual(got, before) {
+		t.Fatal("backup lost pre-upgrade facts")
+	}
+	if got := originalFacts(t, cfg.Path); !reflect.DeepEqual(got["run_remote_pending"], before["run_remote_pending"]) || !reflect.DeepEqual(got["sessions"], before["sessions"]) || !reflect.DeepEqual(got["core_resources"], before["core_resources"]) {
+		t.Fatal("scope witness changed accepted Session, configuration or remote relations")
+	}
+	db, err := engine.Open(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store, err := coredata.New(db, api.Scope{Namespace: "core", User: "operator", Workspace: "station"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, found, err := store.GetRunResourceRecovery(t.Context(), "kept-run")
+	if err != nil || !found || state.Joined || state.LegacyLocalScope == nil || state.LegacyLocalScope.PreviousKernelBootID != "old-kernel" || state.AgentBootID != "old-agent" {
+		t.Fatalf("witness hid an outstanding remote child: %+v found=%v err=%v", state, found, err)
+	}
+	want := model.IncomingRunRelease{ParentRunID: "upstream-parent", RootRunID: "up-root1", CallNodeID: "outer", TargetID: "upstream", PrincipalID: "operator", AgentBootID: "old-agent"}
+	if _, err := store.ReleaseIncomingRun(t.Context(), "kept-run", want); errCode(err) != "failed_precondition" {
+		t.Fatalf("pending children allowed incoming release: %v", err)
+	}
+	links, err := store.ListPendingRemoteRuns(t.Context(), "agent", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, link := range links.Links {
+		if link.BootID == "" {
+			if _, err := store.ResolveUnsentRemoteRun(t.Context(), link, model.RunRetentionPolicy{}); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if _, err := store.SettleRemoteRun(t.Context(), link, model.RemoteRunSettlement{Disposition: "canceled", FinishedAt: epoch.Add(time.Second)}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.MarkRemoteRunReleased(t.Context(), link, epoch.Add(2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.ResolveRemoteRun(t.Context(), link, model.RunRetentionPolicy{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	state, _, err = store.GetRunResourceRecovery(t.Context(), "kept-run")
+	if err != nil || !state.Joined {
+		t.Fatalf("exact joined descendants did not complete witness: %+v %v", state, err)
+	}
+	changed, err := store.ReleaseIncomingRun(t.Context(), "kept-run", want)
+	if err != nil || !changed {
+		t.Fatalf("witnessed exact hold: changed=%v err=%v", changed, err)
+	}
+	run, err := store.GetRun(t.Context(), "kept-run")
+	if err != nil || run.Status != model.RunInterrupted {
+		t.Fatalf("business outcome changed: %+v %v", run, err)
+	}
+}
+
+func TestOfflineLegacyScopeRejectsSameKernelAndUnknownSelection(t *testing.T) {
+	for _, tc := range []struct{ name, old, current, run string }{{"same-kernel", "boot", "boot", "kept-run"}, {"unknown-run", "old", "new", "not-a-run"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, backups := legacyIncomingFixture(t)
+			before := originalFacts(t, cfg.Path)
+			_, err := coredata.Upgrade13To14WithLocalScope(t.Context(), cfg, filepath.Join(backups, "before.db"), &coredata.LegacyLocalScopeHandoff{PreviousKernelBootID: tc.old, ReplacementKernelBootID: tc.current, PreviousAgentBootID: "old-agent", RunIDs: []string{tc.run}})
+			if err == nil {
+				t.Fatal("invalid legacy witness succeeded")
+			}
+			if got := originalFacts(t, cfg.Path); !reflect.DeepEqual(got, before) {
+				t.Fatal("rejected witness changed old accepted facts")
+			}
+			old := oldThirteenOwner(t, cfg)
+			_ = old.Close()
+		})
 	}
 }

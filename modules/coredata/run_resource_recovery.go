@@ -46,6 +46,12 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 	} else if !textKey(state.AgentBootID) || state.Resources == nil {
 		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
 	}
+	if state.LocalDriver != "" && state.LocalDriver != "pending" && state.LocalDriver != "joined" && state.LocalDriver != "lost" && state.LocalDriver != "failed" || state.Joined && state.LocalDriver != "" && state.LocalDriver != "joined" && state.LocalDriver != "lost" {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run driver ownership")
+	}
+	if scope := state.LegacyLocalScope; scope != nil && (!textKey(scope.PreviousKernelBootID) || !textKey(scope.ReplacementKernelBootID) || scope.PreviousKernelBootID == scope.ReplacementKernelBootID || state.AgentBootID == "" || state.LocalDriver != "") {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid witnessed legacy local scope")
+	}
 	if len(state.RemoteProviders) > model.MaxRemoteRunLinks || !state.TrackRemoteProviders && len(state.RemoteProviders) != 0 {
 		return model.RunResourceRecovery{}, false, failure("data_loss", "untracked remote provider selection")
 	}
@@ -72,7 +78,7 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 		if state.Joined && resource.Kind == "local-call" && !resource.LocalJoined {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined local child")
 		}
-		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" && resource.Kind != "local-call" {
+		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" && resource.Kind != "local-call" && resource.Kind != "completed-effect" {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
@@ -80,7 +86,7 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 }
 
 func validateRecoveryAdmission(a model.RunResourceAdmission) error {
-	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "workflow-call" && a.Kind != "local-call" && a.Kind != "uncovered-effect") {
+	if !textKey(a.ID) || !textKey(a.NodeID) || (a.Kind != "process" && a.Kind != "command" && a.Kind != "workflow-call" && a.Kind != "local-call" && a.Kind != "uncovered-effect" && a.Kind != "completed-effect") {
 		return failure("invalid_argument", "exact resource ID, node ID and supported kind are required")
 	}
 	return nil
@@ -177,7 +183,7 @@ func (s *Store) GetRunResourceRecovery(ctx context.Context, runID string) (model
 // A repeated identical admission is a no-op. Storage errors, including an
 // unknown COMMIT disposition, must be joined before the caller starts work.
 func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) error {
-	if !textKey(runID) || !textKey(bootID) || admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined {
+	if !textKey(runID) || !textKey(bootID) || admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined || admission.Kind == "completed-effect" {
 		return engine.WriteRefused(failure("invalid_argument", "exact Run and boot admission is required"))
 	}
 	if err := validateRecoveryAdmission(admission); err != nil {
@@ -204,6 +210,41 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 	})
 }
 
+// CompleteRunEffect records the return of the exact previously admitted
+// synchronous effect. A canceled or failed transport is not a remote join.
+func (s *Store) CompleteRunEffect(ctx context.Context, runID, bootID, id, nodeID string) error {
+	for _, value := range []string{runID, bootID, id, nodeID} {
+		if !textKey(value) {
+			return engine.WriteRefused(failure("invalid_argument", "exact Run effect identity is required"))
+		}
+	}
+	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		_, state, found, err := readRunRecovery(ctx, tx, s.scope, runID)
+		if err != nil {
+			return err
+		}
+		if !found || state.AgentBootID != bootID {
+			return failure("failed_precondition", "effect has no matching execution owner")
+		}
+		for i := range state.Resources {
+			a := &state.Resources[i]
+			if a.ID == id && a.NodeID == nodeID {
+				if a.Kind == "completed-effect" {
+					return nil
+				}
+				if a.Kind != "uncovered-effect" || state.Joined {
+					return failure("failed_precondition", "effect was not admitted or is already joined")
+				}
+				// Both kind strings have the same encoded length; this completion
+				// consumes no additional storage capacity.
+				a.Kind = "completed-effect"
+				return writeRunRecovery(ctx, tx, s.scope, runID, state, false)
+			}
+		}
+		return failure("failed_precondition", "effect was not admitted")
+	})
+}
+
 // JoinRunResource persists only the exact process owner's positive join. The
 // source PID evidence may retire only after this durable write is accepted.
 func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin, policy model.RunRetentionPolicy) (model.RunRecoveryTransition, error) {
@@ -218,6 +259,10 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 		var cut retentionChanges
 		complete := func() error {
 			var err error
+			if _, err = sealRunResourceRecovery(ctx, tx, s.scope, proof.RunID, proof.AgentBootID); err != nil {
+				return err
+			}
+			cut.touch(proof.RunID)
 			result.Recovered, err = completeLocalAncestors(ctx, tx, s.scope, proof.RunID, &cut, true)
 			if err != nil {
 				return err
@@ -228,7 +273,7 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 			result.Retention, err = retentionEffect(ctx, tx, s.scope, &cut, policy)
 			return err
 		}
-		status, state, found, err := readRunRecovery(ctx, tx, s.scope, proof.RunID)
+		_, state, found, err := readRunRecovery(ctx, tx, s.scope, proof.RunID)
 		if err != nil {
 			return err
 		}
@@ -249,9 +294,8 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 				}
 				return failure("failed_precondition", "resource already has a different join")
 			}
-			if !model.RunStatus(status).Open() && model.RunStatus(status) != model.RunInterrupted {
-				return failure("failed_precondition", "a normally finished Run cannot acquire a late join")
-			}
+			// The terminal business outcome can be durable before a physically
+			// joined resource's receipt reaches the same owner.
 			if state.Joined {
 				return failure("failed_precondition", "Run is already joined")
 			}
@@ -268,6 +312,62 @@ func (s *Store) JoinRunResource(ctx context.Context, proof model.RunResourceJoin
 		return model.RunRecoveryTransition{}, err
 	}
 	return result, err
+}
+
+// JoinRunDriver records the accepted local root owner's actual driver join.
+// This does not assert that any admitted process or remote child has joined.
+// The values have equal or smaller encoded size than the admitted "pending"
+// value, so completion does not require new storage capacity.
+func (s *Store) JoinRunDriver(ctx context.Context, runID, bootID, outcome string, policy model.RunRetentionPolicy) (model.RunRetentionEffect, error) {
+	if !textKey(runID) || !textKey(bootID) {
+		return model.RunRetentionEffect{}, engine.WriteRefused(failure("invalid_argument", "exact root Run and execution boot are required"))
+	}
+	if outcome != "joined" && outcome != "failed" && outcome != "lost" {
+		return model.RunRetentionEffect{}, engine.WriteRefused(failure("invalid_argument", "actual joined, failed, or replaced driver outcome required"))
+	}
+	if err := validateRetentionPolicy(policy); err != nil {
+		return model.RunRetentionEffect{}, engine.WriteRefused(err)
+	}
+	var effect model.RunRetentionEffect
+	err := s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		var parent, root string
+		if err := tx.QueryRowContext(ctx, "SELECT parent_run_id,root_run_id FROM runs WHERE scope=? AND id=?", s.scope, runID).Scan(&parent, &root); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return failure("not_found", "run not found")
+			}
+			return err
+		}
+		_, state, found, err := readRunRecovery(ctx, tx, s.scope, runID)
+		if err != nil {
+			return err
+		}
+		if parent != "" || root != runID || !found || state.AgentBootID != bootID || state.LocalDriver == "" {
+			return failure("failed_precondition", "Run has no matching local root driver")
+		}
+		if state.LocalDriver != "pending" && state.LocalDriver != outcome {
+			return failure("failed_precondition", "local root driver already has a different outcome")
+		}
+		if state.LocalDriver == "pending" {
+			state.LocalDriver = outcome
+			if err := writeRunRecovery(ctx, tx, s.scope, runID, state, false); err != nil {
+				return err
+			}
+		}
+		if _, err := sealRunResourceRecovery(ctx, tx, s.scope, runID, bootID); err != nil {
+			return err
+		}
+		var cut retentionChanges
+		cut.touch(runID)
+		if err := cut.finish(ctx, tx, s.scope); err != nil {
+			return err
+		}
+		effect, err = retentionEffect(ctx, tx, s.scope, &cut, policy)
+		return err
+	})
+	if err != nil {
+		return model.RunRetentionEffect{}, err
+	}
+	return effect, nil
 }
 
 // SealRunResourceRecovery is a positive exact-Run receipt. Incoming retention
@@ -289,20 +389,37 @@ func (s *Store) SealRunResourceRecovery(ctx context.Context, runID, bootID strin
 	})
 }
 
-// Called on one exact newly interrupted Run. Empty bootID is internal to the
-// interruption transaction; it selects the already stamped original boot.
+// Called on one exact terminal Run. Empty bootID is internal to existing
+// owner transactions; it selects the already stamped original boot.
 func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, bootID string) (bool, error) {
 	status, state, found, err := readRunRecovery(ctx, tx, scope, runID)
 	if err != nil {
 		return false, err
 	}
-	if !found || state.AgentBootID == "" || model.RunStatus(status) != model.RunInterrupted || (bootID != "" && state.AgentBootID != bootID) {
+	if !found || state.AgentBootID == "" || !model.RunStatus(status).Terminal() || (bootID != "" && state.AgentBootID != bootID) {
+		return false, nil
+	}
+	if state.LocalDriver != "" {
+		if state.LocalDriver != "joined" && state.LocalDriver != "lost" {
+			return false, nil
+		}
+	} else if model.RunStatus(status) != model.RunInterrupted {
 		return false, nil
 	}
 	if state.Joined {
 		return true, nil
 	}
+	var cleanupFailed bool
+	if err := tx.QueryRowContext(ctx, "SELECT cleanup_failed FROM runs WHERE scope=? AND id=?", scope, runID).Scan(&cleanupFailed); err != nil {
+		return false, err
+	}
+	if cleanupFailed {
+		return false, nil
+	}
 	for _, a := range state.Resources {
+		if a.Kind == "completed-effect" {
+			continue
+		}
 		// Remote calls first acquire a durable outbound relation. A local child
 		// remains unjoined until its physical owner and all of its own admitted
 		// resources have supplied their exact evidence.

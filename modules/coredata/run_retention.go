@@ -27,6 +27,7 @@ const retentionLocalChildClear = `NOT EXISTS (SELECT 1 FROM runs owner
   AND coalesce(json_extract(admission.value,'$.localJoined'),0)=0)
  ELSE 1 END)`
 const retentionPendingClear = `CASE WHEN r.pending_remote_count<>0 THEN 0
+ WHEN length(r.resource_recovery_json)>0 AND CASE WHEN json_valid(CAST(r.resource_recovery_json AS TEXT)) THEN coalesce(json_extract(CAST(r.resource_recovery_json AS TEXT),'$.localDriver'),'')<>'' AND coalesce(json_extract(CAST(r.resource_recovery_json AS TEXT),'$.joined'),0)=0 ELSE 1 END THEN 0
  WHEN r.incoming_remote_target_id<>'' AND r.incoming_hold_released=0 THEN 0
  WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.owner_run_id=r.id) THEN 0
  WHEN EXISTS (SELECT 1 FROM run_remote_pending p WHERE p.scope=r.scope AND p.root_run_id=r.id) THEN 0

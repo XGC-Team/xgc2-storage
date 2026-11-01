@@ -182,6 +182,8 @@ func completeLocalAncestors(ctx context.Context, tx *sql.Tx, scope, childID stri
 		}
 		for _, a := range child.Resources {
 			switch a.Kind {
+			case "completed-effect":
+				// This exact effect returned successfully before its owner ended.
 			case "workflow-call":
 				// Its actual outbound relation must have closed below.
 			case "local-call":
@@ -223,7 +225,9 @@ func completeLocalAncestors(ctx context.Context, tx *sql.Tx, scope, childID stri
 			if err != nil {
 				return nil, err
 			}
-			recovered = append(recovered, row)
+			if row.Status == model.RunInterrupted {
+				recovered = append(recovered, row)
+			}
 		}
 		childID = parentID
 	}

@@ -1,14 +1,26 @@
 package model
 
-// RunResourceRecovery is the current-format control fact for an incoming Run
-// or its exactly admitted local child. It is separate from the public node
+// RunResourceRecovery is the current-format control fact for an accepted Run
+// and its exactly admitted local children. It is separate from the public node
 // outcome and absent for historical Runs whose effects were not recorded.
 type RunResourceRecovery struct {
-	AgentBootID          string                       `json:"agentBootId"`
-	Resources            []RunResourceAdmission       `json:"resources"`
-	Joined               bool                         `json:"joined"`
+	AgentBootID string                 `json:"agentBootId"`
+	Resources   []RunResourceAdmission `json:"resources"`
+	Joined      bool                   `json:"joined"`
+	// LocalDriver records the accepted local root's actual in-process driver
+	// join, separately from its admitted processes and remote children. It is
+	// absent for incoming and local child Runs, whose caller owns that join.
+	LocalDriver          string                       `json:"localDriver,omitempty"`
+	LegacyLocalScope     *RunLegacyLocalScope         `json:"legacyLocalScope,omitempty"`
 	TrackRemoteProviders bool                         `json:"trackRemoteProviders,omitempty"`
 	RemoteProviders      []RunRemoteProviderSelection `json:"remoteProviders,omitempty"`
+}
+
+// RunLegacyLocalScope is an explicit offline maintenance witness for the
+// selected pre-14 local OS scope. It is never inferred on ordinary startup.
+type RunLegacyLocalScope struct {
+	PreviousKernelBootID    string `json:"previousKernelBootId"`
+	ReplacementKernelBootID string `json:"replacementKernelBootId"`
 }
 
 // RunRecoveryTransition carries exact newly completed callers and the
