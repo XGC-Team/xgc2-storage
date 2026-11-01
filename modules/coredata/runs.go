@@ -357,8 +357,12 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 		return model.Run{}, false, err
 	}
 	storedNodes := []byte{}
-	if q.RecoveryAgentBootID != "" {
-		raw, err := encodeRecoveryNodes(nil, model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, Resources: []model.RunResourceAdmission{}})
+	if q.RecoveryAgentBootID != "" || q.TrackRemoteProviderRecovery {
+		state := model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, TrackRemoteProviders: q.TrackRemoteProviderRecovery}
+		if q.RecoveryAgentBootID != "" {
+			state.Resources = []model.RunResourceAdmission{}
+		}
+		raw, err := encodeRecoveryNodes(nil, state)
 		if err != nil {
 			return model.Run{}, false, err
 		}
@@ -481,7 +485,7 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		return existing, nil
 	}
 	trackedNodes := false
-	if f.RecoveryAgentBootID != "" {
+	if f.RecoveryAgentBootID != "" || f.TrackRemoteProviderRecovery {
 		var stored []byte
 		if err := tx.QueryRowContext(ctx, "SELECT nodes_json FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&stored); err != nil {
 			return model.Run{}, err
@@ -490,7 +494,7 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		if err != nil {
 			return model.Run{}, err
 		}
-		if !tracked || recovery.AgentBootID != f.RecoveryAgentBootID {
+		if !tracked || recovery.AgentBootID != f.RecoveryAgentBootID || recovery.TrackRemoteProviders != f.TrackRemoteProviderRecovery {
 			return model.Run{}, failure("failed_precondition", "finish does not match the admitted Run resource owner")
 		}
 		nodes, err = encodeRecoveryNodes(nodes, recovery)

@@ -82,8 +82,26 @@ func decodeRecoveryNodes(raw []byte) ([]byte, model.RunResourceRecovery, bool, e
 	var envelope resourceRecoveryNodes
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&envelope); err != nil || envelope.Format != resourceRecoveryFormat || !textKey(envelope.Recovery.AgentBootID) || envelope.Recovery.Resources == nil || len(envelope.Nodes) > model.MaxRunNodesBytes {
+	if err := decoder.Decode(&envelope); err != nil || envelope.Format != resourceRecoveryFormat || len(envelope.Nodes) > model.MaxRunNodesBytes {
 		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid Run resource recovery fact")
+	}
+	if envelope.Recovery.AgentBootID == "" {
+		if !envelope.Recovery.TrackRemoteProviders || envelope.Recovery.Resources != nil || envelope.Recovery.Joined {
+			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
+		}
+	} else if !textKey(envelope.Recovery.AgentBootID) || envelope.Recovery.Resources == nil {
+		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
+	}
+	if len(envelope.Recovery.RemoteProviders) > model.MaxRemoteRunLinks || !envelope.Recovery.TrackRemoteProviders && len(envelope.Recovery.RemoteProviders) != 0 {
+		return nil, model.RunResourceRecovery{}, false, failure("data_loss", "untracked remote provider selection")
+	}
+	selected := make(map[string]bool, len(envelope.Recovery.RemoteProviders))
+	for _, item := range envelope.Recovery.RemoteProviders {
+		key := item.Link.TargetID + "\x00" + item.Link.RunID
+		if validateRemoteProviderSelection(item) != nil || selected[key] {
+			return nil, model.RunResourceRecovery{}, false, failure("data_loss", "invalid remote provider selection")
+		}
+		selected[key] = true
 	}
 	seen := make(map[string]bool, len(envelope.Recovery.Resources))
 	for _, resource := range envelope.Recovery.Resources {
@@ -135,6 +153,11 @@ func readRecoveryNodes(ctx context.Context, tx *sql.Tx, scope, runID string) (st
 	}
 	nodes, state, found, err := decodeStoredNodes(stored)
 	if err == nil && found {
+		for _, item := range state.RemoteProviders {
+			if item.Link.OwnerRunID != runID {
+				return "", nil, model.RunResourceRecovery{}, false, failure("data_loss", "selected provider belongs to a different Run")
+			}
+		}
 		for _, resource := range state.Resources {
 			if resource.Join != nil && resource.Join.RunID != runID {
 				return "", nil, model.RunResourceRecovery{}, false, failure("data_loss", "resource join belongs to a different Run")
@@ -192,7 +215,7 @@ func (s *Store) GetRunResourceRecovery(ctx context.Context, runID string) (model
 	}
 	out, err := read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (result, error) {
 		_, _, state, found, err := readRecoveryNodes(ctx, tx, scope, runID)
-		return result{state, found}, err
+		return result{state, found && state.AgentBootID != ""}, err
 	})
 	return out.state, out.found, err
 }
@@ -295,7 +318,7 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 	if err != nil {
 		return false, err
 	}
-	if !found || model.RunStatus(status) != model.RunInterrupted || (bootID != "" && state.AgentBootID != bootID) {
+	if !found || state.AgentBootID == "" || model.RunStatus(status) != model.RunInterrupted || (bootID != "" && state.AgentBootID != bootID) {
 		return false, nil
 	}
 	if state.Joined {

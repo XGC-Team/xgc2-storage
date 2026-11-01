@@ -105,6 +105,9 @@ type NewRun struct {
 	// admission contract at the same durable cut as Run creation. Empty means
 	// that older or otherwise uncovered effects have unknown cleanup.
 	RecoveryAgentBootID string
+	// TrackRemoteProviderRecovery records selected remote providers for this
+	// newly admitted Run; old Runs without this fact remain unknown.
+	TrackRemoteProviderRecovery bool
 }
 
 // RunStatusUpdate moves an open Run to running or stopping.
@@ -129,7 +132,8 @@ type RunFinish struct {
 	At            time.Time
 	// RecoveryAgentBootID selects the same Run-resource owner stamped at
 	// admission; a tracked Run cannot finish by discarding that evidence.
-	RecoveryAgentBootID string
+	RecoveryAgentBootID         string
+	TrackRemoteProviderRecovery bool
 }
 
 // CreatedRun is the per-item result of creating a Run in ApplyRunOps.

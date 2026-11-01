@@ -98,6 +98,41 @@ func BenchmarkAdmitRunResourceDurable(b *testing.B) {
 	report(b, db, before, "admissions/s")
 }
 
+// Measure actual provider selection commits with eight pending slots per Run.
+// Run and relation setup is outside the timed window.
+func BenchmarkAdmitRemoteProviderRecovery(b *testing.B) {
+	core, db := benchCore(b)
+	ctx := context.Background()
+	for group := 0; group < (b.N+7)/8; group++ {
+		q := benchRun(fmt.Sprintf("parent-%d", group))
+		q.SessionID, q.TrackRemoteProviderRecovery = "session", true
+		if _, _, err := core.CreateRun(ctx, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+	for i := 0; i < b.N; i++ {
+		parent := fmt.Sprintf("parent-%d", i/8)
+		link := model.RemoteRunLink{OwnerRunID: parent, RootRunID: parent, TargetID: fmt.Sprintf("agent-%d", i%8),
+			RunID: fmt.Sprintf("child-%d", i), CallNodeID: "call", BootID: "old-agent-boot"}
+		if err := core.ReserveRemoteRun(ctx, link); err != nil {
+			b.Fatal(err)
+		}
+	}
+	before, err := db.Stats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	latencies(b, func(i int) error {
+		parent := fmt.Sprintf("parent-%d", i/8)
+		link := model.RemoteRunLink{OwnerRunID: parent, RootRunID: parent, TargetID: fmt.Sprintf("agent-%d", i%8),
+			RunID: fmt.Sprintf("child-%d", i), CallNodeID: "call", BootID: "old-agent-boot"}
+		return core.AdmitRemoteProviderRecovery(ctx, model.RunRemoteProviderSelection{Link: link, SessionID: "session",
+			NodeID: "serve", ResourceID: fmt.Sprintf("process-%d", i), Incarnation: fmt.Sprintf("incarnation-%d", i),
+			WorkflowResourceID: "workflow", WorkflowCommitID: "commit", WorkflowDigest: strings.Repeat("d", 64)})
+	})
+	report(b, db, before, "selections/s")
+}
+
 func BenchmarkUpdateRunStatusRelaxed(b *testing.B) {
 	core, db := benchCore(b)
 	ctx := context.Background()
