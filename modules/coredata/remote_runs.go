@@ -89,8 +89,8 @@ func (s *Store) ReserveRemoteRun(ctx context.Context, link model.RemoteRunLink) 
 }
 
 // ResolveRemoteRun requires an exact terminal/joined identity whose bound
-// relation already passed settle and release, or a definitively unbound
-// reservation. A bound relation that is not yet released cannot resolve: the
+// relation already passed settle and release. A relation that is not yet
+// released cannot resolve through this operation: the
 // callee's incoming hold is still owed. A Stop acceptance alone is not a
 // reason to call it.
 func (s *Store) ResolveRemoteRun(ctx context.Context, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
@@ -98,9 +98,8 @@ func (s *Store) ResolveRemoteRun(ctx context.Context, link model.RemoteRunLink, 
 }
 
 // ResolveUnsentRemoteRun resolves an exact relation under the caller's
-// definitive unsent proof. It applies only to a still-unbound reservation:
-// once a remote process identity bound, the relation owes settle and release
-// before any resolution, whatever the caller believes about the send.
+// definitive no-effect proof. A boot binding is admission identity, not proof
+// that Start was sent. Only the still-open exact relation may resolve here.
 func (s *Store) ResolveUnsentRemoteRun(ctx context.Context, link model.RemoteRunLink, policy model.RunRetentionPolicy) (model.RemoteRunResolveResult, error) {
 	return s.resolveRemote(ctx, link, policy, remoteResolveUnsent)
 }
@@ -515,18 +514,14 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 		}
 		if resolve {
 			switch {
-			case op == remoteResolveUnsent && existingBoot != "":
-				// "Unsent" is provable only for a relation that never bound a
-				// remote process; a bound row always owes settlement/release.
-				return false, failure("failed_precondition", "a bound remote relation is not unsent")
 			case op == remoteResolveUnsent && current.Phase != model.RemoteRunOpen:
 				return false, failure("failed_precondition", "a settled or released remote relation is no longer unsent")
 			case op == remoteResolve && existingBoot == "":
 				return false, failure("failed_precondition", "an unbound relation requires a no-send proof")
 			case op == remoteResolve && existingBoot != "" && current.Phase != model.RemoteRunReleased:
 				// A bound relation owes the callee's incoming hold its release.
-				// Definitively-unsent reservations stay unbound and resolve
-				// directly; anything else must settle and release first.
+				// A live caller with definitive no-effect proof uses the explicit
+				// unsent operation; all other relations settle and release first.
 				return false, failure("failed_precondition", "a bound remote relation must settle and release before resolution")
 			}
 			funded, e := remoteLinkFundedBytes(current)

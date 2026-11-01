@@ -396,7 +396,7 @@ func TestSettleRemoteRunGatesBoundRelation(t *testing.T) {
 	}
 }
 
-func TestResolveUnsentRemoteRunRefusesBoundProcess(t *testing.T) {
+func TestResolveUnsentRemoteRunRequiresExactBootEvenBeforeSend(t *testing.T) {
 	f := openStore(t)
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {
 		t.Fatal(err)
@@ -405,9 +405,15 @@ func TestResolveUnsentRemoteRunRefusesBoundProcess(t *testing.T) {
 	if err := f.core.ReserveRemoteRun(f.ctx, bound); err != nil {
 		t.Fatal(err)
 	}
-	// Neither an unbooted claim nor the exact bound boot can pretend unsent.
-	if _, err := f.core.ResolveUnsentRemoteRun(f.ctx, bound, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
-		t.Fatalf("bound relation resolved as unsent: %v", err)
+	// The caller owns the no-effect proof; Storage still requires the exact
+	// originally bound boot and an open relation.
+	wrong := bound
+	wrong.BootID = "other-boot"
+	if _, err := f.core.ResolveUnsentRemoteRun(f.ctx, wrong, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
+		t.Fatalf("wrong boot resolved the no-effect relation: %v", err)
+	}
+	if out, err := f.core.ResolveUnsentRemoteRun(f.ctx, bound, model.RunRetentionPolicy{}); err != nil || !out.Changed {
+		t.Fatalf("exact bound no-effect relation did not resolve: %+v %v", out, err)
 	}
 	unbound := model.RemoteRunLink{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent", RunID: "unsent", CallNodeID: "call"}
 	if err := f.core.ReserveRemoteRun(f.ctx, unbound); err != nil {
