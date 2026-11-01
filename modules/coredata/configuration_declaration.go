@@ -15,7 +15,7 @@ import (
 
 // DeclareConfigurationDomains applies the owner's deployment facts in one
 // durable transaction. It is the only way a domain enters the catalog; no data
-// call adopts one. Existing fixed capabilities cannot be changed.
+// call adopts one. Existing fixed capabilities cannot be changed; explicit schema advances are CAS guarded.
 func DeclareConfigurationDomains(ctx context.Context, db *engine.Store, domains []model.ConfigurationDomainDeclaration) error {
 	if len(domains) == 0 || len(domains) > 256 {
 		return failure("invalid_argument", "bounded explicit domain declarations required")
@@ -29,6 +29,10 @@ func DeclareConfigurationDomains(ctx context.Context, db *engine.Store, domains 
 			for i := range domains {
 				if len(domains[i].Capabilities) <= 64 {
 					domains[i].Capabilities = slices.Clone(domains[i].Capabilities)
+				}
+				if domains[i].PreviousSchema != nil {
+					previous := *domains[i].PreviousSchema
+					domains[i].PreviousSchema = &previous
 				}
 			}
 		}); err != nil {
@@ -58,14 +62,21 @@ func declareDomains(ctx context.Context, tx *sql.Tx, domains []model.Configurati
 				return err
 			}
 			var version int
+			var identity, registryDigest string
 			var old []byte
 			var visibility, system bool
-			err = tx.QueryRowContext(ctx, "SELECT schema_version,capabilities,main_visibility,system_provisioning FROM core_configuration_domains WHERE domain=?", d.Key).Scan(&version, &old, &visibility, &system)
+			err = tx.QueryRowContext(ctx, "SELECT schema_version,capabilities,main_visibility,system_provisioning,schema_identity,registry_digest FROM core_configuration_domains WHERE domain=?", d.Key).Scan(&version, &old, &visibility, &system, &identity, &registryDigest)
 			if err == nil {
-				if version != d.SchemaVersion || !bytes.Equal(old, body) || visibility != d.MainVisibility || system != d.AllowSystemProvisioning {
+				if !bytes.Equal(old, body) || visibility != d.MainVisibility || system != d.AllowSystemProvisioning {
 					return failure("conflict", "fixed domain schema or capabilities changed")
 				}
-				_, err = tx.ExecContext(ctx, "UPDATE core_configuration_domains SET schema_identity=?,registry_digest=? WHERE domain=?", d.SchemaIdentity, d.RegistryDigest, d.Key)
+				if version != d.SchemaVersion {
+					previous := d.PreviousSchema
+					if previous == nil || previous.Key != d.Key || previous.SchemaVersion != version || previous.SchemaIdentity != identity || previous.RegistryDigest != registryDigest || d.SchemaVersion <= version {
+						return failure("conflict", "schema advance requires the exact previous owner declaration")
+					}
+				}
+				_, err = tx.ExecContext(ctx, "UPDATE core_configuration_domains SET schema_identity=?,schema_version=?,registry_digest=? WHERE domain=?", d.SchemaIdentity, d.SchemaVersion, d.RegistryDigest, d.Key)
 			} else if errors.Is(err, sql.ErrNoRows) {
 				_, err = tx.ExecContext(ctx, "INSERT INTO core_configuration_domains VALUES(?,?,?,?,?,?,?)", d.Key, d.SchemaIdentity, d.SchemaVersion, d.RegistryDigest, body, d.MainVisibility, d.AllowSystemProvisioning)
 			}
