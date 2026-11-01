@@ -19,9 +19,10 @@ import (
 // Run is an idempotent success — the hold cannot outlive its row — and an
 // already released hold reports no change. Release requires the caller's
 // clean-terminal/join proof: the child must have reached a clean terminal
-// disposition (succeeded/failed/stopped/canceled with no failed cleanup);
-// open, interrupted or cleanup-failed rows keep their hold since they may
-// still own remote work. Release never reads the child's prunable payload.
+// disposition (succeeded/failed/stopped/canceled with no failed cleanup).
+// An interrupted child can also be released after its local resource owner
+// confirms join and its actual remote descendants have joined. Release never
+// reads the child's prunable payload.
 // Transport authentication of the current legitimate caller is the ingress
 // owner's job; this store only compares the exact historical call facts it
 // stamped.
@@ -74,13 +75,29 @@ func releaseIncomingRun(ctx context.Context, tx *sql.Tx, scope, runID string, wa
 	if released != 0 {
 		return false, nil
 	}
-	// Release requires the caller's clean-terminal/join proof: only a child
-	// that reached a clean terminal disposition (succeeded/failed/stopped/
-	// canceled with no failed cleanup) may have its hold released. Open,
-	// interrupted or cleanup-failed rows keep their hold — they may still own
-	// remote work.
+	// The local join is supplied by the Agent resource owner, never inferred
+	// from the interrupted result. Remote descendants have their own durable
+	// owners and must also be resolved before this hold can be released.
 	switch model.RunStatus(status) {
 	case model.RunSucceeded, model.RunFailed, model.RunStopped, model.RunCanceled:
+	case model.RunInterrupted:
+		if !want.LocalJoined {
+			return false, failure("failed_precondition", "the interrupted child has no local join")
+		}
+		open, err := interruptedChildHasOpenLocal(ctx, tx, scope, runID, root)
+		if err != nil {
+			return false, err
+		}
+		if open {
+			return false, failure("failed_precondition", "the interrupted child still owns a local Run")
+		}
+		pending, err := interruptedChildHasPendingRemote(ctx, tx, scope, runID, root)
+		if err != nil {
+			return false, err
+		}
+		if pending {
+			return false, failure("failed_precondition", "the interrupted child still owns remote work")
+		}
 	default:
 		return false, failure("failed_precondition", "the incoming child Run has no clean terminal disposition")
 	}
@@ -94,6 +111,43 @@ func releaseIncomingRun(ctx context.Context, tx *sql.Tx, scope, runID string, wa
 	var cut retentionChanges
 	cut.touch(runID)
 	return true, cut.finish(ctx, tx, scope)
+}
+
+func interruptedChildHasOpenLocal(ctx context.Context, tx *sql.Tx, scope, runID, root string) (bool, error) {
+	const q = `WITH RECURSIVE descendants(id) AS (
+ SELECT ?2 UNION
+ SELECT r.id FROM runs r JOIN descendants parent ON r.parent_run_id=parent.id
+ WHERE r.scope=?1 AND r.root_run_id=?3
+)
+SELECT EXISTS(SELECT 1 FROM descendants child JOIN runs r ON r.scope=?1 AND r.id=child.id
+ WHERE child.id<>?2 AND r.status IN ('queued','running','stopping'))`
+	var open bool
+	err := tx.QueryRowContext(ctx, q, scope, runID, root).Scan(&open)
+	return open, err
+}
+
+// Pending remote owners can belong to local descendants. Walk only the
+// selected root's existing pending owners towards their recorded parents; a
+// missing intermediate parent is unknown and cannot establish this join.
+// An unrelated sibling with intact lineage does not block this child.
+func interruptedChildHasPendingRemote(ctx context.Context, tx *sql.Tx, scope, runID, root string) (bool, error) {
+	const q = `WITH RECURSIVE lineage(id,parent,depth) AS (
+ SELECT r.id,r.parent_run_id,r.depth
+ FROM run_remote_pending p LEFT JOIN runs r ON r.scope=p.scope AND r.id=p.owner_run_id
+ WHERE p.scope=?1 AND p.root_run_id=?2
+ UNION
+ SELECT parent.id,parent.parent_run_id,parent.depth
+ FROM lineage child JOIN runs parent ON parent.scope=?1 AND parent.id=child.parent
+ WHERE child.id<>?3 AND child.parent<>?2 AND parent.root_run_id=?2 AND parent.depth=child.depth-1
+)
+SELECT EXISTS(SELECT 1 FROM lineage child
+ WHERE child.id IS NULL OR child.id=?3 OR
+ (child.id<>?2 AND child.id<>?3 AND child.parent<>?2 AND child.parent<>'' AND NOT EXISTS (
+   SELECT 1 FROM runs parent WHERE parent.scope=?1 AND parent.id=child.parent AND parent.root_run_id=?2 AND parent.depth=child.depth-1
+ )))`
+	var pending bool
+	err := tx.QueryRowContext(ctx, q, scope, root, runID).Scan(&pending)
+	return pending, err
 }
 
 // RemoteRunIncomingReleaseError retains the requested run and presented facts

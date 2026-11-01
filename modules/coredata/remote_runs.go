@@ -790,7 +790,7 @@ func (s *Store) SettleRemoteRun(ctx context.Context, link model.RemoteRunLink, s
 	// Only a clean terminal disposition proves the remote join; its bounded
 	// length is also what keeps the prefunded encoding bound exact.
 	switch settlement.Disposition {
-	case string(model.RunSucceeded), string(model.RunFailed), string(model.RunStopped), string(model.RunCanceled):
+	case string(model.RunSucceeded), string(model.RunFailed), string(model.RunStopped), string(model.RunCanceled), "recovered":
 	default:
 		return false, engine.WriteRefused(failure("invalid_argument", "remote settlement requires a clean terminal disposition"))
 	}

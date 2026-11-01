@@ -82,6 +82,9 @@ type IncomingRunRelease struct {
 	CallNodeID  string `json:"callNodeId"`
 	TargetID    string `json:"targetId"`
 	PrincipalID string `json:"principalId"`
+	// LocalJoined is supplied only by the Agent's resource owner after it
+	// verifies that an interrupted Run's local resources have joined.
+	LocalJoined bool `json:"localJoined,omitempty"`
 }
 
 // RemoteRunResolveResult reports the committed transition of one exact
