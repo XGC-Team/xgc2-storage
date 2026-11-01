@@ -70,6 +70,34 @@ func BenchmarkCreateRunDurable(b *testing.B) {
 	report(b, db, before, "runs/s")
 }
 
+// One real durable resource admission per incoming Run, including the actual
+// storage transaction and codec work. Setup is outside the measured window.
+func BenchmarkAdmitRunResourceDurable(b *testing.B) {
+	core, db := benchCore(b)
+	ctx := context.Background()
+	if _, _, err := core.CreateRun(ctx, benchRun("parent")); err != nil {
+		b.Fatal(err)
+	}
+	for i := 0; i < b.N; i++ {
+		q := benchRun(fmt.Sprintf("child-%d", i))
+		q.ParentRunID, q.RootRunID, q.CallNodeID, q.Depth = "parent", "parent", "call", 1
+		q.TargetID = "agent"
+		q.IncomingHold = model.IncomingRemoteHold{TargetID: "core", PrincipalID: "core-identity"}
+		q.RecoveryAgentBootID = "agent-boot"
+		if _, _, err := core.CreateRun(ctx, q); err != nil {
+			b.Fatal(err)
+		}
+	}
+	before, err := db.Stats()
+	if err != nil {
+		b.Fatal(err)
+	}
+	latencies(b, func(i int) error {
+		return core.AdmitRunResource(ctx, fmt.Sprintf("child-%d", i), "agent-boot", model.RunResourceAdmission{ID: "process", NodeID: "start", Kind: "process"})
+	})
+	report(b, db, before, "admissions/s")
+}
+
 func BenchmarkUpdateRunStatusRelaxed(b *testing.B) {
 	core, db := benchCore(b)
 	ctx := context.Background()

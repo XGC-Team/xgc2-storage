@@ -101,6 +101,10 @@ type NewRun struct {
 	// atomically with the Run; an idempotent retry can never recreate a
 	// released hold. Released must be false: a hold is created active.
 	IncomingHold IncomingRemoteHold
+	// RecoveryAgentBootID opts this incoming child into the current resource
+	// admission contract at the same durable cut as Run creation. Empty means
+	// that older or otherwise uncovered effects have unknown cleanup.
+	RecoveryAgentBootID string
 }
 
 // RunStatusUpdate moves an open Run to running or stopping.

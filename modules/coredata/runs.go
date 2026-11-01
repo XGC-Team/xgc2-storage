@@ -158,6 +158,14 @@ func scanRun(row scanner, projection ...model.RunProjection) (model.Run, error) 
 			r.Error = rawOrNil(field.stored)
 			continue
 		}
+		if field.target == &r.Nodes {
+			raw, _, _, err := decodeStoredNodes(field.stored)
+			if err != nil {
+				return r, err
+			}
+			*field.target = rawOrNil(raw)
+			continue
+		}
 		raw, err := decodeRunPayload(field.stored, field.limit)
 		if err != nil {
 			return r, err
@@ -283,6 +291,9 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err := validateNewRun(&q); err != nil {
 		return model.Run{}, false, err
 	}
+	if q.RecoveryAgentBootID != "" && (!textKey(q.RecoveryAgentBootID) || !q.IncomingHold.Active()) {
+		return model.Run{}, false, failure("invalid_argument", "resource recovery requires an exact Agent boot and incoming hold")
+	}
 	inputs, err := jsonField("inputs", q.Inputs, model.MaxRunInputsBytes, true, true)
 	if err != nil {
 		return model.Run{}, false, err
@@ -345,13 +356,24 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err != nil {
 		return model.Run{}, false, err
 	}
-	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger)+len(sessionInstance))
+	storedNodes := []byte{}
+	if q.RecoveryAgentBootID != "" {
+		raw, err := encodeRecoveryNodes(nil, model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, Resources: []model.RunResourceAdmission{}})
+		if err != nil {
+			return model.Run{}, false, err
+		}
+		storedNodes, err = encodeRecoveryPayload(raw)
+		if err != nil {
+			return model.Run{}, false, err
+		}
+	}
+	bytes := runBytes(r) - int64(len(inputs)+len(trigger)) + int64(len(storedInputs)+len(storedTrigger)+len(storedNodes)+len(sessionInstance))
 	if err = reserve(ctx, tx, scope, 1, bytes); err != nil {
 		return model.Run{}, false, err
 	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',x'',x'',0,?,?,0,1,?,?,?,0)",
+	_, err = tx.ExecContext(ctx, "INSERT INTO runs(scope,id,target_id,root_run_id,parent_run_id,call_node_id,depth,session_id,session_instance_id,idempotency_key,predecessor_run_id,workflow_resource_id,workflow_commit_id,definition_digest,action_id,inputs_json,trigger_json,source_observation_json,status,termination,error_json,error_summary_json,result_json,nodes_json,cleanup_errors_json,cleanup_failed,created_at,started_at,finished_at,revision,bytes,incoming_remote_target_id,incoming_remote_principal_id,incoming_hold_released) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,x'',x'',x'',?,x'',0,?,?,0,1,?,?,?,0)",
 		scope, r.ID, r.TargetID, r.RootRunID, r.ParentRunID, r.CallNodeID, r.Depth, r.SessionID, sessionInstance, r.IdempotencyKey, r.PredecessorRunID, r.WorkflowResourceID, r.WorkflowCommitID, r.DefinitionDigest, r.ActionID,
-		storedInputs, storedTrigger, []byte(source), string(r.Status), "", nanos(r.CreatedAt), nanos(r.StartedAt), bytes, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID)
+		storedInputs, storedTrigger, []byte(source), string(r.Status), "", storedNodes, nanos(r.CreatedAt), nanos(r.StartedAt), bytes, r.IncomingHold.TargetID, r.IncomingHold.PrincipalID)
 	return r, true, err
 }
 
@@ -458,15 +480,37 @@ func finishRunTransition(ctx context.Context, tx *sql.Tx, scope string, f model.
 		}
 		return existing, nil
 	}
+	trackedNodes := false
+	if f.Status == model.RunInterrupted {
+		var stored []byte
+		if err := tx.QueryRowContext(ctx, "SELECT nodes_json FROM runs WHERE scope=? AND id=?", scope, f.ID).Scan(&stored); err != nil {
+			return model.Run{}, err
+		}
+		_, recovery, tracked, err := decodeStoredNodes(stored)
+		if err != nil {
+			return model.Run{}, err
+		}
+		if tracked {
+			nodes, err = encodeRecoveryNodes(nodes, recovery)
+			if err != nil {
+				return model.Run{}, err
+			}
+			trackedNodes = true
+		}
+	}
 	for _, field := range []*[]byte{&errored, &result, &nodes, &cleanup} {
 		*field, err = encodeRunPayload(*field)
 		if err != nil {
 			return model.Run{}, err
 		}
 	}
-	// An open Run carries none of these columns, so the row only grows by them.
+	if trackedNodes {
+		nodes = append(append([]byte(nil), resourceRecoveryPrefix...), nodes...)
+	}
+	// Account an explicitly tracked Run's old admissions inside the writer;
+	// ordinary changed finishes still select only the same thin driver facts.
 	grown := int64(len(f.Termination) + len(errored) + len(result) + len(nodes) + len(cleanup) + len(preview))
-	if err = charge(ctx, tx, scope, 0, grown); err != nil {
+	if err = chargeRunFinish(ctx, tx, scope, f.ID, grown); err != nil {
 		return model.Run{}, err
 	}
 	var eligible int64

@@ -26,7 +26,7 @@ const retentionSessionClear = `NOT EXISTS (SELECT 1 FROM sessions s WHERE s.scop
 
 // Compute the local predicate once, inside the changed finish UPDATE. The
 // materialized scalar also avoids group guard reads when the local guard fails.
-const retentionFinish = `UPDATE runs AS r SET status=?1,termination=?2,error_json=?3,error_summary_json=?4,result_json=?5,nodes_json=?6,cleanup_errors_json=?7,cleanup_failed=?8,finished_at=?9,revision=revision+1,bytes=bytes+?10,
+const retentionFinish = `UPDATE runs AS r SET status=?1,termination=?2,error_json=?3,error_summary_json=?4,result_json=?5,nodes_json=?6,cleanup_errors_json=?7,cleanup_failed=?8,finished_at=?9,revision=revision+1,bytes=bytes+?10-length(nodes_json),
  (retention_local_ok,retention_eligible)=(WITH local(value) AS MATERIALIZED (SELECT CASE WHEN ?9>0 THEN (` + retentionLocalPlanned + `) ELSE 0 END) SELECT value,CASE WHEN value AND (` + retentionRootPlanned + `) THEN (` + retentionSessionClear + `) ELSE 0 END FROM local)
  WHERE scope=?11 AND id=?12 AND status=?13 RETURNING retention_eligible,predecessor_run_id,CASE WHEN ?8>0 THEN session_id ELSE '' END`
 
