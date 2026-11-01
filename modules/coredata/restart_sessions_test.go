@@ -49,16 +49,17 @@ func TestRestartSessionReservationPromotionAndRemoteRetention(t *testing.T) {
 	if err != nil || pruned.Deleted != 0 {
 		t.Fatalf("queued dependency pruned: %+v %v", pruned, err)
 	}
-	if _, err = f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{}); errCode(err) != "failed_precondition" {
-		t.Fatalf("pending remote promoted: %v", err)
+	active, err := f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{})
+	if err != nil || active.Status != model.SessionOpen || active.PredecessorSessionID != old.ID || active.ExperimentCommitID != "frozen-next" {
+		t.Fatalf("independent Session did not activate: %+v %v", active, err)
+	}
+	page, err := f.core.ListPendingRemoteRuns(f.ctx, link.TargetID, "", 10)
+	if err != nil || len(page.Links) != 1 || page.Links[0].RunID != link.RunID {
+		t.Fatalf("Session activation lost the offline relation: %+v %v", page, err)
 	}
 	releaseBoundRemote(t, f, link)
 	if _, err = f.core.ResolveRemoteRun(f.ctx, link, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
-	}
-	active, err := f.core.ActivateRestartSession(f.ctx, next.ID, model.RunRetentionPolicy{})
-	if err != nil || active.Status != model.SessionOpen || active.PredecessorSessionID != old.ID || active.ExperimentCommitID != "frozen-next" {
-		t.Fatalf("active: %+v %v", active, err)
 	}
 	pruned, err = f.core.PruneRuns(f.ctx, model.RunRetention{OlderThan: epoch.Add(time.Hour), Limit: 100})
 	if err != nil || pruned.Deleted != 1 {

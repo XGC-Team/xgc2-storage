@@ -162,7 +162,7 @@ func TestRestartSessionCleanupFailureRollbackAndRaceWithClear(t *testing.T) {
 	}
 }
 
-func TestRestartSessionDetectsActualPendingRelationWithInconsistentCounter(t *testing.T) {
+func TestRestartSessionKeepsActualPendingRelationWithInconsistentCounter(t *testing.T) {
 	f := openStore(t)
 	p := model.RunRetentionPolicy{OlderThan: epoch.Add(time.Hour)}
 	old := model.NewSession{ID: "old", TargetID: "local", ExperimentResourceID: "e", ExperimentCommitID: "c", RunMode: "simulation", At: epoch}
@@ -193,11 +193,20 @@ func TestRestartSessionDetectsActualPendingRelationWithInconsistentCounter(t *te
 	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(time.Minute)}, p); err != nil {
 		t.Fatal(err)
 	}
-	// Test-only corruption: retain the authoritative relation but hide it
-	// from the counter subset. Activation must still see the indexed link.
+	// Test-only corruption: the actual indexed relation still fences its own
+	// target even when the unrelated Session can activate.
 	f.exec(t, `UPDATE runs SET pending_remote_count=0,pending_remote_bytes=0 WHERE id=?`, q.ID)
-	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID, p); errCode(err) != "failed_precondition" {
-		t.Fatalf("actual pending link was ignored: %v", err)
+	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID, p); err != nil {
+		t.Fatalf("offline relation blocked Session activation: %v", err)
+	}
+	newOwner := newRun("new-owner")
+	newOwner.SessionID = next.ID
+	if _, _, err := f.core.CreateRun(f.ctx, newOwner); err != nil {
+		t.Fatal(err)
+	}
+	attempt := remoteLink(newOwner.ID, newOwner.ID, "new-child")
+	if err := f.core.ReserveRemoteRun(f.ctx, attempt); errCode(err) != "failed_precondition" {
+		t.Fatalf("actual pending relation did not fence its target: %v", err)
 	}
 }
 

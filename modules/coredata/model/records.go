@@ -105,6 +105,9 @@ type NewRun struct {
 	// admission contract at the same durable cut as Run creation. Empty means
 	// that older or otherwise uncovered effects have unknown cleanup.
 	RecoveryAgentBootID string
+	// RecoveryKernelBootID identifies the actual kernel of this Run's local
+	// execution scope. It is not the Agent connection or process boot.
+	RecoveryKernelBootID string
 	// TrackRemoteProviderRecovery records selected remote providers for this
 	// newly admitted Run; old Runs without this fact remain unknown.
 	TrackRemoteProviderRecovery bool

@@ -4,9 +4,14 @@ package model
 // and its exactly admitted local children. It is separate from the public node
 // outcome and absent for historical Runs whose effects were not recorded.
 type RunResourceRecovery struct {
-	AgentBootID string                 `json:"agentBootId"`
-	Resources   []RunResourceAdmission `json:"resources"`
-	Joined      bool                   `json:"joined"`
+	AgentBootID string `json:"agentBootId"`
+	// KernelBootID is the kernel of the execution owner at Run acceptance.
+	// A different replacement kernel ends all processes in that old scope.
+	// Older Runs without this identity remain unknown.
+	KernelBootID     string                 `json:"kernelBootId,omitempty"`
+	KernelReplacedBy string                 `json:"kernelReplacedBy,omitempty"`
+	Resources        []RunResourceAdmission `json:"resources"`
+	Joined           bool                   `json:"joined"`
 	// LocalDriver records the accepted local root's actual in-process driver
 	// join, separately from its admitted processes and remote children. It is
 	// absent for incoming and local child Runs, whose caller owns that join.

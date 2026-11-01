@@ -12,14 +12,11 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-// The predecessor's failed-cleanup fact was read with the Session itself. Each
-// remaining unsafe subset is independently indexed by the exact Session. The
-// pending relation has its own Session selector so a real link is checked
-// even when its owner's counter is inconsistent.
+// The predecessor's failed-cleanup fact was read with the Session itself.
+// Remote relations remain with their exact targets and fence new calls there;
+// they do not occupy the station-wide Session slot.
 const sessionUnsafeActivation = `SELECT CASE
  WHEN EXISTS (SELECT 1 FROM runs INDEXED BY runs_session_instance_open WHERE scope=?1 AND session_id=?2 AND session_id<>'' AND status IN ('queued','running','stopping')) THEN 1
- WHEN EXISTS (SELECT 1 FROM runs INDEXED BY runs_session_pending WHERE scope=?1 AND session_id=?2 AND session_id<>'' AND pending_remote_count>0) THEN 1
- WHEN EXISTS (SELECT 1 FROM run_remote_pending INDEXED BY run_remote_pending_session WHERE scope=?1 AND owner_session_id=?2 AND owner_session_id<>'') THEN 1
  ELSE 0 END`
 
 // QueueRestartSession durably reserves a successor without acquiring the live
@@ -89,7 +86,8 @@ func (s *Store) QueueRestartSession(ctx context.Context, q model.NewSession) (mo
 }
 
 // ActivateRestartSession promotes the same queued identity after the exact old
-// Session closed cleanly and all of its durable remote and cleanup facts joined.
+// Session closed cleanly and its local cleanup joined. Unresolved remote
+// relations remain owned and prevent conflicting calls to their own targets.
 func (s *Store) ActivateRestartSession(ctx context.Context, id string, policy model.RunRetentionPolicy) (model.SessionMutationResult, error) {
 	if err := validateRetentionPolicy(policy); err != nil {
 		return model.SessionMutationResult{}, err

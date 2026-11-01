@@ -20,3 +20,18 @@ func (s *Store) HasPendingRemoteRoot(ctx context.Context, root string) (bool, er
 		return pending, err
 	})
 }
+
+// HasRootStopIntent reads the existing Session's durable accepted Stop for
+// this exact root. A Core restart can interrupt the Run without erasing the
+// separately accepted Session Stop; an interrupted Run alone is not a Stop.
+func (s *Store) HasRootStopIntent(ctx context.Context, root string) (bool, error) {
+	if !textKey(root) {
+		return false, failure("invalid_argument", "root run identity required")
+	}
+	return read(ctx, s, func(ctx context.Context, tx *sql.Tx, scope string) (bool, error) {
+		var requested bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM runs r JOIN sessions s ON s.scope=r.scope AND s.id=r.session_id
+			WHERE r.scope=? AND r.id=? AND r.root_run_id=r.id AND length(s.stop_intent_json)>0)`, scope, root).Scan(&requested)
+		return requested, err
+	})
+}

@@ -23,6 +23,9 @@ func validateLocalRecoveryChild(ctx context.Context, tx *sql.Tx, scope string, q
 	if !found || !model.RunStatus(status).Open() || parent.AgentBootID != q.RecoveryAgentBootID || parent.Joined {
 		return failure("failed_precondition", "local child has no matching open recovery owner")
 	}
+	if parent.KernelBootID != q.RecoveryKernelBootID {
+		return failure("failed_precondition", "local child has a different kernel execution scope")
+	}
 	var root, target string
 	var depth int
 	if err := tx.QueryRowContext(ctx, "SELECT root_run_id,target_id,depth FROM runs WHERE scope=? AND id=?", scope, q.ParentRunID).Scan(&root, &target, &depth); err != nil {
@@ -191,7 +194,7 @@ func completeLocalAncestors(ctx context.Context, tx *sql.Tx, scope, childID stri
 					return recovered, nil
 				}
 			case "process", "command":
-				if a.Join == nil {
+				if a.Join == nil && child.KernelReplacedBy == "" {
 					return recovered, nil
 				}
 			default:

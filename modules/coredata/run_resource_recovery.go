@@ -46,6 +46,10 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 	} else if !textKey(state.AgentBootID) || state.Resources == nil {
 		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run resource coverage")
 	}
+	if state.KernelBootID != "" && (!textKey(state.KernelBootID) || state.AgentBootID == "") ||
+		state.KernelReplacedBy != "" && (!textKey(state.KernelReplacedBy) || state.KernelBootID == "" || state.KernelReplacedBy == state.KernelBootID) {
+		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local kernel scope")
+	}
 	if state.LocalDriver != "" && state.LocalDriver != "pending" && state.LocalDriver != "joined" && state.LocalDriver != "lost" && state.LocalDriver != "failed" || state.Joined && state.LocalDriver != "" && state.LocalDriver != "joined" && state.LocalDriver != "lost" {
 		return model.RunResourceRecovery{}, false, failure("data_loss", "invalid local Run driver ownership")
 	}
@@ -78,7 +82,8 @@ func decodeRunRecovery(raw []byte) (model.RunResourceRecovery, bool, error) {
 		if state.Joined && resource.Kind == "local-call" && !resource.LocalJoined {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined local child")
 		}
-		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" && resource.Kind != "local-call" && resource.Kind != "completed-effect" {
+		if state.Joined && resource.Join == nil && resource.Kind != "workflow-call" && resource.Kind != "local-call" && resource.Kind != "completed-effect" &&
+			!(state.KernelReplacedBy != "" && (resource.Kind == "process" || resource.Kind == "command")) {
 			return model.RunResourceRecovery{}, false, failure("data_loss", "joined Run retains an unjoined resource")
 		}
 	}
@@ -423,7 +428,8 @@ func sealRunResourceRecovery(ctx context.Context, tx *sql.Tx, scope, runID, boot
 		// Remote calls first acquire a durable outbound relation. A local child
 		// remains unjoined until its physical owner and all of its own admitted
 		// resources have supplied their exact evidence.
-		if a.Kind == "local-call" && !a.LocalJoined || a.Kind != "workflow-call" && a.Kind != "local-call" && a.Join == nil {
+		if a.Kind == "local-call" && !a.LocalJoined || a.Kind != "workflow-call" && a.Kind != "local-call" && a.Join == nil &&
+			!(state.KernelReplacedBy != "" && (a.Kind == "process" || a.Kind == "command")) {
 			return false, nil
 		}
 	}

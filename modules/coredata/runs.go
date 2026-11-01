@@ -283,6 +283,9 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	if err := validateNewRun(&q); err != nil {
 		return model.Run{}, false, err
 	}
+	if q.RecoveryKernelBootID != "" && (q.RecoveryAgentBootID == "" || !textKey(q.RecoveryKernelBootID)) {
+		return model.Run{}, false, failure("invalid_argument", "kernel scope requires an exact recovery owner")
+	}
 	if q.RecoveryAgentBootID != "" {
 		if !textKey(q.RecoveryAgentBootID) {
 			return model.Run{}, false, failure("invalid_argument", "resource recovery requires an exact Agent boot")
@@ -357,7 +360,7 @@ func createRunRaw(ctx context.Context, tx *sql.Tx, scope string, q model.NewRun)
 	}
 	storedRecovery := []byte{}
 	if q.RecoveryAgentBootID != "" || q.TrackRemoteProviderRecovery {
-		state := model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, TrackRemoteProviders: q.TrackRemoteProviderRecovery}
+		state := model.RunResourceRecovery{AgentBootID: q.RecoveryAgentBootID, KernelBootID: q.RecoveryKernelBootID, TrackRemoteProviders: q.TrackRemoteProviderRecovery}
 		if q.RecoveryAgentBootID != "" {
 			state.Resources = []model.RunResourceAdmission{}
 			if q.ParentRunID == "" {
