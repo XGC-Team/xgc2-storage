@@ -55,6 +55,8 @@ func recordingArchiveClass(kind, path string) model.RecordingArchiveClass {
 	switch {
 	case kind == "image-gallery":
 		return model.RecordingArchiveGallery
+	case kind == "rosbag-set":
+		return model.RecordingArchiveROSBag
 	case filepath.Ext(path) == ".bag":
 		return model.RecordingArchiveROSBag
 	case filepath.Ext(path) == ".mp4":

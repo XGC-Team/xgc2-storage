@@ -176,6 +176,7 @@ func TestRecordingArchiveClassAndDataFileSelection(t *testing.T) {
 		{"gallery", "image-gallery", "/data/gallery", "session", run.ID, model.RecordingArchiveGallery},
 		{"gallery-bag", "image-gallery", "/data/weird.bag", "session", run.ID, model.RecordingArchiveGallery},
 		{"bag", "rosbag", "/data/bag.bag", "session", run.ID, model.RecordingArchiveROSBag},
+		{"set", "rosbag-set", "/data/set", "session", run.ID, model.RecordingArchiveROSBag},
 		{"screen", "screen-video", "/data/screen.mp4", "session", run.ID, model.RecordingArchiveScreen},
 		{"table", "table", "/data/table.csv", "session", run.ID, model.RecordingArchiveOther},
 		{"movie", "video", "/data/movie.mkv", "session", run.ID, model.RecordingArchiveOther},
@@ -192,7 +193,7 @@ func TestRecordingArchiveClassAndDataFileSelection(t *testing.T) {
 
 	// Data files are every non-gallery archive class of exactly one Experiment.
 	data := must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", DataFilesOnly: true, Order: model.RecordingNewestFirst}))
-	if got := recordingIDs(data); got != "movie,table,screen,bag" {
+	if got := recordingIDs(data); got != "movie,table,screen,set,bag" {
 		t.Fatalf("data files: %s", got)
 	}
 	for _, record := range data.Recordings {
@@ -203,13 +204,13 @@ func TestRecordingArchiveClassAndDataFileSelection(t *testing.T) {
 	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", ArchiveClass: model.RecordingArchiveGallery}))); got != "gallery,gallery-bag" {
 		t.Fatalf("gallery class: %s", got)
 	}
-	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", ArchiveClass: model.RecordingArchiveROSBag}))); got != "bag" {
+	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", ArchiveClass: model.RecordingArchiveROSBag}))); got != "bag,set" {
 		t.Fatalf("rosbag class: %s", got)
 	}
 	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", SessionID: "session", ArchiveClass: model.RecordingArchiveScreen}))); got != "screen" {
 		t.Fatalf("session and class: %s", got)
 	}
-	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", SessionID: "session", DataFilesOnly: true}))); got != "bag,screen,table,movie" {
+	if got := recordingIDs(must(f.core.ListRecordings(f.ctx, model.RecordingFilter{ExperimentResourceID: "exp", SessionID: "session", DataFilesOnly: true}))); got != "bag,set,screen,table,movie" {
 		t.Fatalf("session data files: %s", got)
 	}
 
