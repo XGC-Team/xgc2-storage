@@ -143,9 +143,15 @@ example: [schemas/documents-example.json](schemas/documents-example.json).
 ## Administration
 
 `storage-admin check | stats | checkpoint | backup` (installed as `xgc2-storage-admin`) run offline
-against a stopped owner (they take the same file lock and never migrate). Backup is a consistent `VACUUM INTO`, fsynced,
+against a stopped owner and take the same file lock. Backup is a consistent `VACUUM INTO`, fsynced,
 integrity- and identity-checked, and never overwrites. Restore means starting the owner on a
 verified backup file; there is no tool that edits a live WAL.
+
+The explicit `upgrade-coredata-13-to-14` operation requires the existing database,
+its deployment manifest and a new private backup destination. It takes the same
+exclusive owner lock, verifies and checkpoints the database, creates the backup,
+and adds the typed Run recovery field and version marker atomically. Existing
+empty recovery evidence remains unknown. Normal startup never performs this cut.
 
 ## Build and test
 

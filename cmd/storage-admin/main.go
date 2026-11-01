@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
+	"github.com/XGC-Team/xgc2-storage/modules/coredata"
 	"github.com/XGC-Team/xgc2-storage/registry"
 )
 
@@ -23,11 +24,11 @@ func main() {
 }
 func run() error {
 	if len(os.Args) < 2 {
-		return errors.New("storage-admin: check | stats | checkpoint | backup")
+		return errors.New("storage-admin: check | stats | checkpoint | backup | upgrade-coredata-13-to-14")
 	}
 	operation := os.Args[1]
 	switch operation {
-	case "check", "stats", "checkpoint", "backup":
+	case "check", "stats", "checkpoint", "backup", "upgrade-coredata-13-to-14":
 	default:
 		return errors.New("storage-admin: unknown operation")
 	}
@@ -47,7 +48,7 @@ func run() error {
 	if flags.NArg() != 0 {
 		return errors.New("storage-admin: unexpected positional arguments")
 	}
-	if operation == "backup" && (!filepath.IsAbs(destination) || filepath.Clean(destination) != destination || filepath.Ext(destination) != ".db" || strings.ContainsAny(destination, "\x00?#")) {
+	if (operation == "backup" || operation == "upgrade-coredata-13-to-14") && (!filepath.IsAbs(destination) || filepath.Clean(destination) != destination || filepath.Ext(destination) != ".db" || strings.ContainsAny(destination, "\x00?#")) {
 		return errors.New("storage-admin: canonical absolute backup .db destination required")
 	}
 	f, e := os.Open(manifest)
@@ -59,8 +60,19 @@ func run() error {
 	if e != nil {
 		return e
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	timeout := 30 * time.Second
+	if operation == "upgrade-coredata-13-to-14" {
+		timeout = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	if operation == "upgrade-coredata-13-to-14" {
+		result, err := coredata.Upgrade13To14(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled(), MaxDBBytes: maxDBBytes, CallBudget: timeout}, destination)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
 	// Administration admits the current stored schema without conversion.
 	store, e := engine.Open(ctx, engine.Config{Path: path, Manifest: m, Modules: registry.Compiled(), MaxDBBytes: maxDBBytes})
 	if e != nil {

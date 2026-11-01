@@ -41,8 +41,8 @@ var SchemaSQL string
 //go:embed records.sql
 var RecordsSQL string
 
-// SchemaVersion is the only admitted Core data layout. Development storage is
-// initialized explicitly; this module never migrates or scrubs older facts.
+// SchemaVersion is the only Core data layout admitted by ordinary startup.
+// The explicit, offline 13-to-14 owner operation is separate from startup.
 const SchemaVersion = 14
 
 // Module registers the Core data module with the storage engine.

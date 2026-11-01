@@ -158,6 +158,12 @@ func (s *Store) readerDSN(o *owner) string {
 }
 
 func Open(ctx context.Context, c Config) (s *Store, err error) {
+	return open(ctx, c, false)
+}
+
+// offlineCore13 is used only by the explicit, exclusive 13→14 owner cut.
+// Ordinary Open continues to admit only the compiled current schema.
+func open(ctx context.Context, c Config, offlineCore13 bool) (s *Store, err error) {
 	if err = c.defaults(); err != nil {
 		return nil, err
 	}
@@ -221,7 +227,9 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if journal != "wal" {
 		return nil, fail("failed_precondition", "WAL unavailable")
 	}
-	if c.Create {
+	if offlineCore13 {
+		err = s.admitCoreData13ForUpgrade(ctx)
+	} else if c.Create {
 		err = s.create(ctx)
 	} else {
 		err = s.admitCurrentSchema(ctx)
@@ -234,6 +242,9 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if err = s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logPages, &checkpointed); err != nil {
 		return nil, err
 	}
+	if offlineCore13 && (busy != 0 || logPages != checkpointed) {
+		return nil, fail("conflict", "offline checkpoint could not join all database users")
+	}
 	if err = s.configureWriterCapacity(ctx); err != nil {
 		return nil, err
 	}
@@ -243,7 +254,9 @@ func Open(ctx context.Context, c Config) (s *Store, err error) {
 	if err = s.rdb.PingContext(ctx); err != nil {
 		return nil, err
 	}
-	s.startMaintenance(ctx)
+	if !offlineCore13 {
+		s.startMaintenance(ctx)
+	}
 	return s, nil
 }
 
