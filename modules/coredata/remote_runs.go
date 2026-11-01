@@ -604,22 +604,6 @@ func changeRemoteRun(ctx context.Context, tx *sql.Tx, scope string, link model.R
 	if !model.RunStatus(status).Open() {
 		return false, failure("failed_precondition", "closed owner cannot reserve a new remote Run")
 	}
-	// The stopped Run still owns its exact remote relation until that target
-	// actually joins. Fence only that target, in this same reservation
-	// transaction; independent targets and live concurrent roots remain free.
-	var blocked bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(
-		SELECT 1 FROM run_remote_pending p INDEXED BY run_remote_pending_target
-		LEFT JOIN runs r ON r.scope=p.scope AND r.id=p.root_run_id
-		LEFT JOIN sessions s ON s.scope=r.scope AND s.id=r.session_id
-		WHERE p.scope=? AND p.target_id=? AND p.root_run_id<>?
-		AND (r.id IS NULL OR r.status IN ('stopping','stopped','canceled','failed','succeeded','interrupted') OR length(s.stop_intent_json)>0))`, scope, link.TargetID, link.RootRunID).Scan(&blocked)
-	if err != nil {
-		return false, err
-	}
-	if blocked {
-		return false, failure("failed_precondition", "target retains unresolved work from a stopped owner")
-	}
 	if link.Phase != model.RemoteRunOpen {
 		return false, failure("invalid_argument", "a remote control relation is reserved in the open phase")
 	}

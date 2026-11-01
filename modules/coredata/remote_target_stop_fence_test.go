@@ -7,7 +7,7 @@ import (
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
 )
 
-func TestStoppedRemoteOwnerFencesOnlyItsTargetUntilJoined(t *testing.T) {
+func TestStoppedRemoteOwnerDoesNotBlockIndependentSameTarget(t *testing.T) {
 	f := openStore(t)
 	for _, id := range []string{"old", "next", "concurrent"} {
 		if _, _, err := f.core.CreateRun(f.ctx, newRun(id)); err != nil {
@@ -28,8 +28,8 @@ func TestStoppedRemoteOwnerFencesOnlyItsTargetUntilJoined(t *testing.T) {
 	}
 	f.reopen(t)
 	next := model.RemoteRunLink{OwnerRunID: "next", RootRunID: "next", TargetID: "offline", RunID: "new-child", CallNodeID: "call"}
-	if err := f.core.ReserveRemoteRun(f.ctx, next); errCode(err) != "failed_precondition" {
-		t.Fatalf("offline target accepted a conflicting new call: %v", err)
+	if err := f.core.ReserveRemoteRun(f.ctx, next); err != nil {
+		t.Fatalf("retained owner blocked a separate call on the same target: %v", err)
 	}
 	other := next
 	other.TargetID, other.RunID = "independent-docker", "docker-child"
@@ -37,18 +37,16 @@ func TestStoppedRemoteOwnerFencesOnlyItsTargetUntilJoined(t *testing.T) {
 		t.Fatalf("unrelated target was fenced: %v", err)
 	}
 	page, err := f.core.ListPendingRemoteRuns(f.ctx, "offline", "", 20)
-	if err != nil || len(page.Links) != 2 {
+	if err != nil || len(page.Links) != 3 {
 		t.Fatalf("offline relations lost: %+v %v", page, err)
 	}
 	releaseBoundRemote(t, f, old)
-	if err := f.core.ReserveRemoteRun(f.ctx, next); errCode(err) != "failed_precondition" {
-		t.Fatalf("retained relation was ignored before owner resolution: %v", err)
-	}
 	if _, err := f.core.ResolveRemoteRun(f.ctx, old, model.RunRetentionPolicy{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.core.ReserveRemoteRun(f.ctx, next); err != nil {
-		t.Fatalf("joined target remained fenced: %v", err)
+	page, err = f.core.ListPendingRemoteRuns(f.ctx, "offline", "", 20)
+	if err != nil || len(page.Links) != 2 {
+		t.Fatalf("resolving the old owner changed unrelated relations: %+v %v", page, err)
 	}
 }
 
