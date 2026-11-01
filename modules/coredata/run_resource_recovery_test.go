@@ -43,6 +43,11 @@ func TestInterruptedResourceCoverageNeedsAllExactJoinsAndOutboundResolution(t *t
 	if err := f.core.SealRunResourceRecovery(f.ctx, "child", child.RecoveryAgentBootID); errCode(err) != "failed_precondition" {
 		t.Fatalf("unjoined resources produced a receipt: %v", err)
 	}
+	want := releaseWant(child)
+	want.AgentBootID = child.RecoveryAgentBootID
+	if _, err := f.core.ReleaseIncomingRun(f.ctx, child.ID, want); errCode(err) != "failed_precondition" {
+		t.Fatalf("unjoined resources released the incoming hold: %v", err)
+	}
 	proof := func(id, node string, pid int) model.RunResourceJoin {
 		kind := "process"
 		if id == "command" {
@@ -193,6 +198,27 @@ func TestInterruptedAfterDurableResourceJoinSealsWithoutSourceReplay(t *testing.
 	state, found, err := f.core.GetRunResourceRecovery(f.ctx, child.ID)
 	if err != nil || !found || !state.Joined || len(state.Resources) != 1 || state.Resources[0].Join == nil || *state.Resources[0].Join != proof {
 		t.Fatalf("persisted join was not sealed on interruption: %+v found=%v error=%v", state, found, err)
+	}
+	want := releaseWant(child)
+	for _, boot := range []string{"", "replacement-agent-boot"} {
+		want.AgentBootID = boot
+		if _, err := f.core.ReleaseIncomingRun(f.ctx, child.ID, want); errCode(err) != "failed_precondition" {
+			t.Fatalf("missing or foreign original boot %q released child: %v", boot, err)
+		}
+	}
+	want.AgentBootID = child.RecoveryAgentBootID
+	foreign := want
+	foreign.CallNodeID = "foreign-call"
+	if _, err := f.core.ReleaseIncomingRun(f.ctx, child.ID, foreign); errCode(err) != "failed_precondition" {
+		t.Fatalf("foreign call lineage released child: %v", err)
+	}
+	if changed, err := f.core.ReleaseIncomingRun(f.ctx, child.ID, want); err != nil || !changed {
+		t.Fatalf("exact sealed receipt did not release the child: changed=%v error=%v", changed, err)
+	}
+	f.reopen(t)
+	stored, err := f.core.GetRun(f.ctx, child.ID)
+	if err != nil || stored.Status != model.RunInterrupted || !stored.IncomingHold.Released {
+		t.Fatalf("release changed business status or failed to persist: %+v error=%v", stored, err)
 	}
 }
 

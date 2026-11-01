@@ -82,6 +82,9 @@ type IncomingRunRelease struct {
 	CallNodeID  string `json:"callNodeId"`
 	TargetID    string `json:"targetId"`
 	PrincipalID string `json:"principalId"`
+	// AgentBootID is the callee boot bound by the caller's remote relation.
+	// It is required to release an interrupted Run with a positive receipt.
+	AgentBootID string `json:"agentBootId,omitempty"`
 }
 
 // RemoteRunResolveResult reports the committed transition of one exact

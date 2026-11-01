@@ -290,6 +290,38 @@ func TestSettleRemoteRunRequiresCleanDisposition(t *testing.T) {
 	}
 }
 
+func TestRecoveredDispositionFitsActualPrefundedEncoding(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {
+		t.Fatal(err)
+	}
+	link := model.RemoteRunLink{OwnerRunID: "owner", RootRunID: "owner", TargetID: "agent", RunID: "remote", CallNodeID: "call", BootID: "boot"}
+	if err := f.core.ReserveRemoteRun(f.ctx, link); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := json.Marshal(fundedRemoteLink(link))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Saturate the real quota, then exercise the actual typed settlement and
+	// release. No status or encoded size is truncated or normalized.
+	f.exec(t, `UPDATE core_data_usage SET bytes=? WHERE scope=?`, coredata.MaxScopeBytes, engine.ScopeID(f.scope))
+	if _, err := f.core.SettleRemoteRun(f.ctx, link, model.RemoteRunSettlement{Disposition: "recovered", FinishedAt: epoch}); err != nil {
+		t.Fatalf("recovered settle did not fit its existing exact escrow: %v", err)
+	}
+	if _, err := f.core.MarkRemoteRunReleased(f.ctx, link, epoch); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := f.core.ReadRemoteRunLink(f.ctx, link)
+	if err != nil || stored.SettledDisposition != "recovered" || stored.Phase != model.RemoteRunReleased {
+		t.Fatalf("stored settlement: %+v error=%v", stored, err)
+	}
+	raw, err := json.Marshal(stored)
+	if err != nil || len(raw) > len(bound) {
+		t.Fatalf("actual released encoding %d exceeds funded %d: %v", len(raw), len(bound), err)
+	}
+}
+
 func TestSettleRemoteRunGatesBoundRelation(t *testing.T) {
 	f := openStore(t)
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("owner")); err != nil {

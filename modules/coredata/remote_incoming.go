@@ -19,9 +19,9 @@ import (
 // Run is an idempotent success — the hold cannot outlive its row — and an
 // already released hold reports no change. Release requires the caller's
 // clean-terminal/join proof: the child must have reached a clean terminal
-// disposition (succeeded/failed/stopped/canceled with no failed cleanup);
-// open, interrupted or cleanup-failed rows keep their hold since they may
-// still own remote work. Release never reads the child's prunable payload.
+// disposition (succeeded/failed/stopped/canceled with no failed cleanup),
+// or an interrupted Run with an exact, durably sealed resource receipt for
+// the bound original Agent boot. Older or incomplete evidence remains unknown.
 // Transport authentication of the current legitimate caller is the ingress
 // owner's job; this store only compares the exact historical call facts it
 // stamped.
@@ -74,13 +74,21 @@ func releaseIncomingRun(ctx context.Context, tx *sql.Tx, scope, runID string, wa
 	if released != 0 {
 		return false, nil
 	}
-	// Release requires the caller's clean-terminal/join proof: only a child
-	// that reached a clean terminal disposition (succeeded/failed/stopped/
-	// canceled with no failed cleanup) may have its hold released. Open,
-	// interrupted or cleanup-failed rows keep their hold — they may still own
-	// remote work.
+	// An interrupted child only releases from its positive complete-Run
+	// receipt, never from its status, a new boot, or an absent old record.
 	switch model.RunStatus(status) {
 	case model.RunSucceeded, model.RunFailed, model.RunStopped, model.RunCanceled:
+	case model.RunInterrupted:
+		if !textKey(want.AgentBootID) {
+			return false, failure("failed_precondition", "interrupted Run release requires its original Agent boot")
+		}
+		_, _, recovery, found, err := readRecoveryNodes(ctx, tx, scope, runID)
+		if err != nil {
+			return false, err
+		}
+		if !found || !recovery.Joined || recovery.AgentBootID != want.AgentBootID {
+			return false, failure("failed_precondition", "interrupted Run has no matching complete cleanup receipt")
+		}
 	default:
 		return false, failure("failed_precondition", "the incoming child Run has no clean terminal disposition")
 	}
