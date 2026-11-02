@@ -193,8 +193,8 @@ func TestRestartSessionKeepsActualPendingRelationWithInconsistentCounter(t *test
 	if _, err := f.core.CloseSession(f.ctx, old.ID, model.SessionClose{Outcome: model.SessionStopped, At: epoch.Add(time.Minute)}, p); err != nil {
 		t.Fatal(err)
 	}
-	// Test-only corruption: the actual indexed relation still fences its own
-	// target even when the unrelated Session can activate.
+	// Test-only corruption: the actual indexed relation remains owned even
+	// when an independent Session and a new call on the same target proceed.
 	f.exec(t, `UPDATE runs SET pending_remote_count=0,pending_remote_bytes=0 WHERE id=?`, q.ID)
 	if _, err := f.core.ActivateRestartSession(f.ctx, next.ID, p); err != nil {
 		t.Fatalf("offline relation blocked Session activation: %v", err)
@@ -205,8 +205,16 @@ func TestRestartSessionKeepsActualPendingRelationWithInconsistentCounter(t *test
 		t.Fatal(err)
 	}
 	attempt := remoteLink(newOwner.ID, newOwner.ID, "new-child")
-	if err := f.core.ReserveRemoteRun(f.ctx, attempt); errCode(err) != "failed_precondition" {
-		t.Fatalf("actual pending relation did not fence its target: %v", err)
+	if err := f.core.ReserveRemoteRun(f.ctx, attempt); err != nil {
+		t.Fatalf("retained relation blocked an independent call: %v", err)
+	}
+	f.reopen(t)
+	for _, want := range []model.RemoteRunLink{link, attempt} {
+		got, err := f.core.ReadRemoteRunLink(f.ctx, want)
+		if err != nil || got.OwnerRunID != want.OwnerRunID || got.RootRunID != want.RootRunID ||
+			got.RunID != want.RunID || got.TargetID != want.TargetID || got.Phase != model.RemoteRunOpen {
+			t.Fatalf("exact relation was lost or changed: got=%+v want=%+v err=%v", got, want, err)
+		}
 	}
 }
 
