@@ -117,19 +117,20 @@ func recordingMetadataSummary(raw json.RawMessage) model.RecordingSummary {
 		return model.RecordingSummary{}
 	}
 	return model.RecordingSummary{
-		RecordingID: summaryText(fields, "recordingId"),
-		RecordID:    summaryText(fields, "recordId"),
-		BindingID:   summaryText(fields, "bindingId"),
-		TimeSource:  summaryText(fields, "timeSource"),
-		MediaType:   summaryText(fields, "mediaType"),
-		DurationMS:  summaryInt64(fields, "durationMs"),
-		Width:       summaryInt(fields, "width"),
-		Height:      summaryInt(fields, "height"),
-		Status:      summaryText(fields, "status"),
-		HasPoster:   summaryBool(fields, "hasPoster"),
-		StartedAt:   summaryInstant(fields, "startedAt"),
-		EndedAt:     summaryInstant(fields, "endedAt"),
-		FinishedAt:  summaryInstant(fields, "finishedAt"),
+		SourceRecordingID: summaryText(fields, "sourceRecordingId"),
+		RecordingID:       summaryText(fields, "recordingId"),
+		RecordID:          summaryText(fields, "recordId"),
+		BindingID:         summaryText(fields, "bindingId"),
+		TimeSource:        summaryText(fields, "timeSource"),
+		MediaType:         summaryText(fields, "mediaType"),
+		DurationMS:        summaryInt64(fields, "durationMs"),
+		Width:             summaryInt(fields, "width"),
+		Height:            summaryInt(fields, "height"),
+		Status:            summaryText(fields, "status"),
+		HasPoster:         summaryBool(fields, "hasPoster"),
+		StartedAt:         summaryInstant(fields, "startedAt"),
+		EndedAt:           summaryInstant(fields, "endedAt"),
+		FinishedAt:        summaryInstant(fields, "finishedAt"),
 	}
 }
 
@@ -450,6 +451,12 @@ func recordingQuery(scope string, f model.RecordingFilter) (query string, args [
 	}
 	if class != "" {
 		where, args = append(where, "archive_class=?"), append(args, class)
+	}
+	if f.SourceRecordingID != "" {
+		if err := optionalKey("source recording", f.SourceRecordingID); err != nil {
+			return "", nil, 0, err
+		}
+		where, args = append(where, "json_extract(summary_json,'$.sourceRecordingId')=?"), append(args, f.SourceRecordingID)
 	}
 	if f.DataFilesOnly {
 		// The condition of the partial data-file indexes.

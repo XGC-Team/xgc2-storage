@@ -344,22 +344,23 @@ const (
 // fields come from the accepted Run/Session owner; the rest are projected from
 // the registration metadata.
 type RecordingSummary struct {
-	ExperimentName string    `json:"experimentName,omitempty"`
-	RunMode        string    `json:"runMode,omitempty"`
-	TargetID       string    `json:"targetId,omitempty"`
-	RecordingID    string    `json:"recordingId,omitempty"`
-	RecordID       string    `json:"recordId,omitempty"`
-	BindingID      string    `json:"bindingId,omitempty"`
-	TimeSource     string    `json:"timeSource,omitempty"`
-	MediaType      string    `json:"mediaType,omitempty"`
-	DurationMS     int64     `json:"durationMs,omitempty"`
-	Width          int       `json:"width,omitempty"`
-	Height         int       `json:"height,omitempty"`
-	Status         string    `json:"status,omitempty"`
-	HasPoster      bool      `json:"hasPoster,omitempty"`
-	StartedAt      time.Time `json:"startedAt,omitzero"`
-	EndedAt        time.Time `json:"endedAt,omitzero"`
-	FinishedAt     time.Time `json:"finishedAt,omitzero"`
+	SourceRecordingID string    `json:"sourceRecordingId,omitempty"`
+	ExperimentName    string    `json:"experimentName,omitempty"`
+	RunMode           string    `json:"runMode,omitempty"`
+	TargetID          string    `json:"targetId,omitempty"`
+	RecordingID       string    `json:"recordingId,omitempty"`
+	RecordID          string    `json:"recordId,omitempty"`
+	BindingID         string    `json:"bindingId,omitempty"`
+	TimeSource        string    `json:"timeSource,omitempty"`
+	MediaType         string    `json:"mediaType,omitempty"`
+	DurationMS        int64     `json:"durationMs,omitempty"`
+	Width             int       `json:"width,omitempty"`
+	Height            int       `json:"height,omitempty"`
+	Status            string    `json:"status,omitempty"`
+	HasPoster         bool      `json:"hasPoster,omitempty"`
+	StartedAt         time.Time `json:"startedAt,omitzero"`
+	EndedAt           time.Time `json:"endedAt,omitzero"`
+	FinishedAt        time.Time `json:"finishedAt,omitzero"`
 }
 
 // Recording is one durable registration. ExperimentResourceID, ArchiveClass and
@@ -408,6 +409,7 @@ type RecordingDelete struct {
 // DataFilesOnly selects non-gallery archive files and requires exactly one
 // Experiment. Order defaults to oldest first.
 type RecordingFilter struct {
+	SourceRecordingID    string
 	ExperimentResourceID string
 	SessionID            string
 	RunID                string
