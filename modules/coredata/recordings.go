@@ -346,7 +346,7 @@ func deleteRecording(ctx context.Context, tx *sql.Tx, scope string, q model.Reco
 	if err != nil {
 		return model.Recording{}, err
 	}
-	if v.RunID != q.RunID || v.SessionID != q.SessionID || v.Kind != q.Kind || v.Path != q.Path || !v.CreatedAt.Equal(q.CreatedAt) {
+	if !sameRecordingIdentity(v, q) {
 		return model.Recording{}, failure("conflict", "recording identity was reused with other facts")
 	}
 	if err = recordingRunDeletable(ctx, tx, scope, v.RunID); err != nil {
@@ -375,6 +375,10 @@ func deleteRecording(ctx context.Context, tx *sql.Tx, scope string, q model.Reco
 		return model.Recording{}, failure("data_loss", "recording quota disagrees")
 	}
 	return v, nil
+}
+
+func sameRecordingIdentity(v model.Recording, q model.RecordingDelete) bool {
+	return v.ID == q.ID && v.RunID == q.RunID && v.SessionID == q.SessionID && v.Kind == q.Kind && v.Path == q.Path && v.CreatedAt.Equal(q.CreatedAt)
 }
 
 func recordingClass(value model.RecordingArchiveClass) (string, error) {
