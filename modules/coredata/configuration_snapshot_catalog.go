@@ -129,7 +129,7 @@ WHERE scope=? AND domain=? AND commit_id IN (SELECT r.main_commit_id FROM ` + co
 
 func configurationResourceCatalogAssociationsQuery(q model.ConfigurationCatalogRead, predicate string) string {
 	return `SELECT commit_id,kind,agent_id,slot_id,related_robot_resource_id FROM core_configuration_agent_index
-WHERE scope=? AND domain=? AND commit_id IN (SELECT r.main_commit_id FROM ` + configurationResourceCatalogTable(q) + ` WHERE ` + predicate + ` ORDER BY r.id LIMIT ? OFFSET ?) ORDER BY commit_id,kind,agent_id,slot_id,related_robot_resource_id LIMIT ?`
+WHERE scope=? AND domain=? AND kind<>'environment-slot' AND commit_id IN (SELECT r.main_commit_id FROM ` + configurationResourceCatalogTable(q) + ` WHERE ` + predicate + ` ORDER BY r.id LIMIT ? OFFSET ?) ORDER BY commit_id,kind,agent_id,slot_id,related_robot_resource_id LIMIT ?`
 }
 
 // Count the public snapshot representation without allocating base64 copies of

@@ -103,7 +103,11 @@ func configurationAgentSources(ctx context.Context, tx *sql.Tx, scope string, q 
 	for rows.Next() {
 		if len(out.Items) == q.Limit {
 			last := out.Items[len(out.Items)-1]
-			out.Next = &model.ConfigurationAgentSourceCursor{ScopeDigest: digest(scope), DomainKey: q.Domain.Key, AgentID: q.AgentID, ExcludeWorld: q.ExcludeWorld, Generation: out.Generation, CommitID: last.Header.Head.Commit.ID, Kind: last.Association.Kind, SlotID: last.Association.SlotID, RobotResourceID: last.Association.RobotResourceID}
+			kind := last.Association.Kind
+			if last.EnvironmentDerived {
+				kind = environmentSlotKind
+			}
+			out.Next = &model.ConfigurationAgentSourceCursor{ScopeDigest: digest(scope), DomainKey: q.Domain.Key, AgentID: q.AgentID, ExcludeWorld: q.ExcludeWorld, Generation: out.Generation, CommitID: last.Header.Head.Commit.ID, Kind: kind, SlotID: last.Association.SlotID, RobotResourceID: last.Association.RobotResourceID}
 			break
 		}
 		var fact model.ConfigurationAgentAssociation
@@ -116,6 +120,10 @@ func configurationAgentSources(ctx context.Context, tx *sql.Tx, scope string, q 
 		if selectedBytes > MaxResponseBytes {
 			return model.ConfigurationAgentSourcePage{}, failure("resource_exhausted", "Agent source page exceeds selected-byte bound")
 		}
+		derived := fact.Kind == environmentSlotKind
+		if derived {
+			fact.Kind = model.AgentAssociationOnboardSlot
+		}
 		if fact.AgentID != q.AgentID {
 			return model.ConfigurationAgentSourcePage{}, failure("data_loss", "Agent association identity disagrees")
 		}
@@ -126,7 +134,7 @@ func configurationAgentSources(ctx context.Context, tx *sql.Tx, scope string, q 
 		if err != nil {
 			return model.ConfigurationAgentSourcePage{}, err
 		}
-		item := model.ConfigurationAgentSource{Header: header, Association: fact}
+		item := model.ConfigurationAgentSource{Header: header, Association: fact, EnvironmentDerived: derived}
 		body, err := encode(item)
 		if err != nil {
 			return model.ConfigurationAgentSourcePage{}, err

@@ -518,6 +518,11 @@ func configurationCommit(ctx context.Context, tx *sql.Tx, scope string, q model.
 	if err = configurationInsertSnapshot(ctx, tx, scope, q.Domain.Key, c, q.Snapshot, q.Domain.Key == "robot" && b.NameKey == "main"); err != nil {
 		return out, err
 	}
+	if b.NameKey == "main" {
+		if err = advanceEnvironmentAssociations(ctx, tx, scope, q.Domain.Key, base.Head.Commit.ID, c.ID); err != nil {
+			return out, err
+		}
+	}
 	if err = bumpCatalogCuts(ctx, tx, scope, q.Domain.Key, &oldResource, &r); err != nil {
 		return out, err
 	}

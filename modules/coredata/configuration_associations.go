@@ -9,7 +9,7 @@ import (
 
 func configurationAssociations(ctx context.Context, tx *sql.Tx, scope, domain, commit string) ([]model.ConfigurationAgentAssociation, int, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT kind,agent_id,slot_id,related_robot_resource_id FROM core_configuration_agent_index
-WHERE scope=? AND domain=? AND commit_id=? ORDER BY kind,agent_id,slot_id,related_robot_resource_id LIMIT ?`, scope, domain, commit, model.MaxConfigurationAssociations+1)
+WHERE scope=? AND domain=? AND commit_id=? AND kind<>'environment-slot' ORDER BY kind,agent_id,slot_id,related_robot_resource_id LIMIT ?`, scope, domain, commit, model.MaxConfigurationAssociations+1)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -26,6 +26,9 @@ type ConfigurationAgentSourceRead struct {
 type ConfigurationAgentSource struct {
 	Header      ConfigurationResourceHeader   `json:"header"`
 	Association ConfigurationAgentAssociation `json:"association"`
+	// EnvironmentDerived marks an index entry derived from the selected owned
+	// container, rather than a fact in the immutable configuration snapshot.
+	EnvironmentDerived bool `json:"environmentDerived,omitempty"`
 }
 
 type ConfigurationAgentSourcePage struct {

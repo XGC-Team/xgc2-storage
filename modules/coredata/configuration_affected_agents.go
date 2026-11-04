@@ -65,6 +65,26 @@ func configurationAffectedAgents(ctx context.Context, tx *sql.Tx, scope, domain,
 				return failure("resource_exhausted", "affected Agent count exceeds bound")
 			}
 		}
+		if !onlyOwner {
+			rows, err := tx.QueryContext(ctx, `SELECT agent_id FROM core_configuration_agent_index WHERE scope=? AND domain=? AND commit_id=? AND kind=?`, scope, resource.domain, commit, environmentSlotKind)
+			if err != nil {
+				return err
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
+				if err := step(len(id)); err != nil {
+					return err
+				}
+				agents[id] = true
+			}
+			if err := rows.Err(); err != nil {
+				return err
+			}
+		}
 		return nil
 	}
 	for len(queue) > 0 {

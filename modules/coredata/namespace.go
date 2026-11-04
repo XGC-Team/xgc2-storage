@@ -175,7 +175,7 @@ func namespaceSnapshot(ctx context.Context, tx *sql.Tx, scope string, r model.Na
 	associations, err := tx.QueryContext(ctx, treeSQL+`SELECT f.commit_id,f.kind,f.agent_id,f.slot_id,f.related_robot_resource_id FROM tree
  JOIN core_resources r ON r.namespace_id=tree.id
  JOIN core_configuration_agent_index f ON f.scope=r.scope AND f.domain=r.domain AND f.commit_id=r.main_commit_id
- WHERE r.scope=? AND r.domain=? AND r.archived=0 ORDER BY f.commit_id,f.kind,f.agent_id,f.slot_id,f.related_robot_resource_id LIMIT ?`, append(args, model.MaxConfigurationCloneAssociations+1)...)
+ WHERE r.scope=? AND r.domain=? AND r.archived=0 AND f.kind<>'environment-slot' ORDER BY f.commit_id,f.kind,f.agent_id,f.slot_id,f.related_robot_resource_id LIMIT ?`, append(args, model.MaxConfigurationCloneAssociations+1)...)
 	if err != nil {
 		return out, err
 	}
