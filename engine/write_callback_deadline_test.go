@@ -122,9 +122,11 @@ func TestHeldBatchCallbackDeadlineRetainsPhysicalAttempt(t *testing.T) {
 				request.Mutations[0].Data[i] = 'x'
 			}
 			request.Mutations[0].Key = "caller-changed"
-			if err := s.Write(base, Durable, func(context.Context, *sql.Tx) error { return nil }); code(err) != "unavailable" {
+			waitCtxForWriter, cancelWriter := context.WithTimeout(base, 30*time.Millisecond)
+			if err := s.Write(waitCtxForWriter, Durable, func(context.Context, *sql.Tx) error { t.Error("writer entered before settlement"); return nil }); !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("new writer entered: %v", err)
 			}
+			cancelWriter()
 			closed := make(chan error, 1)
 			go func() { closed <- s.Close() }()
 			readCtx, readCancel := context.WithTimeout(base, 50*time.Millisecond)

@@ -7,6 +7,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -482,9 +484,11 @@ func TestFaultProbeHoldsOriginalWriterUntilExactRead(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("post-join probe did not start")
 	}
-	if err := s.Write(ctx, Durable, func(context.Context, *sql.Tx) error { return nil }); code(err) != "unavailable" {
+	waitCtxForWriter, cancelWriter := context.WithTimeout(ctx, 30*time.Millisecond)
+	if err := s.Write(waitCtxForWriter, Durable, func(context.Context, *sql.Tx) error { t.Error("writer entered before settlement"); return nil }); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("intervening writer entered the fault cut: %v", err)
 	}
+	cancelWriter()
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	if err := outcome.WaitSettlement(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("probe reported completion before its snapshot joined: %v", err)
@@ -555,9 +559,11 @@ func TestCanceledCallbackRollbackFactHoldsOriginalAdmission(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("post-rollback owned fact did not start")
 	}
-	if err := s.Write(ctx, Durable, func(context.Context, *sql.Tx) error { return nil }); code(err) != "unavailable" {
+	waitCtxForWriter, cancelWriter := context.WithTimeout(ctx, 30*time.Millisecond)
+	if err := s.Write(waitCtxForWriter, Durable, func(context.Context, *sql.Tx) error { t.Error("writer entered before settlement"); return nil }); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("intervening writer entered the rollback fact cut: %v", err)
 	}
+	cancelWriter()
 	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Millisecond)
 	if err := outcome.WaitSettlement(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("unfinished rollback fact reported settlement: %v", err)
@@ -892,4 +898,94 @@ func TestUnknownUnjoinedBatchRetainsMaintenanceUntilReopen(t *testing.T) {
 		_, err := reopened.Receipt(ctx, api.ReceiptRequest{Scope: testScope, RequestID: request.RequestID})
 		return code(err) == "not_found"
 	})
+}
+
+// A cancellation may return while COMMIT still owns the writer gate.
+// Subsequent writes queue behind that physical attempt, without entering it.
+func TestWriterQueuesBehindCanceledCommitSettlement(t *testing.T) {
+	for _, cancelWaiting := range []bool{false, true} {
+		name := "resumes-after-settlement"
+		if cancelWaiting {
+			name = "waiting-caller-canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			s, _, ctx := setup(t)
+			plan := &settlementPlan{commitEntered: make(chan struct{}), continueCommit: make(chan struct{})}
+			installSettlementDriver(t, s, plan)
+			var once sync.Once
+			release := func() { once.Do(func() { close(plan.continueCommit) }) }
+			defer release()
+			originalCtx, cancelOriginal := context.WithCancel(ctx)
+			defer cancelOriginal()
+			original := make(chan error, 1)
+			go func() {
+				original <- s.Write(originalCtx, Durable, func(ctx context.Context, tx *sql.Tx) error {
+					return insertFaultRow(ctx, tx, "original-settlement")
+				})
+			}()
+			select {
+			case <-plan.commitEntered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("original COMMIT did not enter")
+			}
+			cancelOriginal()
+			originalErr := <-original
+			requireWriteDisposition(t, originalErr, WriteUnknown, false)
+			var outcome *WriteError
+			if !errors.As(originalErr, &outcome) || !outcome.MayHaveCommitted {
+				t.Fatalf("lost original unknown COMMIT: %v", originalErr)
+			}
+			if err := s.Read(ctx, func(context.Context, *sql.Tx) error { return nil }); code(err) != "unavailable" {
+				t.Fatalf("reader entered before physical settlement: %v", err)
+			}
+			nextCtx, cancelNext := context.WithCancel(ctx)
+			defer cancelNext()
+			var entered atomic.Bool
+			next := make(chan error, 1)
+			go func() {
+				next <- s.Write(nextCtx, Durable, func(ctx context.Context, tx *sql.Tx) error {
+					entered.Store(true)
+					return insertFaultRow(ctx, tx, "queued-settlement")
+				})
+			}()
+			deadline := time.NewTimer(5 * time.Second)
+			defer deadline.Stop()
+			for len(s.queue) != 2 {
+				select {
+				case err := <-next:
+					t.Fatalf("next writer refused before original settlement: %v", err)
+				case <-deadline.C:
+					t.Fatal("next writer did not enter bounded queue")
+				case <-time.After(time.Millisecond):
+				}
+			}
+			if entered.Load() {
+				t.Fatal("next callback entered unsettled writer")
+			}
+			if cancelWaiting {
+				cancelNext()
+				err := <-next
+				requireWriteDisposition(t, err, WriteNotCommitted, true)
+				if !errors.Is(err, context.Canceled) || entered.Load() {
+					t.Fatalf("canceled queued writer executed: %v", err)
+				}
+			}
+			release()
+			if err := outcome.WaitSettlement(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !cancelWaiting {
+				if err := <-next; err != nil {
+					t.Fatalf("next writer failed after settlement: %v", err)
+				}
+			}
+			want := 1
+			if cancelWaiting {
+				want = 0
+			}
+			if got := countFaultRow(t, s, "queued-settlement"); got != want {
+				t.Fatalf("queued writer rows=%d want=%d", got, want)
+			}
+		})
+	}
 }

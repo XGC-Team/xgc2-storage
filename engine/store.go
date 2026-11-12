@@ -102,8 +102,9 @@ type Store struct {
 	// queue admits writers, gate runs one of them, reads admits readers.
 	queue, gate, reads chan struct{}
 	closed             atomic.Bool
-	// fenced prevents new calls while a failed writer is being physically
-	// settled, or while its connection cannot safely be restored.
+	// fenced prevents execution while a writer is physically settling or its
+	// connection cannot safely be restored. Ordinary writers may queue behind
+	// the existing gate; readers and still-fenced execution remain rejected.
 	fenced atomic.Bool
 	// A discarded reader whose physical Close failed remains owned even if a
 	// concurrently finishing writer clears its own settlement fence.
@@ -401,14 +402,14 @@ func (s *Store) admit(ctx context.Context, write bool) (context.Context, func(),
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
-	if s.closing.Load() || s.fenced.Load() || s.readerUnsettled.Load() != 0 || !s.lifecycle.TryRLock() {
+	if s.closing.Load() || !write && s.fenced.Load() || s.readerUnsettled.Load() != 0 || !s.lifecycle.TryRLock() {
 		return nil, nil, fail("unavailable", "store is closing or writer settlement is unavailable")
 	}
 	if s.closed.Load() {
 		s.lifecycle.RUnlock()
 		return nil, nil, fail("unavailable", "store closed")
 	}
-	if s.fenced.Load() || s.readerUnsettled.Load() != 0 {
+	if !write && s.fenced.Load() || s.readerUnsettled.Load() != 0 {
 		s.lifecycle.RUnlock()
 		return nil, nil, fail("unavailable", "writer settlement is unavailable")
 	}
@@ -439,7 +440,9 @@ func (s *Store) admit(ctx context.Context, write bool) (context.Context, func(),
 			return refuse(ctx.Err())
 		}
 	}
-	// A call queued before the fence must not start after an unsettled writer.
+	// Writers wait behind the same gate held through physical settlement.
+	// Persistent faults remain fenced after that gate is released; neither
+	// queued writers nor readers may enter an unusable owner.
 	if s.fenced.Load() || s.readerUnsettled.Load() != 0 {
 		if write {
 			<-s.gate
