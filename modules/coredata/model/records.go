@@ -162,9 +162,10 @@ type RunFilter struct {
 	// These select accepted Experiment invocation identity from the same-row source projection.
 	ExperimentResourceID string
 	WorkflowInstanceID   string
-	// SessionInstanceID selects the accepted Session Action's trigger identity.
-	// SessionID must also be specified. It is independent of WorkflowInstanceID.
-	SessionInstanceID  string
+	// SessionInstanceIDs selects accepted Session Action trigger identities.
+	// SessionID is required. Nil omits this filter; an explicit empty slice
+	// selects no Runs. Accepted Run identity remains a single instance.
+	SessionInstanceIDs []string
 	ID                 string
 	TargetID           string
 	RootRunID          string

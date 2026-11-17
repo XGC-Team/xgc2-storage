@@ -587,11 +587,25 @@ func runQuery(scope string, f model.RunFilter) (query string, args []any, limit 
 		return "", nil, 0, err
 	}
 	where, args := []string{"scope=?"}, []any{scope}
-	if f.SessionInstanceID != "" {
-		if f.SessionID == "" || !sessionInstanceKey(f.SessionInstanceID) {
-			return "", nil, 0, failure("invalid_argument", "a Session instance filter requires a Session and a bounded instance identifier")
+	if f.SessionInstanceIDs != nil {
+		if f.SessionID == "" {
+			return "", nil, 0, failure("invalid_argument", "Session instance filters require a Session")
 		}
-		where, args = append(where, "session_instance_id=?"), append(args, f.SessionInstanceID)
+		marks := make([]string, len(f.SessionInstanceIDs))
+		for i, id := range f.SessionInstanceIDs {
+			if !sessionInstanceKey(id) {
+				return "", nil, 0, failure("invalid_argument", "Session instance filters require bounded instance identifiers")
+			}
+			marks[i], args = "?", append(args, id)
+		}
+		switch len(marks) {
+		case 0:
+			where = append(where, "0")
+		case 1:
+			where = append(where, "session_instance_id=?")
+		default:
+			where = append(where, "session_instance_id IN ("+strings.Join(marks, ",")+")")
+		}
 	}
 	for column, value := range map[string]string{"id": f.ID, "target_id": f.TargetID, "root_run_id": f.RootRunID, "session_id": f.SessionID, "workflow_resource_id": f.WorkflowResourceID, "action_id": f.ActionID, "source_experiment_id": f.ExperimentResourceID, "source_instance_id": f.WorkflowInstanceID} {
 		if value == "" {

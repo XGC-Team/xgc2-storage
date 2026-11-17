@@ -44,7 +44,7 @@ func TestSessionActionInstanceIndexSelectsOnlyAcceptedOpenInstance(t *testing.T)
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	filter := model.RunFilter{TargetID: "local", SessionID: "session", SessionInstanceID: "selected", Statuses: []model.RunStatus{model.RunQueued, model.RunRunning, model.RunStopping}, Projection: model.RunObservation, Limit: 1}
+	filter := model.RunFilter{TargetID: "local", SessionID: "session", SessionInstanceIDs: []string{"selected"}, Statuses: []model.RunStatus{model.RunQueued, model.RunRunning, model.RunStopping}, Projection: model.RunObservation, Limit: 1}
 	read := func(f model.RunFilter) (model.RunPage, int, string) {
 		t.Helper()
 		rec.statements, rec.bytes = nil, 0
@@ -99,19 +99,19 @@ func TestSessionActionInstanceIndexSelectsOnlyAcceptedOpenInstance(t *testing.T)
 		t.Fatalf("selected next page: %+v", second)
 	}
 	filter.Cursor = ""
-	filter.SessionInstanceID = "missing"
+	filter.SessionInstanceIDs = []string{"missing"}
 	empty, emptyBytes, _ := read(filter)
 	if len(empty.Runs) != 0 || empty.Next != "" || emptyBytes != 0 {
 		t.Fatalf("missing instance read other rows: %+v bytes=%d", empty, emptyBytes)
 	}
-	filter.SessionInstanceID = "selected"
+	filter.SessionInstanceIDs = []string{"selected"}
 	for _, tc := range []struct {
 		name   string
 		filter model.RunFilter
 		index  string
 	}{
 		{"open", filter, "runs_session_instance_open"},
-		{"history", model.RunFilter{SessionID: "session", SessionInstanceID: "selected", Projection: model.RunObservation}, "runs_session_instance"},
+		{"history", model.RunFilter{SessionID: "session", SessionInstanceIDs: []string{"selected"}, Projection: model.RunObservation}, "runs_session_instance"},
 	} {
 		query, args, _, err := runQuery(testScope, tc.filter)
 		if err != nil {

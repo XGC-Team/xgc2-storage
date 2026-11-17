@@ -25,7 +25,7 @@ func TestSessionActionInstanceSelectorPersistsAndAccounts(t *testing.T) {
 		t.Fatalf("derived selector was not charged: rows=%d bytes=%d", rows-baseRows, bytes-baseBytes)
 	}
 	f.reopen(t)
-	filter := model.RunFilter{SessionID: "session", SessionInstanceID: id, Projection: model.RunObservation, Statuses: []model.RunStatus{model.RunQueued, model.RunRunning, model.RunStopping}, Limit: 1}
+	filter := model.RunFilter{SessionID: "session", SessionInstanceIDs: []string{id}, Projection: model.RunObservation, Statuses: []model.RunStatus{model.RunQueued, model.RunRunning, model.RunStopping}, Limit: 1}
 	page, err := f.core.ListRuns(f.ctx, filter)
 	if err != nil || len(page.Runs) != 1 || page.Runs[0].ID != q.ID {
 		t.Fatalf("reopened selector: %+v %v", page, err)
@@ -34,7 +34,7 @@ func TestSessionActionInstanceSelectorPersistsAndAccounts(t *testing.T) {
 	if _, err := f.core.ListRuns(f.ctx, filter); errCode(err) != "invalid_argument" {
 		t.Fatalf("instance-only unbounded session search: %v", err)
 	}
-	filter.SessionID, filter.SessionInstanceID = "session", id+"x"
+	filter.SessionID, filter.SessionInstanceIDs = "session", []string{id + "x"}
 	if _, err := f.core.ListRuns(f.ctx, filter); errCode(err) != "invalid_argument" {
 		t.Fatalf("oversized instance filter: %v", err)
 	}
