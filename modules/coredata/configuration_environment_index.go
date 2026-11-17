@@ -3,6 +3,7 @@ package coredata
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"reflect"
 	"sort"
 
@@ -80,8 +81,13 @@ func (s *Store) ReplaceEnvironmentAssociations(ctx context.Context, domain model
 			return nil, failure("conflict", "Environment projection source changed")
 		}
 		selected := make(map[string]bool, len(slotIDs))
+		selectedSlots := make([]string, 0, len(slotIDs))
 		for _, slotID := range slotIDs {
+			if selected[slotID] {
+				continue
+			}
 			selected[slotID] = true
+			selectedSlots = append(selectedSlots, slotID)
 		}
 		canonical, err := model.CanonicalConfigurationAssociations(facts)
 		if err != nil {
@@ -99,7 +105,11 @@ func (s *Store) ReplaceEnvironmentAssociations(ctx context.Context, domain model
 				return nil, failure("conflict", "Environment projection differs from selected Robot reference")
 			}
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT agent_id,slot_id,related_robot_resource_id FROM core_configuration_agent_index WHERE scope=? AND domain=? AND commit_id=? AND kind=? ORDER BY agent_id,slot_id,related_robot_resource_id`, scope, domain.Key, commitID, environmentSlotKind)
+		selectedJSON, err := json.Marshal(selectedSlots)
+		if err != nil {
+			return nil, err
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT agent_id,slot_id,related_robot_resource_id FROM core_configuration_agent_index WHERE scope=? AND domain=? AND commit_id=? AND kind=? AND slot_id IN (SELECT value FROM json_each(?)) ORDER BY agent_id,slot_id,related_robot_resource_id`, scope, domain.Key, commitID, environmentSlotKind, string(selectedJSON))
 		if err != nil {
 			return nil, err
 		}
@@ -110,9 +120,7 @@ func (s *Store) ReplaceEnvironmentAssociations(ctx context.Context, domain model
 				rows.Close()
 				return nil, err
 			}
-			if selected[fact.SlotID] {
-				previous = append(previous, fact)
-			}
+			previous = append(previous, fact)
 		}
 		if err = rows.Err(); err != nil {
 			rows.Close()
