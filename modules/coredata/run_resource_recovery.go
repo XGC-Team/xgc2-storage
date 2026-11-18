@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
 
 	"github.com/XGC-Team/xgc2-storage/engine"
 	"github.com/XGC-Team/xgc2-storage/modules/coredata/model"
@@ -212,6 +213,37 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 		}
 		state.Resources = append(state.Resources, admission)
 		return writeRunRecovery(ctx, tx, s.scope, runID, state, true)
+	})
+}
+
+// WithdrawUnstartedRunResource drops an exact admission from the original
+// owner that still holds the reservation and has never handed it to a producer.
+// A producer failure or a missing process receipt does not qualify.
+func (s *Store) WithdrawUnstartedRunResource(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) error {
+	if !textKey(runID) || !textKey(bootID) || !textKey(admission.ID) || !textKey(admission.NodeID) ||
+		(admission.Kind != "command" && admission.Kind != "process" && admission.Kind != "uncovered-effect") ||
+		admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined {
+		return engine.WriteRefused(failure("invalid_argument", "exact unstarted Run resource admission is required"))
+	}
+	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+		_, state, found, err := readRunRecovery(ctx, tx, s.scope, runID)
+		if err != nil {
+			return err
+		}
+		if !found || state.AgentBootID != bootID {
+			return failure("failed_precondition", "Run has no matching resource coverage")
+		}
+		for i, existing := range state.Resources {
+			if existing.ID != admission.ID {
+				continue
+			}
+			if state.Joined || existing != admission {
+				return failure("failed_precondition", "resource admission changed or already joined")
+			}
+			state.Resources = slices.Delete(state.Resources, i, i+1)
+			return writeRunRecovery(ctx, tx, s.scope, runID, state, false)
+		}
+		return nil
 	})
 }
 

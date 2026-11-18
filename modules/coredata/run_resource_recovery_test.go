@@ -127,6 +127,52 @@ func TestRecoveryDoesNotInferUncoveredEffects(t *testing.T) {
 	}
 }
 
+func TestWithdrawUnstartedRunResourceRequiresExactUnjoinedAdmission(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
+		t.Fatal(err)
+	}
+	child := incomingChild("child", "parent", "parent", "core", "core-principal")
+	child.RecoveryAgentBootID = "boot"
+	if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	unstarted := model.RunResourceAdmission{ID: "unstarted", NodeID: "command", Kind: "command"}
+	executed := model.RunResourceAdmission{ID: "executed", NodeID: "command", Kind: "command"}
+	for _, a := range []model.RunResourceAdmission{unstarted, executed} {
+		if err := f.core.AdmitRunResource(f.ctx, child.ID, "boot", a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	joined := model.RunResourceJoin{RunID: child.ID, ResourceID: executed.ID, NodeID: executed.NodeID,
+		Kind: executed.Kind, AgentBootID: "boot", Incarnation: "inc", HostBootID: "os",
+		PID: 20, PGID: 20, StartTicks: 40, OwnerPID: 11, OwnerStartTicks: 22}
+	if _, err := f.core.JoinRunResource(f.ctx, joined, model.RunRetentionPolicy{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, wrong := range []struct {
+		boot      string
+		admission model.RunResourceAdmission
+	}{
+		{"replacement", unstarted},
+		{"boot", model.RunResourceAdmission{ID: unstarted.ID, NodeID: "other-node", Kind: unstarted.Kind}},
+		{"boot", model.RunResourceAdmission{ID: unstarted.ID, NodeID: unstarted.NodeID, Kind: "process"}},
+		{"boot", executed},
+	} {
+		if err := f.core.WithdrawUnstartedRunResource(f.ctx, child.ID, wrong.boot, wrong.admission); errCode(err) != "failed_precondition" {
+			t.Fatalf("foreign or joined admission was withdrawn: %+v: %v", wrong, err)
+		}
+	}
+	if err := f.core.WithdrawUnstartedRunResource(f.ctx, child.ID, "boot", unstarted); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen(t)
+	state, found, err := f.core.GetRunResourceRecovery(f.ctx, child.ID)
+	if err != nil || !found || len(state.Resources) != 1 || state.Resources[0].ID != executed.ID || state.Resources[0].Join == nil {
+		t.Fatalf("withdrawal removed the wrong evidence: %+v found=%v err=%v", state, found, err)
+	}
+}
+
 func TestInterruptedFinishKeepsNodeDetailAndActualQuota(t *testing.T) {
 	f := openStore(t)
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
