@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 )
 
 func writerConnectionLost(err error) bool {
@@ -38,18 +38,7 @@ func (c writerConnector) Connect(ctx context.Context) (driver.Conn, error) {
 
 type sqliteWriterConnector struct{ dsn string }
 
-// Open the configured driver without opening a database connection here. Its
-// SQL extensions also apply to the physical connections tracked by the owner.
-var storageSQLiteDriver = func() driver.Driver {
-	db, err := sql.Open("sqlite", "")
-	if err != nil {
-		panic(err)
-	}
-	defer db.Close()
-	return db.Driver()
-}()
-
-func (c sqliteWriterConnector) Driver() driver.Driver { return storageSQLiteDriver }
+func (c sqliteWriterConnector) Driver() driver.Driver { return &sqlite.Driver{} }
 func (c sqliteWriterConnector) Connect(context.Context) (driver.Conn, error) {
 	return c.Driver().Open(c.dsn)
 }
