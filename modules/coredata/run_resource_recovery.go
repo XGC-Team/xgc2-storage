@@ -189,13 +189,22 @@ func (s *Store) GetRunResourceRecovery(ctx context.Context, runID string) (model
 // A repeated identical admission is a no-op. Storage errors, including an
 // unknown COMMIT disposition, must be joined before the caller starts work.
 func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) error {
+	_, err := s.AdmitRunResourceOnce(ctx, runID, bootID, admission)
+	return err
+}
+
+// AdmitRunResourceOnce reports whether this commit inserted the admission.
+// An identical prior admission may already have been handed to an executor.
+// An uncertain write never gives the caller a receipt to withdraw it.
+func (s *Store) AdmitRunResourceOnce(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) (bool, error) {
 	if !textKey(runID) || !textKey(bootID) || admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined || admission.Kind == "completed-effect" {
-		return engine.WriteRefused(failure("invalid_argument", "exact Run and boot admission is required"))
+		return false, engine.WriteRefused(failure("invalid_argument", "exact Run and boot admission is required"))
 	}
 	if err := validateRecoveryAdmission(admission); err != nil {
-		return engine.WriteRefused(err)
+		return false, engine.WriteRefused(err)
 	}
-	return s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
+	var created bool
+	err := s.db.Write(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx) error {
 		status, state, found, err := readRunRecovery(ctx, tx, s.scope, runID)
 		if err != nil {
 			return err
@@ -212,8 +221,13 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 			}
 		}
 		state.Resources = append(state.Resources, admission)
+		created = true
 		return writeRunRecovery(ctx, tx, s.scope, runID, state, true)
 	})
+	if err != nil {
+		return false, err
+	}
+	return created, nil
 }
 
 // WithdrawUnstartedRunResource drops an exact admission from the original
@@ -221,7 +235,8 @@ func (s *Store) AdmitRunResource(ctx context.Context, runID, bootID string, admi
 // A producer failure or a missing process receipt does not qualify.
 func (s *Store) WithdrawUnstartedRunResource(ctx context.Context, runID, bootID string, admission model.RunResourceAdmission) error {
 	if !textKey(runID) || !textKey(bootID) || !textKey(admission.ID) || !textKey(admission.NodeID) ||
-		(admission.Kind != "command" && admission.Kind != "process" && admission.Kind != "uncovered-effect") ||
+		(admission.Kind != "command" && admission.Kind != "process" && admission.Kind != "uncovered-effect" &&
+			admission.Kind != "workflow-call" && admission.Kind != "local-call") ||
 		admission.Join != nil || admission.LocalPhysicalJoined || admission.LocalJoined {
 		return engine.WriteRefused(failure("invalid_argument", "exact unstarted Run resource admission is required"))
 	}
@@ -239,6 +254,15 @@ func (s *Store) WithdrawUnstartedRunResource(ctx context.Context, runID, bootID 
 			}
 			if state.Joined || existing != admission {
 				return failure("failed_precondition", "resource admission changed or already joined")
+			}
+			if admission.Kind == "local-call" {
+				var accepted bool
+				if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM runs WHERE scope=? AND id=?)", s.scope, admission.ID).Scan(&accepted); err != nil {
+					return err
+				}
+				if accepted {
+					return failure("failed_precondition", "local child already accepted")
+				}
 			}
 			state.Resources = slices.Delete(state.Resources, i, i+1)
 			return writeRunRecovery(ctx, tx, s.scope, runID, state, false)

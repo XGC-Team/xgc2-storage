@@ -173,6 +173,80 @@ func TestWithdrawUnstartedRunResourceRequiresExactUnjoinedAdmission(t *testing.T
 	}
 }
 
+func TestAdmitRunResourceOnceDistinguishesInsertFromReplay(t *testing.T) {
+	f := openStore(t)
+	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
+		t.Fatal(err)
+	}
+	child := incomingChild("child", "parent", "parent", "core", "core-principal")
+	child.RecoveryAgentBootID = "boot"
+	if _, _, err := f.core.CreateRun(f.ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	a := model.RunResourceAdmission{ID: "call", NodeID: "dispatch", Kind: "workflow-call"}
+	if created, err := f.core.AdmitRunResourceOnce(f.ctx, child.ID, "boot", a); err != nil || !created {
+		t.Fatalf("new call admission: created=%v err=%v", created, err)
+	}
+	f.reopen(t)
+	if created, err := f.core.AdmitRunResourceOnce(f.ctx, child.ID, "boot", a); err != nil || created {
+		t.Fatalf("durable replay received a new admission: created=%v err=%v", created, err)
+	}
+	other := a
+	other.NodeID = "different-node"
+	if created, err := f.core.AdmitRunResourceOnce(f.ctx, child.ID, "boot", other); errCode(err) != "failed_precondition" || created {
+		t.Fatalf("conflict received an admission: created=%v err=%v", created, err)
+	}
+	ctx, cancel := context.WithCancel(f.ctx)
+	cancel()
+	if created, err := f.core.AdmitRunResourceOnce(ctx, child.ID, "boot", a); err == nil || created {
+		t.Fatalf("canceled write received an admission: created=%v err=%v", created, err)
+	}
+	if err := f.core.WithdrawUnstartedRunResource(f.ctx, child.ID, "boot", a); err != nil {
+		t.Fatal(err)
+	}
+	state, found, err := f.core.GetRunResourceRecovery(f.ctx, child.ID)
+	if err != nil || !found || len(state.Resources) != 0 {
+		t.Fatalf("exact unhanded call remained registered: %+v found=%v err=%v", state, found, err)
+	}
+}
+
+func TestWithdrawUnstartedLocalCallPreservesAcceptedChild(t *testing.T) {
+	f := openStore(t)
+	parent := newRun("parent")
+	parent.RecoveryAgentBootID = "boot"
+	if _, _, err := f.core.CreateRun(f.ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	admit := func(id string) model.RunResourceAdmission {
+		t.Helper()
+		a := model.RunResourceAdmission{ID: id, NodeID: "call", Kind: "local-call"}
+		if created, err := f.core.AdmitRunResourceOnce(f.ctx, parent.ID, "boot", a); err != nil || !created {
+			t.Fatalf("%s resource admission: created=%v err=%v", id, created, err)
+		}
+		return a
+	}
+	accept := func(id string) error {
+		q := childRun(id, parent.ID, parent.ID, 1)
+		q.RecoveryAgentBootID = "boot"
+		_, _, err := f.core.CreateRun(f.ctx, q)
+		return err
+	}
+	active := admit("accepted")
+	if err := accept(active.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.core.WithdrawUnstartedRunResource(f.ctx, parent.ID, "boot", active); errCode(err) != "failed_precondition" {
+		t.Fatalf("accepted child lost its ownership: %v", err)
+	}
+	unstarted := admit("unstarted")
+	if err := f.core.WithdrawUnstartedRunResource(f.ctx, parent.ID, "boot", unstarted); err != nil {
+		t.Fatal(err)
+	}
+	if err := accept(unstarted.ID); errCode(err) != "failed_precondition" {
+		t.Fatalf("child was accepted after its authorization was withdrawn: %v", err)
+	}
+}
+
 func TestInterruptedFinishKeepsNodeDetailAndActualQuota(t *testing.T) {
 	f := openStore(t)
 	if _, _, err := f.core.CreateRun(f.ctx, newRun("parent")); err != nil {
