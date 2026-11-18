@@ -49,15 +49,25 @@ func configurationHeaderPage(ctx context.Context, tx *sql.Tx, scope string, q mo
 	if _, err := configurationDomain(ctx, tx, q.Domain); err != nil {
 		return nil, err
 	}
-	return configurationHeaderPageInDomain(ctx, tx, scope, q, selector, ordinary)
+	return configurationHeaderPageInDomain(ctx, tx, scope, q, selector, ordinary, "")
 }
 
-func configurationHeaderPageInDomain(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead, selector string, ordinary bool) ([]model.ConfigurationResourceHeader, error) {
+func configurationHeaderPageInDomain(ctx context.Context, tx *sql.Tx, scope string, q model.ConfigurationCatalogRead, selector string, ordinary bool, order model.ConfigurationCatalogOrder) ([]model.ConfigurationResourceHeader, error) {
 	predicate, args, limit, err := configurationResourceCatalogSelector(scope, q)
 	if err != nil {
 		return nil, err
 	}
 	query := configurationResourceHeadersQuery(q, predicate)
+	if order != "" {
+		ordering := catalogPageOrdering(order)
+		// Sort only resource identities and hydrate current-main headers
+		// for the selected page within the same generation cut.
+		query = "WITH selected AS MATERIALIZED (SELECT r.id FROM " + configurationResourceCatalogTable(q) +
+			" WHERE " + predicate + " ORDER BY " + ordering + " LIMIT ? OFFSET ?) " +
+			"SELECT " + configurationResourceHeaderColumns + " FROM selected p JOIN core_resources r ON r.id=p.id" +
+			configurationResourceCatalogJoin + "r.scope=? AND r.domain=? ORDER BY " + ordering
+		args = append(args, scope, q.Domain.Key)
+	}
 	if selector != "" {
 		index := "core_resources_catalog_selector"
 		if q.ParentID != nil {

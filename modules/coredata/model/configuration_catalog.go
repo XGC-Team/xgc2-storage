@@ -36,9 +36,18 @@ type ConfigurationCatalogPageRead struct {
 	OrdinaryOnly bool                     `json:"ordinary_only"`
 	// ChoiceOnly fences only facts used by an ordinary current-main choice:
 	// identity, name, selector, location, visibility, and current commit.
-	ChoiceOnly         bool   `json:"choice_only"`
-	ExpectedGeneration *int64 `json:"expected_generation,omitempty"`
+	ChoiceOnly         bool                      `json:"choice_only"`
+	ExpectedGeneration *int64                    `json:"expected_generation,omitempty"`
+	Order              ConfigurationCatalogOrder `json:"order,omitempty"`
 }
+
+type ConfigurationCatalogOrder string
+
+const (
+	ConfigurationCatalogNameOrder   ConfigurationCatalogOrder = "name-asc"
+	ConfigurationCatalogOldestOrder ConfigurationCatalogOrder = "updated-asc"
+	ConfigurationCatalogNewestOrder ConfigurationCatalogOrder = "updated-desc"
+)
 
 type ConfigurationCatalogHeaderPage struct {
 	Headers    []ConfigurationResourceHeader `json:"headers"`

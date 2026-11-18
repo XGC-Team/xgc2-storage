@@ -17,7 +17,7 @@ func (s *Store) ReadCatalogHeaderPage(ctx context.Context, q model.Configuration
 		var out model.ConfigurationCatalogHeaderPage
 		if q.Catalog.ID != "" || q.ExpectedGeneration != nil && *q.ExpectedGeneration < 0 ||
 			q.OrdinaryOnly && (q.Selector == "" || q.Catalog.IncludeArchived) || q.ChoiceOnly && !q.OrdinaryOnly ||
-			q.Selector != "" && !textKey(q.Selector) {
+			q.Selector != "" && !textKey(q.Selector) || q.Order != "" && (q.Selector != "" || q.ChoiceOnly || catalogPageOrdering(q.Order) == "") {
 			return out, failure("invalid_argument", "invalid catalog cut selector")
 		}
 		if _, err := configurationDomain(ctx, tx, q.Catalog.Domain); err != nil {
@@ -36,7 +36,7 @@ func (s *Store) ReadCatalogHeaderPage(ctx context.Context, q model.Configuration
 		if q.ChoiceOnly {
 			out.Choices, err = configurationChoicePageInDomain(ctx, tx, scope, q.Catalog, q.Selector, q.OrdinaryOnly)
 		} else {
-			out.Headers, err = configurationHeaderPageInDomain(ctx, tx, scope, q.Catalog, q.Selector, q.OrdinaryOnly)
+			out.Headers, err = configurationHeaderPageInDomain(ctx, tx, scope, q.Catalog, q.Selector, q.OrdinaryOnly, q.Order)
 		}
 		out.Generation = generation
 		return out, err
