@@ -236,9 +236,11 @@ func addRecording(ctx context.Context, tx *sql.Tx, scope string, q model.NewReco
 	// replay returns the stored facts even after the owning Run/Session history
 	// has been pruned. Changing a registration fact is a conflict.
 	var archiveExperiment string
+	var summary model.RecordingSummary
 	if owner := q.ArchiveOwner; owner != nil {
+		summary = recordingMetadataSummary(metadata)
 		if v.Kind != "video-clip" || !textKey(owner.RecordID) || !textKey(owner.ExperimentID) ||
-			recordingMetadataSummary(metadata).RecordID != owner.RecordID {
+			summary.RecordID != owner.RecordID {
 			return model.Recording{}, false, failure("invalid_argument", "clip archive owner does not match the selected Record")
 		}
 		archiveExperiment = owner.ExperimentID
@@ -277,7 +279,9 @@ func addRecording(ctx context.Context, tx *sql.Tx, scope string, q model.NewReco
 		}
 		owner.experimentID = archiveExperiment
 	}
-	summary := recordingMetadataSummary(metadata)
+	if q.ArchiveOwner == nil {
+		summary = recordingMetadataSummary(metadata)
+	}
 	// The accepted owner is authoritative; metadata cannot forge association,
 	// target, experiment name or run mode.
 	summary.ExperimentName, summary.RunMode, summary.TargetID = owner.experimentName, owner.runMode, owner.targetID
