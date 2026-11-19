@@ -235,10 +235,32 @@ func addRecording(ctx context.Context, tx *sql.Tx, scope string, q model.NewReco
 	// The immutable registration is checked before any owner lookup: an exact
 	// replay returns the stored facts even after the owning Run/Session history
 	// has been pruned. Changing a registration fact is a conflict.
+	var archiveExperiment string
+	if owner := q.ArchiveOwner; owner != nil {
+		if v.Kind != "video-clip" || !textKey(owner.RecordID) || !textKey(owner.ExperimentID) ||
+			recordingMetadataSummary(metadata).RecordID != owner.RecordID {
+			return model.Recording{}, false, failure("invalid_argument", "clip archive owner does not match the selected Record")
+		}
+		archiveExperiment = owner.ExperimentID
+	}
 	existing, err := scanRecording(tx.QueryRowContext(ctx, "SELECT "+recordingColumns+" FROM recordings WHERE scope=? AND id=?", scope, q.ID))
 	if err == nil {
 		if existing.SessionID != v.SessionID || existing.RunID != v.RunID || existing.Kind != v.Kind || existing.Path != v.Path || string(existing.Metadata) != string(v.Metadata) {
 			return model.Recording{}, false, failure("conflict", "recording identity already registered with other facts")
+		}
+		if archiveExperiment != "" && existing.ExperimentResourceID != archiveExperiment {
+			if existing.ExperimentResourceID != "" {
+				return model.Recording{}, false, failure("conflict", "clip and archive belong to different experiments")
+			}
+			charge := int64(len(archiveExperiment))
+			if err := reserve(ctx, tx, scope, 0, charge); err != nil {
+				return model.Recording{}, false, err
+			}
+			if _, err := tx.ExecContext(ctx, "UPDATE recordings SET experiment_resource_id=?,bytes=bytes+? WHERE scope=? AND id=?",
+				archiveExperiment, charge, scope, q.ID); err != nil {
+				return model.Recording{}, false, err
+			}
+			existing.ExperimentResourceID = archiveExperiment
 		}
 		return existing, false, nil
 	}
@@ -248,6 +270,12 @@ func addRecording(ctx context.Context, tx *sql.Tx, scope string, q model.NewReco
 	owner, err := resolveRecordingOwner(ctx, tx, scope, q)
 	if err != nil {
 		return model.Recording{}, false, err
+	}
+	if archiveExperiment != "" {
+		if owner.experimentID != "" && owner.experimentID != archiveExperiment {
+			return model.Recording{}, false, failure("conflict", "clip and archive belong to different experiments")
+		}
+		owner.experimentID = archiveExperiment
 	}
 	summary := recordingMetadataSummary(metadata)
 	// The accepted owner is authoritative; metadata cannot forge association,
@@ -423,6 +451,12 @@ func recordingQuery(scope string, f model.RecordingFilter) (query string, args [
 		return "", nil, 0, failure("invalid_argument", "recording kind and archive class disagree")
 	}
 	where, args := []string{"scope=?"}, []any{scope}
+	if f.UnassignedOnly {
+		if f.ExperimentResourceID != "" {
+			return "", nil, 0, failure("invalid_argument", "unassigned recordings have no experiment filter")
+		}
+		where = append(where, "experiment_resource_id=''")
+	}
 	if f.ExperimentResourceID != "" {
 		if !textKey(f.ExperimentResourceID) {
 			return "", nil, 0, failure("invalid_argument", "filter values must be bounded identifiers")
@@ -512,7 +546,13 @@ func (s *Store) AddRecording(ctx context.Context, q model.NewRecording) (model.R
 	var recording model.Recording
 	var created bool
 	err := s.db.WriteWithInput(ctx, engine.Durable, func(ctx context.Context, tx *sql.Tx, input *engine.WriteInput) (e error) {
-		if e = input.Own(ctx, func() { q.Metadata = cloneBounded(q.Metadata, model.MaxRecordingMetadata) }); e != nil {
+		if e = input.Own(ctx, func() {
+			q.Metadata = cloneBounded(q.Metadata, model.MaxRecordingMetadata)
+			if q.ArchiveOwner != nil {
+				owner := *q.ArchiveOwner
+				q.ArchiveOwner = &owner
+			}
+		}); e != nil {
 			return e
 		}
 		recording, created, e = addRecording(ctx, tx, s.scope, q)

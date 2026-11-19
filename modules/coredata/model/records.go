@@ -381,17 +381,24 @@ type Recording struct {
 	CreatedAt            time.Time             `json:"created_at"`
 }
 
-// NewRecording registers one recording. Association, archive class and sort
-// order are never caller facts: registration derives them from the accepted
-// Run, the optional Session and the metadata's valid startedAt.
+// RecordingArchiveOwner is the verified allocation holding an exported clip.
+// Only the archive service can supply it, independently of producer metadata.
+type RecordingArchiveOwner struct {
+	RecordID     string
+	ExperimentID string
+}
+
+// NewRecording registers one recording under its accepted execution owner
+// and, for an exported clip, its verified source archive allocation.
 type NewRecording struct {
-	ID        string
-	SessionID string
-	RunID     string
-	Kind      string
-	Path      string
-	Metadata  json.RawMessage
-	At        time.Time
+	ID           string
+	SessionID    string
+	RunID        string
+	Kind         string
+	Path         string
+	Metadata     json.RawMessage
+	ArchiveOwner *RecordingArchiveOwner `json:"-"`
+	At           time.Time
 }
 
 // RecordingDelete is the immutable guard captured from a selected stored row.
@@ -412,6 +419,7 @@ type RecordingDelete struct {
 type RecordingFilter struct {
 	SourceRecordingID    string
 	ExperimentResourceID string
+	UnassignedOnly       bool
 	SessionID            string
 	RunID                string
 	Kind                 string
